@@ -1,0 +1,21 @@
+# Risk-Averse CVaR-CEM FrozenLake Demo
+# Python 3.12: mbrl==0.1.5 pins hydra-core==1.0.3 which is incompatible with Python
+# 3.12. Workaround: install mbrl with --no-deps, then hydra-core>=1.1 separately.
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install mbrl==0.1.5 --no-deps
+#   pip install -r requirements.txt
+
+torch>=2.0
+numpy
+gymnasium
+ns_gym>=1.0
+gym==0.17.2
+hydra-core>=1.3
+omegaconf
+matplotlib
+termcolor
+sk-video
+cloudpickle==1.3.0
+pyglet==1.5.0
+future
