@@ -1,0 +1,124 @@
+"""The two drift filters the env loop runs in parallel.
+
+DriftFilterV1 : rectified-excess EWMA estimator (from bnn_fl_cem_surprise_drift.py).
+                Shadow filter, logged for comparison.
+DriftFilterV2 : equal-weight, SIGNED drift filter with an empirical baseline (from
+                mcts_drift_copy_v2.py).  The REAL filter -- its delta_bar drives
+                forget_dirichlet.
+
+Both are extracted verbatim; only the constant imports changed (now from config).
+"""
+import numpy as np
+
+from config import ETA, GAMMA_UNCERTAINTY, KAPPA
+
+
+class DriftFilterV1:
+    """Rectified-excess EWMA estimator of the squared drift lambda.
+
+    lambda_hat = EWMA([delta_n - 1]_+); optionally an EWMA of the excess's second
+    moment for a moment-matched std.  Reset at the change notification.
+    """
+
+    def __init__(self, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY):
+        self.eta = eta
+        self.gamma_uncertainty = gamma_uncertainty
+        self.reset()
+
+    def reset(self):
+        self.lambda_hat = 0.0      # filtered squared drift (per-dim, excess units)
+        self._m2 = 0.0             # EWMA of excess^2 (for the Gamma-view variance)
+
+    def update(self, delta_n):
+        excess = max(delta_n - 1.0, 0.0)
+        self.lambda_hat = (1.0 - self.eta) * self.lambda_hat + self.eta * excess
+        if self.gamma_uncertainty:
+            self._m2 = (1.0 - self.eta) * self._m2 + self.eta * (excess ** 2)
+        return self.lambda_hat
+
+    @property
+    def delta_bar(self):
+        """Filtered, calibration-relative surprise (baseline 1)."""
+        return 1.0 + self.lambda_hat
+
+    @property
+    def lambda_sd(self):
+        """Moment-matched standard deviation of the filtered excess."""
+        if not self.gamma_uncertainty:
+            return 0.0
+        var = max(self._m2 - self.lambda_hat ** 2, 0.0)
+        # EWMA of an i.i.d. stream has variance ~ eta/(2-eta) of the sample var.
+        return float(np.sqrt(var * self.eta / (2.0 - self.eta)))
+
+    def drift_estimate(self, kappa=KAPPA):
+        """Point (risk-neutral) or risk-averse (kappa>0) squared-drift estimate."""
+        return max(self.lambda_hat + kappa * self.lambda_sd, 0.0)
+
+
+class DriftFilterV2:
+    """Equal-weight, SIGNED drift filter with an EMPIRICAL baseline (v2).
+
+    Every update() BEFORE the first reset() (the pre-change phase) is treated as
+    unchanged and folded into the baseline b; reset() (fired at the change
+    notification) freezes b and switches to detection, where lambda_hat is the
+    signed equal-weight mean of (delta_n - b).
+    """
+
+    def __init__(self, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY,
+                 default_baseline=1.0):
+        # eta kept for call-site compatibility; unused (equal weights, not EWMA).
+        self.gamma_uncertainty = gamma_uncertainty
+        self.default_baseline = default_baseline   # used until b is calibrated
+        self._b_sum = 0.0
+        self._b_n = 0
+        self._calibrating = True
+        self._reset_detection()
+
+    @property
+    def baseline(self):
+        return self._b_sum / self._b_n if self._b_n > 0 else self.default_baseline
+
+    def _reset_detection(self):
+        self._sum = 0.0
+        self._sumsq = 0.0
+        self._n = 0
+
+    def reset(self):
+        # Change notification: stop calibrating, KEEP the learned baseline, and
+        # clear the post-change drift accumulators.
+        self._calibrating = False
+        self._reset_detection()
+
+    def update(self, delta_n):
+        if self._calibrating:
+            # pre-change == known-unchanged: fold into the empirical baseline b
+            self._b_sum += delta_n
+            self._b_n += 1
+            return self.lambda_hat
+        excess = delta_n - self.baseline     # SIGNED, EMPIRICAL baseline (not 1.0)
+        self._sum += excess
+        self._sumsq += excess * excess
+        self._n += 1
+        return self.lambda_hat
+
+    @property
+    def lambda_hat(self):
+        return self._sum / self._n if self._n > 0 else 0.0
+
+    @property
+    def delta_bar(self):
+        # May be < 1 when the net post-shift evidence says "mostly unchanged".
+        return 1.0 + self.lambda_hat
+
+    @property
+    def lambda_sd(self):
+        if not self.gamma_uncertainty or self._n < 2:
+            return 0.0
+        mean = self.lambda_hat
+        var = max(self._sumsq / self._n - mean * mean, 0.0)
+        return float(np.sqrt(var / self._n))   # std error of the equal-weight mean
+
+    def drift_estimate(self, kappa=KAPPA):
+        # SIGNED point estimate (no max(...,0)); the value reflects ALL evidence,
+        # and forget() handles the non-negativity of the actual inflation.
+        return self.lambda_hat + kappa * self.lambda_sd
