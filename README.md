@@ -56,4 +56,12 @@ original modules: the MCTS/UCT tree search and pessimistic sampling, `SlipBelief
 `SlipBeliefMCTSAgent`, the Gaussian `BayesianDynamicsModel` (unused at run time —
 the Dirichlet checkpoint is loaded directly), ground-truth value iteration, the
 NSAnt environment, and the various other diagnostic scripts.
+
+## Setup
+
+```
+python -m venv .venv && source .venv/bin/activate
+pip install mbrl==0.1.5 --no-deps
+pip install -r requirements.txt
+python run_risk_averse.py
 ```
