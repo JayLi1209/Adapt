@@ -1,19 +1,15 @@
 """
-run_risk_averse.py -- BNN env-modeling + surprise/forget/learn loop with the CEM +
-CVaR-greedy MPC planner of Ayan's note (MPC_Style_Decision_Making_under_Non_
-Stationarity), on a scheduled non-stationary 4x4 FrozenLake.
+sweep_alpha.py -- CVaR tail-fraction (alpha) sweep for the CVaR-CEM risk-averse
+FrozenLake demo, on the single-change schedule [(0, 0.7)] (deterministic map that
+becomes 0.7-slippery at step 0).
 
-Refactor of notebooks/risk_averse_ayan.py into the repo/ package:
-  bnn/      Dirichlet world model + surprise/forget/learn workflow
-  planning/ BNNModelPlanner base + CVaRCEMAgent
-  env/      scheduled non-stationary FrozenLake
-  drift/    the two drift filters
-  utils     to_one_hot_action, make_fl_potential
-  plot      side-by-side trial-metrics figure
+For each alpha in ALPHAS it runs N_TRIALS trials with the discount factor
+(planner gamma) pinned to GAMMA, logging the full verbose per-timestep trace to
+results/alpha_<alpha>.log (one file per alpha).
 
-Run (from inside repo/, with mbrl + ns_gym importable):
+Run (from inside the repo, with mbrl + ns_gym importable):
     conda activate nsgym
-    python run_risk_averse.py
+    python sweep_alpha.py
 """
 import pathlib
 
@@ -30,49 +26,72 @@ from bnn import (
     mean_alpha0, direction_of, CONC_PRIOR, DIRICHLET_CKPT,
 )
 from planning.cvar_cem import (
-    CVaRCEMAgent, H_PLAN, N_CEM_ITERS, N_CANDIDATES, ELITE_FRAC, CVAR_ALPHA,
-    K_MODELS, N_ROLLOUTS, BETA_EXPLORE, PLAN_GAMMA, WARM_START, ADAPTIVE_ALPHA,
+    CVaRCEMAgent, H_PLAN, N_CEM_ITERS, N_CANDIDATES, ELITE_FRAC,
+    K_MODELS, N_ROLLOUTS, BETA_EXPLORE, WARM_START, ADAPTIVE_ALPHA,
     ALPHA_MIN, ALPHA_MAX, N_CONFIDENT, SURPRISE_TAU,
 )
+# Reuse the per-step helpers so the sweep matches the single-run diagnostic exactly.
+from run_risk_averse import move, pred_next_row, ACTS, DIRS
 
-# ── diagnostic config ─────────────────────────────────────────────────────────
-SCHEDULE = [(0, 0.7)]      # deterministic, then slippery at step 1
+# ── sweep config ───────────────────────────────────────────────────────────────
+SCHEDULE = [(0, 0.7)]      # deterministic, then 0.7-slippery at step 0
 CHANGE_STEPS = [0]
 N_TRIALS = 100
+GAMMA = 0.99               # discount factor: planning, decision-making AND return
+ALPHAS = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]   # CVaR tail fractions to sweep
+
 K_FORGET = 1                         # forget EVERY post-change step
 TRIAL_LEN = 100
 LEARN = True                         # accumulate post-change Dirichlet counts
 
 _HERE = pathlib.Path(__file__).parent
-LOG = str(_HERE / "risk_averse_ayan.log")
-PLOT = str(_HERE / "risk_averse_ayan_metrics.png")
+RESULTS_DIR = _HERE / "results"
 
-ACTS = {0: "LEFT", 1: "DOWN", 2: "RIGHT", 3: "UP"}
-DIRS = {0: "intend", 1: "perp-", 2: "perp+", -1: "none"}
+# True post-change directional slip distribution [intend, perp-, perp+] for the
+# 0.7-slippery regime; the plotter compares the model's p_dir against this.
+TRUE_P_DIR = np.array([0.7, 0.15, 0.15], dtype=np.float64)
+
+_ALL_SA_INPUT = None
 
 
-def move(s, a, nrow=4, ncol=4):
-    r, c = divmod(s, ncol)
-    if a == 0:   c = max(c - 1, 0)
-    elif a == 1: r = min(r + 1, nrow - 1)
-    elif a == 2: c = min(c + 1, ncol - 1)
-    elif a == 3: r = max(r - 1, 0)
-    return r * ncol + c
+def _all_sa_input(obs_dim, act_dim):
+    """Cached (obs_dim*act_dim, obs_dim+act_dim) batch of every (s,a) one-hot pair,
+    ordered state-major (s=0:a0..a3, s=1:a0..a3, ...)."""
+    global _ALL_SA_INPUT
+    if _ALL_SA_INPUT is None:
+        rows = []
+        for s in range(obs_dim):
+            for a in range(act_dim):
+                v = np.zeros(obs_dim + act_dim, dtype=np.float32)
+                v[s] = 1.0
+                v[obs_dim + a] = 1.0
+                rows.append(v)
+        _ALL_SA_INPUT = torch.as_tensor(np.stack(rows), device=device)
+    return _ALL_SA_INPUT
 
 
 @torch.no_grad()
-def pred_next_row(dyn, bnn, obs, a_idx, n=16, n_actions=4):
-    """The mean transition row T[s,a,:] the planner uses (the Dirichlet mean)."""
-    eye_a = torch.eye(n_actions, device=device)
-    obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-    state = dyn.reset(obs_t)
-    nxt, _, _, _ = dyn.sample(eye_a[a_idx].unsqueeze(0), state, deterministic=True)
-    p = nxt.clamp_min(0.0).cpu().numpy().ravel() + 1e-6
-    return p / p.sum()
+def all_state_pdir(bnn, obs_dim, act_dim):
+    """Deterministic posterior-mean directional predictive p_dir for all 16 states.
+
+    Returns (obs_dim, 3): for each state the [intend, perp-, perp+] distribution the
+    model currently predicts, averaged over the 4 actions (the slip profile is an
+    action-relative quantity, so this is a per-state summary of the learned belief).
+    """
+    x = _all_sa_input(obs_dim, act_dim)
+    saved = bnn.num_weight_groups
+    bnn.num_weight_groups = 1
+    try:
+        alpha, _, _, _ = bnn._forward_alpha(x, sample=False)   # mean weights
+    finally:
+        bnn.num_weight_groups = saved
+    p_dir = (alpha / alpha.sum(-1, keepdim=True)).cpu().numpy()   # (S*A, 3)
+    return p_dir.reshape(obs_dim, act_dim, 3).mean(axis=1)        # (S, 3)
 
 
-def main():
-    out = open(LOG, "w")
+def run_alpha(cvar_alpha, log_path, plot_path):
+    """Run the full N_TRIALS loop for one CVaR alpha, logging verbose per-step."""
+    out = open(log_path, "w")
     def log(*a):
         print(*a, file=out); out.flush()
 
@@ -82,8 +101,6 @@ def main():
     act_dim = eval_env.action_space.shape[0]
 
     bnn, dyn = make_dirichlet_bnn(obs_dim, act_dim)
-    # Prefer the pretrained Dirichlet checkpoint; fall back to a fresh head on the
-    # Gaussian trunk (correctness-only) if it's absent.
     ckpt = SAVE_DIR / DIRICHLET_CKPT
     if ckpt.exists():
         bnn.load(SAVE_DIR)
@@ -93,34 +110,34 @@ def main():
         ckpt_msg = (f"no {DIRICHLET_CKPT} found -> loaded {len(loaded)} trunk tensors "
                     f"from bnn_dynamics.pth, Dirichlet head FRESH (correctness only)")
     bnn.num_weight_groups = 20
-    bnn.use_counts = LEARN          # enable the conjugate Dirichlet-Multinomial update
+    bnn.use_counts = LEARN
 
-    # CEM + CVaR-greedy planner.  Plans on the GROUND-TRUTH map reward (goal +1,
-    # hole -1, frozen 0, true terminals); transitions still come from the BNN.
+    # Fixed-alpha risk-averse planner (adaptive_alpha off), discount pinned to GAMMA.
     agent = CVaRCEMAgent(dyn, bnn, eval_env.env.desc, device,
-                         n_actions=act_dim, rng=rng)
+                         n_actions=act_dim, rng=rng,
+                         cvar_alpha=cvar_alpha, adaptive_alpha=False, gamma=GAMMA)
 
     log("=" * 110)
-    log(f"CVaR-CEM (Ayan) PLANNER + DIRICHLET-HEAD model + ONLINE COUNTS (K=3) | "
+    log(f"CVaR-CEM (Ayan) PLANNER + DIRICHLET-HEAD model + ONLINE COUNTS | "
         f"schedule={SCHEDULE} | change@{CHANGE_STEPS} | trials={N_TRIALS} | "
         f"CONC_PRIOR={CONC_PRIOR} | learn={LEARN}")
     log(f"  {ckpt_msg}")
+    log(f"  SWEEP alpha={cvar_alpha} | gamma(discount)={GAMMA}")
     log(f"  planner: H={H_PLAN} I={N_CEM_ITERS} J={N_CANDIDATES} elite_frac={ELITE_FRAC} "
-        f"CVaR_alpha={CVAR_ALPHA} K_models={K_MODELS} N_rollouts={N_ROLLOUTS} "
-        f"beta={BETA_EXPLORE} gamma={PLAN_GAMMA} warm_start={WARM_START}")
-    log(f"  adaptive_alpha={ADAPTIVE_ALPHA} alpha_min={ALPHA_MIN} alpha_max={ALPHA_MAX} "
+        f"CVaR_alpha={cvar_alpha} K_models={K_MODELS} N_rollouts={N_ROLLOUTS} "
+        f"beta={BETA_EXPLORE} gamma={GAMMA} warm_start={WARM_START}")
+    log(f"  adaptive_alpha=False alpha_min={ALPHA_MIN} alpha_max={ALPHA_MAX} "
         f"n_confident={N_CONFIDENT} surprise_tau={SURPRISE_TAU} | "
         f"learn=EVERY STEP (conjugate counts)")
     log("=" * 110)
 
-    # Per-trial metrics for the side-by-side summary plot.
     steps_hist, returns_hist, goals_hist = [], [], []
 
     for trial in range(N_TRIALS):
         obs, _ = eval_env.reset()
         agent.reset()
-        bnn.retain.fill_(1.0)           # fresh belief each trial (prior, then relearn)
-        bnn.reset_counts()              # post-change counts are per-trial
+        bnn.retain.fill_(1.0)
+        bnn.reset_counts()
         drift_v2 = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)  # REAL
         drift_v1 = DriftFilterV1(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)  # shadow
         epi_hist, a0_hist = [], []
@@ -128,6 +145,7 @@ def main():
         terminated = truncated = False
         reward = 0.0
         total_return = 0.0
+        disc = 1.0                       # running gamma^t for the discounted return
         steps = 0
         log(f"\n########## TRIAL {trial+1}/{N_TRIALS} ##########")
 
@@ -136,8 +154,15 @@ def main():
                 drift_v2.reset(); drift_v1.reset()
                 agent.notify_change()
 
+            # Log the model's directional predictive for ALL 16 states (belief
+            # entering this timestep), so the plotter can compute per-state BNN
+            # error against the true slip [0.7,0.15,0.15]. Format is machine-parsed.
+            psd = all_state_pdir(bnn, obs_dim, act_dim)   # (16, 3)
+            log("PDIR trial={} step={} | ".format(trial + 1, steps)
+                + " ".join("{:02d}:{:.4f},{:.4f},{:.4f}".format(si, p[0], p[1], p[2])
+                           for si, p in enumerate(psd)))
+
             s = int(np.argmax(obs))
-            # For the adaptive-alpha feature: feed the agent its current belief.
             agent.surprise_bar = drift_v2.delta_bar
             agent.n_since_change = post
             action = agent.act(obs)
@@ -148,10 +173,11 @@ def main():
             intend = move(s, a)
 
             next_obs, reward, terminated, truncated, info = eval_env.step(action)
-            # Cancel the hole penalty in the reported return: hole arrival gives
-            # reward -1, which we drop (clamp at 0) so the plotted return is the
-            # positive reward earned (goal +1) and never goes negative.
-            total_return += max(0.0, float(reward))
+            # Discounted realized return with the SAME gamma the planner uses; the
+            # hole penalty stays clamped at 0 so the return is the discounted goal
+            # reward (gamma^t_goal if the goal is reached, else 0).
+            total_return += disc * max(0.0, float(reward))
+            disc *= GAMMA
             s2 = int(np.argmax(next_obs))
             d = direction_of(s, a, s2)
             p_on_reached = float(pred_row[s2])
@@ -161,20 +187,16 @@ def main():
             delta_n = vs["delta_n"]
             excess = delta_n - 1.0
 
-            drift_v2.update(delta_n)        # REAL filter (drives forget)
-            drift_v1.update(delta_n)        # shadow
+            drift_v2.update(delta_n)
+            drift_v1.update(delta_n)
             epi_hist.append(eps["epistemic"]); a0_hist.append(vs["alpha0"])
 
-            # ── LEARN: add this realized direction to (s,a)'s counts every step
-            #    (conjugate Dirichlet-Multinomial: alpha = retained_prior + counts).
-            #    Surprise above was measured BEFORE this update (true predictive).
             post_change = steps >= CHANGE_STEPS[0]
             if LEARN:
                 bnn.add_count(s, a, d)
             n_sa = int(bnn.counts[s, a].sum().item())
 
             pd = vs["p_dir"]
-            # Verbose per-step log (toggle on for debugging):
             log(f" t={steps:2d} | {s:2d},{ACTS[a]:5s}->{s2:2d}(obs) | intend={intend:2d}"
                 f" dir={DIRS[d]:6s} | p(model s'={s2:2d})={p_on_reached:5.3f}"
                 f" || delta_n={delta_n:7.3f} nll={vs['nll']:6.3f} H={vs['entropy']:5.3f}"
@@ -187,7 +209,6 @@ def main():
                 f"dbar={drift_v2.delta_bar:6.3f}"
                 f" || V1 lam={drift_v1.lambda_hat:7.3f} dbar={drift_v1.delta_bar:6.3f}")
 
-            # Re-inflation: only post-change, every K steps -- v2 estimate drives it.
             if post_change:
                 post += 1
                 if post % K_FORGET == 0:
@@ -214,9 +235,7 @@ def main():
             f"dbar={drift_v1.delta_bar:.3f}  ||  retain={float(bnn.retain.item()):.4f}")
         log(f"     epistemic(Var_w[p]): mean={epi_a.mean():.5f} max={epi_a.max():.5f} "
             f"last={epi_a[-1]:.5f} | alpha0: mean={a0_a.mean():.3f} last={a0_a[-1]:.3f}")
-        # LEARN check: for the most-visited (s,a), do the counts (empirical slip
-        # frequencies) match the model's directional predictive p_dir?
-        cnt = bnn.counts.sum(-1)                         # (S, A) total per (s,a)
+        cnt = bnn.counts.sum(-1)
         flat = cnt.flatten()
         for idx in torch.argsort(flat, descending=True)[:3]:
             n_tot = int(flat[idx].item())
@@ -232,14 +251,33 @@ def main():
                 f"empirical=[{emp[0]:.2f},{emp[1]:.2f},{emp[2]:.2f}] | "
                 f"model p_dir=[{mdl[0]:.2f},{mdl[1]:.2f},{mdl[2]:.2f}]")
 
-    # Side-by-side summary: averaged step count / return / goal rate over trials.
-    plot_trial_metrics(steps_hist, returns_hist, goals_hist, PLOT)
-    log(f"\nWrote trial-metrics plot to {PLOT}")
+    plot_trial_metrics(steps_hist, returns_hist, goals_hist, str(plot_path))
+    log(f"\nWrote trial-metrics plot to {plot_path}")
     log(f"  avg steps={np.mean(steps_hist):.3f} | avg return={np.mean(returns_hist):.3f} "
         f"| goal rate={np.mean(goals_hist):.3f}")
-
     log("\nDONE.")
     out.close()
+    return float(np.mean(steps_hist)), float(np.mean(returns_hist)), float(np.mean(goals_hist))
+
+
+def main():
+    RESULTS_DIR.mkdir(exist_ok=True)
+    summary = []
+    for cvar_alpha in ALPHAS:
+        tag = f"{cvar_alpha:g}".replace(".", "p")
+        log_path = RESULTS_DIR / f"alpha_{tag}.log"
+        plot_path = RESULTS_DIR / f"alpha_{tag}_metrics.png"
+        print(f"[sweep] alpha={cvar_alpha} gamma={GAMMA} -> {log_path}")
+        avg_steps, avg_ret, goal_rate = run_alpha(cvar_alpha, log_path, plot_path)
+        summary.append((cvar_alpha, avg_steps, avg_ret, goal_rate))
+        print(f"        avg_steps={avg_steps:.3f} avg_return={avg_ret:.3f} "
+              f"goal_rate={goal_rate:.3f}")
+
+    print("\n=== SWEEP SUMMARY (schedule={}, gamma={}, trials={}) ===".format(
+        SCHEDULE, GAMMA, N_TRIALS))
+    for cvar_alpha, avg_steps, avg_ret, goal_rate in summary:
+        print(f"  alpha={cvar_alpha:<5} | avg_steps={avg_steps:7.3f} | "
+              f"avg_return={avg_ret:6.3f} | goal_rate={goal_rate:.3f}")
 
 
 if __name__ == "__main__":
