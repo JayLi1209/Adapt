@@ -39,24 +39,6 @@ data/frozenlake/
   bnn_dynamics.pth      Gaussian trunk (only read if the Dirichlet ckpt is absent)
 ```
 
-## External dependencies (not vendored)
-
-- **mbrl** (`mbrl.models`, `mbrl.planning`) — the parent mbrl-lib install supplies
-  `models.Model`, `models.OneDTransitionRewardModel`, and `planning.Agent`.
-- **ns_gym** — the non-stationary FrozenLake wrappers / schedulers / update functions.
-- `torch`, `numpy`, `matplotlib`, `gymnasium`.
-
-Both `mbrl` and `ns_gym` are imported from the active environment (they resolve
-regardless of working directory), so nothing from them is copied in here.
-
-## What was deliberately left out
-
-Only code on the runtime path of `risk_averse_ayan.py` was kept. Dropped from the
-original modules: the MCTS/UCT tree search and pessimistic sampling, `SlipBelief`/
-`SlipBeliefMCTSAgent`, the Gaussian `BayesianDynamicsModel` (unused at run time —
-the Dirichlet checkpoint is loaded directly), ground-truth value iteration, the
-NSAnt environment, and the various other diagnostic scripts.
-
 ## Setup
 
 ```
