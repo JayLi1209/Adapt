@@ -31,7 +31,7 @@ from planning.cvar_cem import (
     ALPHA_MIN, ALPHA_MAX, N_CONFIDENT, SURPRISE_TAU,
 )
 # Reuse the per-step helpers so the sweep matches the single-run diagnostic exactly.
-from run_risk_averse import move, pred_next_row, ACTS, DIRS
+from run_discrete import move, pred_next_row, ACTS, DIRS
 
 # ── sweep config ───────────────────────────────────────────────────────────────
 SCHEDULE = [(0, 0.7)]      # deterministic, then 0.7-slippery at step 0
