@@ -5,6 +5,12 @@ CVaR-CEM method, for a fair head-to-head comparison.
     python run_ada_mcts_baseline.py
 """
 
+
+"""""""""""""""""""""""""""""""""
+For a more faithful implementation of Ada-MCTS, see 
+https://github.com/JayLi1209/ADA-MCTS/tree/bugfix/version
+"""""""""""""""""""""""""""""""""
+
 import pathlib
 import time
 
