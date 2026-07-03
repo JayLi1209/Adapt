@@ -1,9 +1,7 @@
-"""Train the Gaussian-head BNN on Pendulum data collected via random exploration.
+"""Train Gaussian-head BNN on Pendulum data. Uses sinusoidal exploration for
+smoother trajectories, then trains with batched GPU operations.
 
-Uses OneDTransitionRewardModel.update_normalizer + save so that both the BNN
-checkpoint and the input/output normalizer stats are persisted in the format
-that dyn.load() expects.
-
+Saves checkpoint + normalizer to data/pendulum/.
 Run:  python train_pendulum_bnn.py
 """
 
@@ -22,30 +20,41 @@ _HERE = pathlib.Path(__file__).parent
 SAVE_DIR = _HERE / "data" / "pendulum"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-N_COLLECT = 8000          # random transitions to collect
-BATCH_SIZE = 1024
-N_EPOCHS = 200
+N_COLLECT = 10000
+BATCH_SIZE = 2048
+N_EPOCHS = 300
 LR = 1e-3
-BETA = 100.0              # KL weight (higher = keep more epistemic uncertainty)
+BETA = 50.0               # KL weight — higher keeps epistemic uncertainty
 
 
-def collect_and_normalize(bnn, dyn, n_steps=N_COLLECT):
-    """Collect random data and populate the input normalizer."""
+def collect_data(n_steps=N_COLLECT):
+    """Collect transitions using sinusoidal torque for smoother dynamics."""
     env = build_pendulum_env()
     obs, _ = env.reset()
     data = []
-    for _ in range(n_steps):
-        act = np.random.uniform(-2.0, 2.0, size=(1,)).astype(np.float32)
+    freq = 0.3
+    for i in range(n_steps):
+        torque = 1.5 * np.sin(freq * i * 0.05) + 0.3 * np.cos(freq * 0.7 * i * 0.05)
+        torque = np.clip(torque, -2.0, 2.0)
+        act = np.array([torque], dtype=np.float32)
         next_obs, rew, term, trunc, _ = env.step(act)
         data.append((obs.copy(), act.copy(), next_obs.copy(), rew))
-        if term or trunc:
-            obs, _ = env.reset()
-        else:
-            obs = next_obs
+        obs = next_obs if not (term or trunc) else env.reset()[0]
+    return data
 
-    obs_dim = data[0][0].shape[0]
-    act_dim = data[0][1].shape[0]
 
+def main():
+    print(f"Collecting {N_COLLECT} transitions (sinusoidal exploration)...")
+    data = collect_data()
+    obs_dim, act_dim = 3, 1
+    print(f"  obs_dim={obs_dim} act_dim={act_dim} samples={len(data)}")
+
+    bnn, dyn = make_gaussian_bnn(obs_dim, act_dim)
+    bnn.beta = BETA
+    bnn.num_train_points = len(data)
+    bnn.anchor_prior_to_current()
+
+    # Populate normalizer.
     batch = TransitionBatch(
         obs=np.stack([d[0] for d in data]).astype(np.float32),
         act=np.stack([d[1] for d in data]).astype(np.float32),
@@ -54,57 +63,34 @@ def collect_and_normalize(bnn, dyn, n_steps=N_COLLECT):
         dones=np.zeros(len(data), dtype=bool),
     )
     dyn.update_normalizer(batch)
-    return data, obs_dim, act_dim
 
-
-def make_training_batches(data, batch_size=BATCH_SIZE):
-    """Yield (model_in, target) mini-batches on device."""
-    xs, ys = [], []
-    for obs, act, next_obs, rew in data:
-        model_in = np.concatenate([obs, act]).astype(np.float32)
-        target = np.concatenate([next_obs - obs, [rew]]).astype(np.float32)
-        xs.append(model_in)
-        ys.append(target)
-    xs = np.stack(xs)
-    ys = np.stack(ys)
-    n = xs.shape[0]
-    idx = np.random.permutation(n)
-    for i in range(0, n, batch_size):
-        batch_idx = idx[i : i + batch_size]
-        yield (torch.tensor(xs[batch_idx], device=device),
-               torch.tensor(ys[batch_idx], device=device))
-
-
-def main():
-    print(f"Collecting {N_COLLECT} random transitions from Pendulum...")
-    bnn, dyn = make_gaussian_bnn(3, 1)       # obs_dim=3, act_dim=1 (pendulum)
-    data, obs_dim, act_dim = collect_and_normalize(bnn, dyn)
-    print(f"  obs_dim={obs_dim} act_dim={act_dim}")
-
-    bnn.beta = BETA               # higher KL weight keeps epistemic uncertainty
-    bnn.num_train_points = len(data)
-    bnn.anchor_prior_to_current()
+    # Prepare training tensors on GPU.
+    xs = np.stack([np.concatenate([d[0], d[1]]).astype(np.float32) for d in data])
+    ys = np.stack([np.concatenate([d[2] - d[0], [d[3]]]).astype(np.float32) for d in data])
+    xs_t = torch.tensor(xs, device=device)
+    ys_t = torch.tensor(ys, device=device)
+    n = len(data)
 
     optimizer = optim.Adam(bnn.parameters(), lr=LR)
 
-    print(f"Training {N_EPOCHS} epochs on {len(data)} transitions (batch={BATCH_SIZE})...")
+    print(f"Training {N_EPOCHS} epochs (batch={BATCH_SIZE}, beta={BETA})...")
     for epoch in range(N_EPOCHS):
+        perm = torch.randperm(n, device=device)
         epoch_loss = 0.0
         n_batches = 0
-        for model_in, target in make_training_batches(data):
+        for i in range(0, n, BATCH_SIZE):
+            idx = perm[i:i + BATCH_SIZE]
             optimizer.zero_grad()
-            loss, meta = bnn.loss(model_in, target)
+            loss, meta = bnn.loss(xs_t[idx], ys_t[idx])
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
             n_batches += 1
-        if epoch % 20 == 0:
-            avg = epoch_loss / max(n_batches, 1)
-            print(f"  epoch {epoch:3d}: loss={avg:.6f}  nll={meta['nll']:.4f}  kl={meta['kl']:.4f}")
+        if epoch % 30 == 0:
+            print(f"  epoch {epoch:3d}: loss={epoch_loss / max(n_batches, 1):.4f}  "
+                  f"nll={meta['nll']:.4f}  kl={meta['kl']:.1f}")
 
     bnn.anchor_prior_to_current()
-
-    # OneDTransitionRewardModel.save saves model.pth (norm stats) + BNN checkpoint.
     dyn.save(str(SAVE_DIR))
     print(f"Saved model + normalizer to {SAVE_DIR}")
     print("DONE.")
