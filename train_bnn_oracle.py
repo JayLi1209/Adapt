@@ -57,6 +57,7 @@ def main():
 
     bnn.anchor_prior_to_current()
     dyn.save(str(SAVE_DIR))
+    bnn.save(str(SAVE_DIR), "bnn_dynamics.pth")
     print(f"Saved to {SAVE_DIR}")
     print("DONE.")
 
