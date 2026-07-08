@@ -1,5 +1,5 @@
 """Bayesian (mean-field VI) linear layer -- the only BNN building block the
-Dirichlet world model needs.  Extracted verbatim from bnn_nsant_cem.py.
+Dirichlet world model needs.
 """
 import numpy as np
 import torch
