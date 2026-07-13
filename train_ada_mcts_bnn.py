@@ -18,10 +18,10 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # ── Collect stationary data using oracle CEM ─────────────────────────────────────
 from oracle_cem_baseline import PendulumSim
 
-N_EPISODES = 10
+N_EPISODES = 20
 EPISODE_LEN = 100
-BATCH_SIZE = 1024
-N_EPOCHS = 400
+BATCH_SIZE = 2048
+N_EPOCHS = 500
 LR = 1e-3
 BETA = 50.0
 
@@ -79,18 +79,31 @@ def main():
     ys_t = torch.tensor(ys, device=device)
 
     opt = optim.Adam(bnn.parameters(), lr=LR)
+    best_nll = float("inf")
+    best_state = None
     print(f"Training {N_EPOCHS} epochs (batch={BATCH_SIZE}, beta={BETA})...")
     for epoch in range(N_EPOCHS):
         perm = torch.randperm(n, device=device)
-        epoch_loss, nb = 0.0, 0
+        epoch_loss, epoch_nll, nb = 0.0, 0.0, 0
         for i in range(0, n, BATCH_SIZE):
             idx = perm[i:i+BATCH_SIZE]
             opt.zero_grad()
             loss, meta = bnn.loss(xs_t[idx], ys_t[idx])
             loss.backward(); opt.step()
-            epoch_loss += loss.item(); nb += 1
-        if epoch % 40 == 0:
-            print(f"  epoch {epoch:3d}: loss={epoch_loss/max(nb,1):.3f}  nll={meta['nll']:.3f}")
+            epoch_loss += loss.item()
+            epoch_nll += meta["nll"]
+            nb += 1
+        avg_nll = epoch_nll / max(nb, 1)
+        if avg_nll < best_nll:
+            best_nll = avg_nll
+            best_state = {k: v.clone() for k, v in bnn.state_dict().items()}
+        if epoch % 50 == 0:
+            print(f"  epoch {epoch:3d}: loss={epoch_loss/max(nb,1):.3f}  nll={avg_nll:.3f}")
+
+    # Restore best checkpoint
+    if best_state is not None:
+        bnn.load_state_dict(best_state)
+        print(f"Restored best model (nll={best_nll:.4f})")
 
     bnn.anchor_prior_to_current()
 

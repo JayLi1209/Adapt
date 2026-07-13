@@ -26,7 +26,7 @@ BNN_DIR = _HERE / "data" / "pendulum_ada"
 
 MASS_SCHEDULE = [(0, 1.0), (80, 3.0)]
 CHANGE_STEPS = [80]
-N_TRIALS = 10
+N_TRIALS = 20
 TRIAL_LEN = 100
 
 N_ACTIONS = 5
@@ -39,7 +39,8 @@ GAMMA = 0.99
 # ── DPAS thresholds ─────────────────────────────────────────────────────────────
 EPS_E = 0.01    # epistemic uncertainty threshold
 HEAD_LR = 1e-3  # learning rate for head+latent finetuning
-FINETUNE_EVERY = 5  # finetune every N steps
+FINETUNE_EVERY = 5  # finetune every N steps post-change
+MIN_BUF = 8           # min buffer size before first finetune
 
 
 class _Node:
@@ -257,9 +258,9 @@ def main():
                 if len(buffer) > 100:
                     buffer.pop(0)
 
-                if training_started and len(buffer) >= 16 and step % FINETUNE_EVERY == 0:
-                    idxs = np.random.choice(len(buffer), size=min(16, len(buffer)),
-                                            replace=False)
+                if training_started and len(buffer) >= MIN_BUF and n_post_change % FINETUNE_EVERY == 0:
+                    batch_size = min(16, len(buffer))
+                    idxs = np.random.choice(len(buffer), size=batch_size, replace=False)
                     for i in idxs:
                         mi, tg = buffer[i]
                         mi_t = torch.tensor(mi, device=device).unsqueeze(0)
@@ -268,6 +269,9 @@ def main():
                         loss, _ = bnn.loss(mi_t, tg_t)
                         loss.backward()
                     opt.step(); opt.zero_grad()
+                    if n_post_change % (FINETUNE_EVERY * 3) == 0:
+                        log(f"  [FT] t={step}: n_buf={len(buffer)} "
+                            f"latent={bnn.latent.data.cpu().numpy().round(4)}")
 
             obs = next_obs
             if term or trunc:

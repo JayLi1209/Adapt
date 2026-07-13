@@ -21,7 +21,7 @@ BNN_DIR = _HERE / "data" / "pendulum_ada"
 
 MASS_SCHEDULE = [(0, 1.0), (80, 3.0)]
 CHANGE_STEPS = [80]
-N_TRIALS = 10
+N_TRIALS = 20
 TRIAL_LEN = 100
 K_FORGET = 5
 
@@ -54,8 +54,8 @@ def main():
                                k_models=K_MODELS, gamma=GAMMA)
 
     log("=" * 80)
-    log(f"CEM+BNN+forget (latent={LATENT_DIM}) | mass_schedule={MASS_SCHEDULE} | "
-        f"change@{CHANGE_STEPS} | trials={N_TRIALS} | K_forget={K_FORGET}")
+    log(f"CEM+BNN+forget (latent={LATENT_DIM}) | mass={MASS_SCHEDULE} | "
+        f"trials={N_TRIALS}x{TRIAL_LEN} | K_forget={K_FORGET}")
     log(f"  H={H_PLAN} I={N_CEM_ITERS} J={N_CANDIDATES} K={K_MODELS} gamma={GAMMA}")
     log("=" * 80)
 
@@ -75,7 +75,7 @@ def main():
                 drift.reset()
                 agent.notify_change()
                 log(f"  [CHANGE] t={step}: mass={eval_env.unwrapped.m}, "
-                    f"latent={bnn.latent.data.cpu().numpy().round(3)}")
+                    f"latent={bnn.latent.data.cpu().numpy().round(4)}")
 
             action = agent.act(obs)
             next_obs, reward, term, trunc, _ = eval_env.step(action)
@@ -98,7 +98,7 @@ def main():
                         log(f"  FORGET t={step}: applied={applied:.4f} "
                             f"sigma {sig_before:.4f}->{sig_after:.4f}")
 
-            if step % 30 == 0:
+            if step % 50 == 0:
                 a_val = float(act_arr[0])
                 log(f"  t={step:3d} | a={a_val:+.3f} r={reward:+.3f} | "
                     f"nu2={raw_s:.3f} | lam={drift.lambda_hat:+.3f} | "
