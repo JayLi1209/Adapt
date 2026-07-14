@@ -47,32 +47,34 @@ class LatentBNN(BayesianDynamicsModel):
     def _run_network(self, x, sample=True, num_weight_groups=1):
         """Run BNN to get K factor predictions, then combine with latent w_b.
         x: (B, obs_dim + act_dim) — raw (obs, act), NO latent concatenation.
+
+        BayesianLinear handles num_weight_groups internally without changing
+        output shape, so the parent always returns (B, K*P).
         """
         B = x.shape[0]
         K = self.num_factors
         P = self.obs_dim + 1    # per-factor output dim (delta-obs + reward)
-        G = num_weight_groups
 
-        # Parent forward pass → raw factor predictions: (B*G, K*P)
+        # Parent forward pass → raw factor predictions: (B, K*P)
         mean_raw, logvar_raw = super()._run_network(
-            x, sample=sample, num_weight_groups=G)
+            x, sample=sample, num_weight_groups=num_weight_groups)
 
-        # Reshape to separate factors: (B, G, K, P)
-        mean = mean_raw.view(B, G, K, P)
-        logvar = logvar_raw.view(B, G, K, P)
+        # Reshape to separate factors: (B, K, P)
+        mean = mean_raw.view(B, K, P)
+        logvar = logvar_raw.view(B, K, P)
 
         w = self.latent  # (K,)
 
         # ── Combine K factors via weighted sum ──────────────────────────
         # μ_combined = Σ w_k * μ_k
-        mean_c = torch.einsum('bgkp,k->bgp', mean, w)           # (B, G, P)
+        mean_c = torch.einsum('bkp,k->bp', mean, w)           # (B, P)
 
         # σ²_combined = Σ w_k² * σ²_k  (independent factors)
-        var = torch.exp(logvar)                                   # (B, G, K, P)
-        var_c = torch.einsum('bgkp,k->bgp', var, w ** 2)         # (B, G, P)
+        var = torch.exp(logvar)                                # (B, K, P)
+        var_c = torch.einsum('bkp,k->bp', var, w ** 2)         # (B, P)
         logvar_c = torch.log(var_c + 1e-8)
 
-        return mean_c.reshape(B * G, P), logvar_c.reshape(B * G, P)
+        return mean_c, logvar_c
 
     def freeze_trunk(self):
         """Freeze all hidden layers; only output layer + latent remain trainable."""

@@ -10,12 +10,12 @@ import torch
 from config import device
 
 # ── Planner hyperparameters ────────────────────────────────────────────────────
-H_PLAN = 12              # planning horizon
-N_CEM_ITERS = 5          # CEM refinement iterations
-N_CANDIDATES = 256       # action sequences per iteration (must be even)
+H_PLAN = 16              # planning horizon
+N_CEM_ITERS = 8          # CEM refinement iterations
+N_CANDIDATES = 512       # action sequences per iteration (must be even)
 ELITE_FRAC = 0.1         # keep top fraction
 CVAR_ALPHA = 1.0         # CVaR tail (1.0 = risk-neutral mean)
-K_MODELS = 1             # posterior BNN draws (1 = fast, >1 = epistemic diversity)
+K_MODELS = 5             # posterior BNN draws (1 = fast, >1 = epistemic diversity)
 GAMMA = 0.99             # discount
 
 
