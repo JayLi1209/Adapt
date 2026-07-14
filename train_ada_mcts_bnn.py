@@ -18,12 +18,12 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # ── Collect stationary data using oracle CEM ─────────────────────────────────────
 from oracle_cem_baseline import PendulumSim
 
-N_EPISODES = 20
+N_EPISODES = 40
 EPISODE_LEN = 100
 BATCH_SIZE = 2048
-N_EPOCHS = 500
+N_EPOCHS = 1000
 LR = 1e-3
-BETA = 50.0
+BETA = 15.0
 
 
 def _to_obs(th, thdot):
