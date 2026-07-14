@@ -17,7 +17,7 @@ from torch import optim
 
 from config import device
 from env.pendulum import build_pendulum_env
-from bnn.latent_model import make_latent_bnn, LATENT_DIM
+from bnn.latent_model import make_latent_bnn, NUM_LATENT_FACTORS
 from bnn.gaussian_workflow import surprise_gaussian
 
 _HERE = pathlib.Path(__file__).parent
@@ -184,7 +184,7 @@ def main():
         print(*a)
 
     # ── Load pretrained latent BNN ─────────────────────────────────────────
-    bnn, dyn = make_latent_bnn(3, 1, LATENT_DIM)
+    bnn, dyn = make_latent_bnn(3, 1, NUM_LATENT_FACTORS)
     frozen_path = BNN_DIR / "latent_bnn_frozen.pth"
     if frozen_path.exists():
         bnn.load_latent(str(BNN_DIR), "latent_bnn_frozen.pth")
@@ -200,7 +200,7 @@ def main():
     bnn_init = copy.deepcopy(bnn.state_dict())
 
     log("=" * 60)
-    log(f"ADA-MCTS (latent={LATENT_DIM}) on Pendulum | N_act={N_ACTIONS} | sims={MCTS_SIMS}")
+    log(f"ADA-MCTS (latent={NUM_LATENT_FACTORS}) on Pendulum | N_act={N_ACTIONS} | sims={MCTS_SIMS}")
     log(f"  mass_schedule={MASS_SCHEDULE} | {N_TRIALS} trials x {TRIAL_LEN} steps")
     log("=" * 60)
 

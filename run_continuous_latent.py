@@ -16,7 +16,7 @@ from config import device, ETA, GAMMA_UNCERTAINTY
 from env import build_pendulum_env
 from drift import DriftFilterV2
 from bnn import surprise_gaussian, forget_gaussian, mean_sigma
-from bnn.latent_model import make_latent_bnn, LATENT_DIM
+from bnn.latent_model import make_latent_bnn, NUM_LATENT_FACTORS
 from planning.continuous_cem import ContinuousCEMAgent, H_PLAN, N_CEM_ITERS, N_CANDIDATES, K_MODELS, GAMMA
 
 _HERE = pathlib.Path(__file__).parent
@@ -42,7 +42,7 @@ def main():
     eval_env = build_pendulum_env(MASS_SCHEDULE)
     obs_dim, act_dim = 3, 1
 
-    bnn, dyn = make_latent_bnn(obs_dim, act_dim, LATENT_DIM)
+    bnn, dyn = make_latent_bnn(obs_dim, act_dim, NUM_LATENT_FACTORS)
     dyn.load(str(BNN_DIR))
     frozen_path = BNN_DIR / "latent_bnn_frozen.pth"
     if frozen_path.exists():
@@ -61,7 +61,7 @@ def main():
                                k_models=K_MODELS, gamma=GAMMA)
 
     log("=" * 80)
-    log(f"CEM+BNN+forget+finetune (latent={LATENT_DIM}) | mass={MASS_SCHEDULE} | "
+    log(f"CEM+BNN+forget+finetune (latent={NUM_LATENT_FACTORS}) | mass={MASS_SCHEDULE} | "
         f"trials={N_TRIALS}x{TRIAL_LEN} | K_forget={K_FORGET} | FT_every={FINETUNE_EVERY}")
     log(f"  H={H_PLAN} I={N_CEM_ITERS} J={N_CANDIDATES} K={K_MODELS} gamma={GAMMA}")
     log("=" * 80)

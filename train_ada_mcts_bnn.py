@@ -8,7 +8,7 @@ import pathlib, numpy as np, torch
 from torch import optim
 
 from config import device
-from bnn.latent_model import make_latent_bnn, LATENT_DIM
+from bnn.latent_model import make_latent_bnn, NUM_LATENT_FACTORS
 from mbrl.types import TransitionBatch
 
 _HERE = pathlib.Path(__file__).parent
@@ -57,7 +57,7 @@ def main():
     n = len(data); obs_dim, act_dim = 3, 1
     print(f"  {n} transitions collected")
 
-    bnn, dyn = make_latent_bnn(obs_dim, act_dim, LATENT_DIM)
+    bnn, dyn = make_latent_bnn(obs_dim, act_dim, NUM_LATENT_FACTORS)
     bnn.beta = BETA
     bnn.num_train_points = n
     bnn.anchor_prior_to_current()
