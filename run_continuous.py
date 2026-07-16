@@ -42,7 +42,11 @@ def main():
 
     bnn, dyn = make_gaussian_bnn(obs_dim, act_dim)
     dyn.load(str(PENDULUM_SAVE_DIR))
-    log(f"Loaded pretrained BNN from {PENDULUM_SAVE_DIR}")
+    # Load pretrained BNN weights (yuanhe model is the well-trained one)
+    ckpt = torch.load(str(PENDULUM_SAVE_DIR / "bnn_dynamics_yuanhe.pth"),
+                      map_location=device)
+    bnn.load_state_dict(ckpt, strict=False)
+    log(f"Loaded pretrained BNN from {PENDULUM_SAVE_DIR / 'bnn_dynamics_yuanhe.pth'}")
     bnn.num_weight_groups = 1
     init_state = copy.deepcopy(bnn.state_dict())
 
