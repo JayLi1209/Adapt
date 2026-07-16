@@ -18,20 +18,55 @@ _HERE = pathlib.Path(__file__).parent
 SAVE_DIR = _HERE / "data" / "lunar_lander"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-N_COLLECT = 20000
+N_COLLECT = 30000
 BATCH_SIZE = 2048
 N_EPOCHS = 300
 LR = 1e-3
 BETA = 50.0
 
 
+def heuristic_action(obs):
+    """Simple PID-like controller for Lunar Lander.
+    State: [x, y, vx, vy, angle, angular_vel, left_contact, right_contact]
+    Actions: 0=nothing, 1=left engine, 2=main engine, 3=right engine
+    """
+    x, y, vx, vy, angle, ang_vel, leg_l, leg_r = obs
+
+    # 1. Stabilize angle first: fire side engine to counter tilt
+    if angle > 0.15:
+        return 3  # right engine (tilts left)
+    if angle < -0.15:
+        return 1  # left engine (tilts right)
+
+    # 2. Control horizontal position: tilt to move toward center
+    if abs(x) > 0.2:
+        if x > 0 and angle > -0.3:
+            return 3  # need to move left
+        if x < 0 and angle < 0.3:
+            return 1  # need to move right
+
+    # 3. Control descent: fire main engine when falling fast
+    if vy < -0.3 or (y < 1.0 and vy < -0.05):
+        return 2  # main engine
+
+    # 4. Fine angle correction
+    if abs(angle) > 0.05:
+        return 3 if angle > 0 else 1
+
+    return 0
+
+
 def collect_data(n_steps=N_COLLECT):
-    """Collect transitions using random actions on stationary Lunar Lander."""
+    """Collect transitions using heuristic controller (better coverage)."""
     env = build_lunar_lander_env()
     obs, _ = env.reset()
     data = []
     for i in range(n_steps):
-        act = env.action_space.sample()
+        # 80% heuristic, 20% random for exploration diversity
+        if np.random.random() < 0.8:
+            act = heuristic_action(obs)
+        else:
+            act = env.action_space.sample()
         next_obs, rew, term, trunc, _ = env.step(act)
         data.append((obs.copy(), np.float32(act), next_obs.copy(), rew))
         obs = next_obs

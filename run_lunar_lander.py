@@ -28,7 +28,7 @@ K_FORGET = 5
 # ── MCTS params ────────────────────────────────────────────────────────────────
 N_ACTIONS = 4
 TORQUES = np.array([0, 1, 2, 3], dtype=np.int64)  # discrete Lunar Lander actions
-MCTS_SIMS = 100
+MCTS_SIMS = 200
 ROLLOUT_H = 10
 CP = math.sqrt(2.0)
 GAMMA = 0.99
