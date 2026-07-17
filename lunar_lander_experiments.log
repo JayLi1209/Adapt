@@ -1,0 +1,51 @@
+Loaded pretrained BNN from /home/guo/Adapt/data/lunar_lander
+======================================================================
+Lunar Lander: MCTS+BNN+forget | sims=200 rollout=10
+  wind=[0.0, 10.0, 15.0, 20.0] | trials=10x1000
+======================================================================
+  trial 1/10: return=-116.5 steps=68
+  trial 2/10: return=-182.0 steps=96
+  trial 3/10: return=-105.0 steps=79
+  trial 4/10: return=-101.8 steps=74
+  trial 5/10: return=-123.9 steps=75
+  trial 6/10: return=-126.8 steps=78
+  trial 7/10: return=-92.2 steps=54
+  trial 8/10: return=-107.9 steps=60
+  trial 9/10: return=-92.8 steps=62
+  trial 10/10: return=-122.9 steps=81
+wind=    0:   -117.2 ± 24.6  (369s)
+  trial 1/10: return=-118.5 steps=70
+  trial 2/10: return=-79.8 steps=53
+  trial 3/10: return=-93.9 steps=83
+  trial 4/10: return=-94.9 steps=90
+  trial 5/10: return=-93.1 steps=76
+  trial 6/10: return=-126.7 steps=89
+  trial 7/10: return=-45.6 steps=89
+  trial 8/10: return=-19.7 steps=117
+  trial 9/10: return=-142.3 steps=77
+  trial 10/10: return=-137.3 steps=72
+wind=   10:    -95.2 ± 37.3  (415s)
+  trial 1/10: return=-91.3 steps=88
+  trial 2/10: return=-149.5 steps=65
+  trial 3/10: return=-120.8 steps=81
+  trial 4/10: return=-91.6 steps=69
+  trial 5/10: return=-49.8 steps=60
+  trial 6/10: return=-145.8 steps=73
+  trial 7/10: return=-83.2 steps=55
+  trial 8/10: return=-99.2 steps=82
+  trial 9/10: return=-98.4 steps=62
+  trial 10/10: return=-104.1 steps=82
+wind=   15:   -103.4 ± 28.0  (365s)
+  trial 1/10: return=-173.5 steps=55
+  trial 2/10: return=-83.7 steps=64
+  trial 3/10: return=-94.1 steps=61
+  trial 4/10: return=-97.6 steps=73
+  trial 5/10: return=-113.9 steps=63
+  trial 6/10: return=-99.7 steps=55
+  trial 7/10: return=-132.1 steps=88
+  trial 8/10: return=-92.6 steps=57
+  trial 9/10: return=-122.9 steps=71
+  trial 10/10: return=-93.8 steps=90
+wind=   20:   -110.4 ± 25.4  (344s)
+
+DONE.

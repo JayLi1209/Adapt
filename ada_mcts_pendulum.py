@@ -32,8 +32,8 @@ TRIAL_LEN = 100
 N_ACTIONS = 7
 TORQUES = np.linspace(-2.0, 2.0, N_ACTIONS, dtype=np.float32)
 MCTS_SIMS = 200
-ROLLOUT_H = 8
-CP = math.sqrt(2.0)
+ROLLOUT_H = 15
+CP = 50.0
 GAMMA = 0.99
 
 # ── DPAS thresholds ─────────────────────────────────────────────────────────────

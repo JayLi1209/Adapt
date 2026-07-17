@@ -110,8 +110,8 @@ def run_ours(exp_name, config, bnn, dyn):
 N_ACTIONS = 7
 TORQUES = np.linspace(-2.0, 2.0, N_ACTIONS, dtype=np.float32)
 MCTS_SIMS = 200
-ROLLOUT_H = 8
-CP = math.sqrt(2.0)
+ROLLOUT_H = 15
+CP = 50.0
 EPS_E = 0.01
 
 

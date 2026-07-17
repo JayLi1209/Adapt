@@ -21,7 +21,7 @@ SAVE_DIR = _HERE / "data" / "lunar_lander"
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 WIND_VALUES = [0.0, 10.0, 15.0, 20.0]  # from PA-MCTS paper
-N_TRIALS = 20
+N_TRIALS = 10
 TRIAL_LEN = 1000  # Lunar Lander episodes can be long
 K_FORGET = 5
 
@@ -30,7 +30,7 @@ N_ACTIONS = 4
 TORQUES = np.array([0, 1, 2, 3], dtype=np.int64)  # discrete Lunar Lander actions
 MCTS_SIMS = 200
 ROLLOUT_H = 10
-CP = math.sqrt(2.0)
+CP = 50.0  # PA-MCTS paper value (sqrt(2) ≈ 1.4 is too small)
 GAMMA = 0.99
 
 
@@ -108,8 +108,9 @@ def mcts_act(dyn, obs):
 def main():
     out = open(LOG, "w")
     def log(*a):
-        print(*a, file=out); out.flush()
-        print(*a)
+        msg = " ".join(str(x) for x in a)
+        out.write(msg + "\n"); out.flush()
+        print(msg, flush=True)
 
     bnn, dyn = make_gaussian_bnn(8, 1)
     dyn.load(str(SAVE_DIR))
@@ -160,6 +161,7 @@ def main():
                     break
 
             returns.append(total)
+            log(f"  trial {trial+1}/{N_TRIALS}: return={total:.1f} steps={post}")
 
         log(f"wind={wind:5.0f}: {np.mean(returns):8.1f} ± {np.std(returns):.1f}  ({time.time()-t0:.0f}s)")
         env.close()
