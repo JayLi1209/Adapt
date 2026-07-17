@@ -12,7 +12,7 @@ import torch
 
 from config import device, ETA, GAMMA_UNCERTAINTY
 from env.pendulum import build_pendulum_env
-from drift import DriftFilterV2
+from drift import DualDriftFilter
 from bnn import make_gaussian_bnn, surprise_gaussian, forget_gaussian
 from planning.continuous_cem import ContinuousCEMAgent, H_PLAN, N_CEM_ITERS, N_CANDIDATES, K_MODELS, GAMMA
 from oracle_cem_baseline import PendulumSim, cem_act
@@ -58,19 +58,20 @@ def run_ours(mass=None, gravity=None, bnn=None, dyn=None, n_trials=N_TRIALS):
     returns = []
     for trial in range(n_trials):
         obs, _ = env.reset(); agent.reset(); bnn.load_state_dict(init_state)
-        drift = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
-        total, post = 0.0, 0
+        drift = DualDriftFilter(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
+        total, post, warmup = 0.0, 0, 20
         for step in range(TRIAL_LEN):
-            if step == 0: drift.reset(); agent.notify_change()
+            if step == 0: agent.notify_change()
+            if step == warmup: drift.reset()  # freeze calibrated baselines
             action = agent.act(obs)
             next_obs, reward, term, trunc, _ = env.step(action)
             total += float(reward)
             act_arr = np.asarray(action, dtype=np.float32).ravel()
             vs = surprise_gaussian(dyn, bnn, obs, act_arr, next_obs, reward)
-            drift.update(max(min(vs["nu2"], 50.0), 1e-6))
+            drift.update(vs["nu2"], vs["delta_n"])
             post += 1
             if post % K_FORGET == 0:
-                forget_gaussian(bnn, drift, inflate_mode="additive", q_max=0.1)
+                f_info = forget_gaussian(bnn, drift, inflate_mode="additive", q_max=0.1)
             obs = next_obs
             if term or trunc: break
         returns.append(total)

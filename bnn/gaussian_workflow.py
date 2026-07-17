@@ -162,19 +162,38 @@ def inflate_toward_prior(bnn, rho, forget_mean=FORGET_MEAN):
 def forget_gaussian(bnn, drift_filter, inflate_mode=INFLATE_MODE,
                     q_scale=Q_SCALE, q_max=Q_MAX, deadband=LAMBDA_DEADBAND,
                     kappa=KAPPA):
-    """Gaussian-native re-inflation.  Applies the configured mode and returns the
-    q_hat (additive) or rho (retention) actually used (0.0 if below the deadband)."""
-    q_hat = q_scale * drift_filter.drift_estimate(kappa)
+    """Gaussian-native re-inflation.  Applies the configured mode and returns a dict
+    with keys: triggered (bool), q_hat/rho (float), sigma_before, sigma_after,
+    delta_sigma, and optional dual-channel info."""
+    # Handle DualDriftFilter
+    if hasattr(drift_filter, 'mean_channel'):
+        q_hat, ch_info = drift_filter.drift_estimate(kappa)
+    else:
+        q_hat = drift_filter.drift_estimate(kappa)
+        ch_info = {}
+    q_hat = q_scale * q_hat
+
+    sigma_before = mean_sigma(bnn)
+
     if q_hat <= deadband:
-        return 0.0
+        return {"triggered": False, "q_hat": q_hat,
+                "sigma_before": sigma_before, "sigma_after": sigma_before,
+                "delta_sigma": 0.0, **ch_info}
+
     if inflate_mode == "additive":
-        q_hat = min(q_hat, q_max)     # cap the per-application jump (anti-overshoot)
+        q_hat = min(q_hat, q_max)
         inflate_by_process_noise(bnn, q_hat)
-        return q_hat
+        sigma_after = mean_sigma(bnn)
+        return {"triggered": True, "q_hat": q_hat,
+                "sigma_before": sigma_before, "sigma_after": sigma_after,
+                "delta_sigma": sigma_after - sigma_before, **ch_info}
     elif inflate_mode == "retention":
         rho = float(np.clip(1.0 / max(drift_filter.delta_bar, 1.0), 1e-3, 1.0))
         inflate_toward_prior(bnn, rho)
-        return rho
+        sigma_after = mean_sigma(bnn)
+        return {"triggered": True, "rho": rho,
+                "sigma_before": sigma_before, "sigma_after": sigma_after,
+                "delta_sigma": sigma_after - sigma_before, **ch_info}
     raise ValueError(f"unknown inflate_mode {inflate_mode!r}")
 
 

@@ -12,7 +12,7 @@ import torch
 
 from config import device, ETA, GAMMA_UNCERTAINTY
 from env.lunar_lander import build_lunar_lander_env
-from drift import DriftFilterV2
+from drift import DualDriftFilter
 from bnn import make_gaussian_bnn, surprise_gaussian, forget_gaussian, mean_sigma
 
 _HERE = pathlib.Path(__file__).parent
@@ -139,9 +139,8 @@ def main():
         for trial in range(N_TRIALS):
             obs, _ = env.reset()
             bnn.load_state_dict(init_state)
-            drift = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
-            drift.reset()
-            total, post = 0.0, 0
+            drift = DualDriftFilter(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
+            total, post, forget_count, warmup = 0.0, 0, 0, 20
 
             for step in range(TRIAL_LEN):
                 action = mcts_act(dyn, obs)
@@ -150,18 +149,22 @@ def main():
 
                 act_arr = np.array([float(action)], dtype=np.float32)
                 vs = surprise_gaussian(dyn, bnn, obs, act_arr, next_obs, reward)
-                drift.update(max(min(vs["nu2"], 50.0), 1e-6))
+                drift.update(vs["nu2"], vs["delta_n"])
 
                 post += 1
-                if post % K_FORGET == 0:
-                    forget_gaussian(bnn, drift, inflate_mode="additive", q_max=0.1)
+                if post == warmup:
+                    drift.reset()
+                if post >= warmup and post % K_FORGET == 0:
+                    f_info = forget_gaussian(bnn, drift, inflate_mode="additive", q_max=0.1)
+                    if f_info["triggered"]:
+                        forget_count += 1
 
                 obs = next_obs
                 if term or trunc:
                     break
 
             returns.append(total)
-            log(f"  trial {trial+1}/{N_TRIALS}: return={total:.1f} steps={post}")
+            log(f"  trial {trial+1}/{N_TRIALS}: return={total:.1f} steps={post} forget={forget_count}")
 
         log(f"wind={wind:5.0f}: {np.mean(returns):8.1f} ± {np.std(returns):.1f}  ({time.time()-t0:.0f}s)")
         env.close()

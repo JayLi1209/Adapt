@@ -17,7 +17,7 @@ from torch import optim
 
 from config import device, ETA, GAMMA_UNCERTAINTY
 from env.pendulum import build_pendulum_env
-from drift import DriftFilterV2
+from drift import DualDriftFilter
 from bnn import make_gaussian_bnn, surprise_gaussian, forget_gaussian, mean_sigma
 from planning.continuous_cem import ContinuousCEMAgent, H_PLAN, N_CEM_ITERS, N_CANDIDATES, K_MODELS, GAMMA
 
@@ -78,12 +78,11 @@ def run_ours(exp_name, config, bnn, dyn):
         obs, _ = env.reset()
         agent.reset()
         bnn.load_state_dict(init_state)
-        drift = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
-        total, post = 0.0, 0
+        drift = DualDriftFilter(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
+        total, post, forget_count, warmup = 0.0, 0, 0, 20
 
         for step in range(TRIAL_LEN):
             if step == 0:
-                drift.reset()
                 agent.notify_change()
 
             action = agent.act(obs)
@@ -92,12 +91,15 @@ def run_ours(exp_name, config, bnn, dyn):
 
             act_arr = np.asarray(action, dtype=np.float32).ravel()
             vs = surprise_gaussian(dyn, bnn, obs, act_arr, next_obs, reward)
-            raw_s = min(vs["nu2"], 50.0)
-            drift.update(max(raw_s, 1e-6))
+            drift.update(vs["nu2"], vs["delta_n"])
 
             post += 1
-            if post % K_FORGET == 0:
-                forget_gaussian(bnn, drift, inflate_mode="additive", q_max=0.1)
+            if post == warmup:
+                drift.reset()
+            if post >= warmup and post % K_FORGET == 0:
+                f_info = forget_gaussian(bnn, drift, inflate_mode="additive", q_max=0.1)
+                if f_info["triggered"]:
+                    forget_count += 1
 
             obs = next_obs
             if term or trunc:

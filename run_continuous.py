@@ -16,7 +16,7 @@ import torch
 
 from config import device, ETA, GAMMA_UNCERTAINTY
 from env import build_pendulum_env
-from drift import DriftFilterV2
+from drift import DualDriftFilter
 from bnn import make_gaussian_bnn, surprise_gaussian, forget_gaussian, mean_sigma
 from planning.continuous_cem import ContinuousCEMAgent, H_PLAN, N_CEM_ITERS, N_CANDIDATES, K_MODELS, GAMMA
 
@@ -67,7 +67,7 @@ def main():
         obs, _ = eval_env.reset()
         agent.reset()
         bnn.load_state_dict(init_state)
-        drift = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
+        drift = DualDriftFilter(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
 
         total_return = 0.0
         post = 0
@@ -84,16 +84,15 @@ def main():
             # Surprise + forget
             act_arr = np.asarray(action, dtype=np.float32).ravel()
             vs = surprise_gaussian(dyn, bnn, obs, act_arr, next_obs, reward)
-            raw_s = min(vs["nu2"], 50.0)    # clip to prevent overflow
-            drift.update(max(raw_s, 1e-6))
+            drift.update(vs["nu2"], vs["delta_n"])
 
             post_change = step >= CHANGE_STEPS[0]
             if post_change:
                 post += 1
                 if post % K_FORGET == 0:
                     sig_before = mean_sigma(bnn)
-                    applied = forget_gaussian(bnn, drift, inflate_mode="additive",
-                                              q_max=0.1)
+                    f_info = forget_gaussian(bnn, drift, inflate_mode="additive",
+                                             q_max=0.1)
                     sig_after = mean_sigma(bnn)
                     if applied > 0:
                         log(f"  FORGET t={step}: applied={applied:.4f} "

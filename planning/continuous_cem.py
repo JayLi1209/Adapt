@@ -10,7 +10,7 @@ import torch
 from config import device
 
 # ── Planner hyperparameters ────────────────────────────────────────────────────
-H_PLAN = 16              # planning horizon
+H_PLAN = 40              # planning horizon (40 = pendulum physics balance point)
 N_CEM_ITERS = 8          # CEM refinement iterations
 N_CANDIDATES = 512       # action sequences per iteration (must be even)
 ELITE_FRAC = 0.1         # keep top fraction
