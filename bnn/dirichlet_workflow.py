@@ -66,7 +66,7 @@ def surprise_dirichlet(dyn, bnn, obs, action, next_obs, reward, n_draws=20):
     nll = float(-torch.log(p_bar[s2]).item())
     entropy = float((-(p_bar * torch.log(p_bar)).sum()).item())
     delta_n = nll / (entropy + SURPRISE_EPS)
-    d = direction_of(s, a, s2)
+    d = bnn.grid.direction_of(s, a, s2)
     return dict(delta_n=delta_n, nll=nll, entropy=entropy,
                 alpha0=float(alphas.sum(-1).mean().item()),
                 p_dir=p_dirs.mean(0).cpu().numpy(), direction=d,
@@ -89,15 +89,61 @@ def forget_dirichlet(bnn, drift_filter):
     return rho, before, after
 
 
+def unfrozen_params_dirichlet(bnn, n_unfrozen):
+    """Mean weights of the top `n_unfrozen` layers of the DIRECTION path, counted
+    from the Dirichlet head downward into the PRETRAINED trunk.
+
+        n_unfrozen = 0 -> nothing trained (fully frozen; original pipeline)
+        n_unfrozen = 1 -> Dirichlet head only            (head-only adaptation)
+        n_unfrozen = 2 -> head + top trunk layer         (unfreeze 1 pretrained)
+        n_unfrozen = 3 -> head + both trunk layers        (unfreeze 2 pretrained,
+                                                            i.e. the whole path)
+
+    This is the knob for the "how many pretrained layers stay frozen" experiment:
+    with `num_layers=3` the trunk has 2 Bayesian layers, so the direction path is
+    [trunk0, trunk1, dir_head] and n_unfrozen in {1,2,3} sweeps head-only ->
+    head+1-trunk -> head+2-trunk.  Only mu (posterior means) are returned; the
+    variational widths (rho) stay fixed so surprise / forget keep their meaning.
+    """
+    # Direction path ordered top(output) -> down(input): head, then trunk.
+    path = [bnn.bayes_layers[bnn.n_trunk]]                    # Dirichlet head
+    path += list(reversed(list(bnn.bayes_layers[:bnn.n_trunk])))  # trunk, top first
+    n = max(0, int(n_unfrozen))
+    params = []
+    for layer in path[:n]:
+        params += [layer.weight_mu, layer.bias_mu]
+    return params
+
+
+def retrain_dirichlet(bnn, opt, model_in, s2_idx, n_steps=5):
+    """Gradient-retrain the adaptation stack on the post-change buffer.
+
+    model_in : (B, obs+act) raw one-hot rows;  s2_idx : (B, 1) realized cells.
+    Loss is the categorical NLL of the realized cell under the deterministic
+    (mean-weight) forward -- counts/retain participate exactly as at plan time.
+    Returns the last NLL.
+    """
+    nll = None
+    for _ in range(n_steps):
+        opt.zero_grad()
+        mean, _ = bnn._run_network(model_in, sample=False)
+        p = mean[:, :bnn.n_states].clamp_min(SURPRISE_EPS)
+        # The loss function is intentionally missing the KL term for adaptation!
+        nll = -torch.log(p.gather(1, s2_idx)).mean()
+        nll.backward()
+        opt.step()
+    return float(nll.item())
+
+
 @torch.no_grad()
 def mean_alpha0(dyn, bnn, n_draws=4):
     """Average posterior-mean concentration alpha0 over all (s,a) -- a scalar
     confidence summary to log alongside retain."""
     tot, cnt = 0.0, 0
-    for s in range(N_STATES):
-        obs = np.zeros(N_STATES, dtype=np.float32); obs[s] = 1.0
-        for a in range(N_ACTIONS):
-            act = np.zeros(N_ACTIONS, dtype=np.float32); act[a] = 1.0
+    for s in range(bnn.n_states):
+        obs = np.zeros(bnn.n_states, dtype=np.float32); obs[s] = 1.0
+        for a in range(bnn.n_actions):
+            act = np.zeros(bnn.n_actions, dtype=np.float32); act[a] = 1.0
             _, _, alphas = _alpha_draws(dyn, bnn, obs, act, n_draws)
             tot += float(alphas.sum(-1).mean().item()); cnt += 1
     return tot / cnt

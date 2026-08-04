@@ -25,10 +25,12 @@ def make_fl_potential(desc: np.ndarray):
     flat = [c.decode() for c in desc.flatten()]
     nrow, ncol = desc.shape
     n = nrow * ncol
-    goal = flat.index("G")
+    goals = [i for i, ch in enumerate(flat) if ch == "G"]
     holes = {i for i, ch in enumerate(flat) if ch == "H"}
-    dist = {goal: 0}
-    q = deque([goal])
+    # Multi-source BFS: distance to the NEAREST goal (handles the 2-goal bridge;
+    # identical to single-goal BFS when there is only one G).
+    dist = {g: 0 for g in goals}
+    q = deque(goals)
     while q:
         c = q.popleft()
         r, col = divmod(c, ncol)
