@@ -1,39 +1,46 @@
-"""Non-stationary Pendulum environment with mass schedule.
+"""Non-stationary Pendulum environment with mass AND gravity schedules.
 
-Wraps gymnasium's Pendulum-v1 and adds scheduled mass changes to create
-non-stationarity. The agent must adapt when the pendulum's mass changes.
+Wraps gymnasium's Pendulum-v1 and adds scheduled changes to the pendulum mass
+and/or gravity to create non-stationarity. The agent (with a BNN pretrained on
+the DEFAULT dynamics) must adapt online when mass/gravity shift.
 """
 
 import numpy as np
 import gymnasium as gym
-from gymnasium.envs.classic_control.pendulum import PendulumEnv
+from gymnasium.envs.classic_control.pendulum import PendulumEnv  # noqa: F401
 
 
 class PendulumWrapper(gym.Wrapper):
-    """Pendulum-v1 with scheduled mass changes for non-stationarity testing.
+    """Pendulum-v1 with scheduled mass/gravity changes for non-stationarity.
 
     Observations: [cos(theta), sin(theta), theta_dot] (3-dim, float32)
     Actions: [torque] (1-dim, float32, range [-2.0, 2.0])
 
-    mass_schedule: list of (timestep, mass) pairs. At each timestep in the
-    schedule, the pendulum's mass changes to the specified value. The
-    wrapper returns info["change_occurred"] = True on change steps.
+    mass_schedule / gravity_schedule: lists of (timestep, value) pairs. At each
+    listed timestep the pendulum's mass (or gravity) is set to the given value.
+    A t==0 entry sets the value at reset. info["change_occurred"] is True on any
+    step where a mass or gravity change fires.
     """
 
-    def __init__(self, mass_schedule=None):
+    def __init__(self, mass_schedule=None, gravity_schedule=None):
         env = gym.make("Pendulum-v1")
         super().__init__(env)
         self.mass_schedule = sorted(mass_schedule or [], key=lambda x: x[0])
+        self.gravity_schedule = sorted(gravity_schedule or [], key=lambda x: x[0])
         self._base_mass = float(self.unwrapped.m)
+        self._base_grav = float(self.unwrapped.g)
         self._step_count = 0
-        self._change_steps = [t for t, _ in self.mass_schedule]
+        self._change_steps = sorted({t for t, _ in self.mass_schedule}
+                                    | {t for t, _ in self.gravity_schedule})
 
     def reset(self, **kwargs):
         self._step_count = 0
         obs, info = self.unwrapped.reset(**kwargs)
-        if self.mass_schedule:
-            t0_mass = next((m for t, m in self.mass_schedule if t == 0), self._base_mass)
-            self.unwrapped.m = t0_mass
+        # t==0 entries set the starting mass/gravity (else keep the base value).
+        self.unwrapped.m = next((m for t, m in self.mass_schedule if t == 0),
+                                self._base_mass)
+        self.unwrapped.g = next((g for t, g in self.gravity_schedule if t == 0),
+                                self._base_grav)
         return obs.astype(np.float32), info
 
     def step(self, action):
@@ -43,7 +50,10 @@ class PendulumWrapper(gym.Wrapper):
             if self._step_count == t:
                 self.unwrapped.m = mass
                 change_occurred = True
-                break
+        for t, grav in self.gravity_schedule:
+            if self._step_count == t:
+                self.unwrapped.g = grav
+                change_occurred = True
         action = np.clip(np.asarray(action, dtype=np.float32).ravel(), -2.0, 2.0)
         obs, reward, terminated, truncated, info = self.unwrapped.step(action)
         info["change_occurred"] = change_occurred
@@ -54,11 +64,14 @@ class PendulumWrapper(gym.Wrapper):
         return self._change_steps
 
 
-def build_pendulum_env(mass_schedule=None):
-    """Build a Pendulum environment with the given mass schedule.
+def build_pendulum_env(mass_schedule=None, gravity_schedule=None):
+    """Build a Pendulum env with the given mass and/or gravity schedules.
 
-    Example:
-        schedule = [(0, 1.0), (80, 3.0)]  # mass 1.0 then changes to 3.0 at t=80
-        env = build_pendulum_env(schedule)
+    Examples:
+        build_pendulum_env([(0, 1.0), (100, 3.0)])                 # mass 1->3 at t=100
+        build_pendulum_env([(0, 1.0)], [(0, 10.0), (100, 18.0)])   # gravity 10->18 at t=100
     """
-    return PendulumWrapper(mass_schedule=([(0, 1.0)] if mass_schedule is None else list(mass_schedule)))
+    return PendulumWrapper(
+        mass_schedule=([(0, 1.0)] if mass_schedule is None else list(mass_schedule)),
+        gravity_schedule=(list(gravity_schedule) if gravity_schedule else None),
+    )

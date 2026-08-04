@@ -10,13 +10,67 @@ import torch
 from config import device
 
 # ── Planner hyperparameters ────────────────────────────────────────────────────
-H_PLAN = 12              # planning horizon
-N_CEM_ITERS = 5          # CEM refinement iterations
-N_CANDIDATES = 256       # action sequences per iteration (must be even)
+# Swing-up needs ~2s of lookahead (H=40 @ dt=0.05); H=12 CANNOT swing up even with
+# perfect dynamics (see collect_oracle_demos.py) -- so these defaults are the
+# accurate config sweep_pendulum_alpha.py already uses, and every consumer
+# (run_continuous, run_comparison, eval_pendulum*) now starts here.
+H_PLAN = 40              # planning horizon (>= ~40 required for swing-up)
+N_CEM_ITERS = 8          # CEM refinement iterations
+N_CANDIDATES = 500       # action sequences per iteration (must be even)
 ELITE_FRAC = 0.1         # keep top fraction
 CVAR_ALPHA = 1.0         # CVaR tail (1.0 = risk-neutral mean)
 K_MODELS = 1             # posterior BNN draws (1 = fast, >1 = epistemic diversity)
 GAMMA = 0.99             # discount
+
+
+PENDULUM_MAX_SPEED = 8.0     # gymnasium PendulumEnv.max_speed
+
+
+def project_unit_circle(next_obs, max_speed=PENDULUM_MAX_SPEED):
+    """Pendulum obs projection onto the VALID state manifold.
+
+    (1) renormalise (cos,sin) [dims 0,1] to the unit circle;
+    (2) clamp theta_dot [dim 2] to +/- max_speed.
+
+    (2) matters as much as (1): the real env does
+    `newthdot = np.clip(newthdot, -max_speed, max_speed)` every step, so
+    |theta_dot| <= 8 ALWAYS holds in reality and the model was only ever trained
+    on that range.  The learned model has no such clip, so across a 40-step
+    self-feeding rollout imagined theta_dot can run to arbitrary magnitude, far
+    off-distribution -- which both wrecks the state predictions and makes the
+    analytic cost's 0.1*theta_dot^2 term explode (planned returns of -1e35 and
+    float overflow to nan).  Clamping mirrors the env and keeps imagined states
+    inside the training range.
+
+    Pass max_speed=None to restore the old unclamped behaviour.
+    """
+    cs = next_obs[:, :2]
+    norm = cs.norm(dim=1, keepdim=True).clamp_min(1e-6)
+    thdot = next_obs[:, 2:]
+    if max_speed is not None:
+        thdot = thdot.clamp(-max_speed, max_speed)
+    return torch.cat([cs / norm, thdot], dim=1)
+
+
+def pendulum_reward(obs, act):
+    """GROUND-TRUTH Pendulum-v1 reward from (obs, action) -- the analytic cost.
+
+    Mirrors gymnasium PendulumEnv.step exactly:
+        costs = angle_normalize(theta)^2 + 0.1*theta_dot^2 + 0.001*u^2
+        reward = -costs
+    computed from the CURRENT state and action (as the env does), with u clipped
+    to the actuator limit.  obs = [cos(theta), sin(theta), theta_dot]; atan2
+    already returns theta in [-pi, pi], so it IS angle_normalize(theta).
+
+    Using this in the planner instead of the BNN's learned reward head bounds
+    every imagined step's reward at <= 0 (the true MDP's bound), which the
+    unbounded learned head does not respect off-distribution.
+    """
+    theta = torch.atan2(obs[:, 1], obs[:, 0])
+    theta_dot = obs[:, 2]
+    u = act[:, 0].clamp(-2.0, 2.0)
+    costs = theta ** 2 + 0.1 * theta_dot ** 2 + 0.001 * u ** 2
+    return -costs
 
 
 class ContinuousCEMAgent:
@@ -26,9 +80,24 @@ class ContinuousCEMAgent:
                  horizon=H_PLAN, n_cem_iters=N_CEM_ITERS,
                  n_candidates=N_CANDIDATES, elite_frac=ELITE_FRAC,
                  k_models=K_MODELS, cvar_alpha=CVAR_ALPHA, gamma=GAMMA,
+                 obs_project=None, reward_fn=None, reward_clip=None,
                  rng=None, **kwargs):
         self.dyn = dyn
         self.bnn = bnn
+        # Optional analytic reward r(obs_t, act_t) used INSTEAD of the model's
+        # learned reward head during imagined rollouts.  None = use the learned
+        # head (previous behaviour, unbounded off-distribution).
+        self.reward_fn = reward_fn
+        # Optional (lo, hi) clamp on every imagined step's reward.  The analytic
+        # Pendulum reward is <= 0 but UNBOUNDED BELOW, because imagined theta_dot
+        # is not clipped the way the env clips it (max_speed=8), so 0.1*theta_dot^2
+        # can explode and overflow the summed return.  Clamping to the true
+        # per-step range keeps the H-step return finite and comparable.
+        self.reward_clip = reward_clip
+        # Optional callable applied to each imagined next_obs in the rollout, to
+        # keep it on the state manifold (e.g. re-normalise Pendulum's (cos,sin)
+        # to the unit circle) so multi-step model error compounds less.
+        self.obs_project = obs_project
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.device = device
@@ -46,9 +115,19 @@ class ContinuousCEMAgent:
         self._mu = np.zeros((horizon, act_dim), dtype=np.float32)
         self._sigma = np.full((horizon, act_dim), 1.0, dtype=np.float32)
         self._sigma_min = 0.05
+        self._sigma_init = 1.0    # sigma each replan restarts from (see act())
 
         self.surprise_bar = 1.0
         self.n_since_change = 0
+        # Diagnostics: the committed plan's predicted (discounted, H-step) return.
+        # last_plan_return = mean CVaR score of the elite set; _best = top candidate.
+        self.last_plan_return = float("nan")
+        self.last_plan_return_best = float("nan")
+        # When True, act() records per-CEM-iteration diagnostics into self.iter_diag
+        # (pool diversity, score distribution, posterior-draw spread, elites).  Off
+        # by default -- zero overhead on the normal path.
+        self.record_diag = False
+        self.iter_diag = []
 
     def reset(self):
         self._mu = np.zeros((self.horizon, self.act_dim), dtype=np.float32)
@@ -67,8 +146,25 @@ class ContinuousCEMAgent:
         total_batch = J * K
         saved_groups = self.bnn.num_weight_groups
         self.bnn.num_weight_groups = K if K > 1 else 1
+
+        # ── MPC warm start ────────────────────────────────────────────────────
+        # Shift the previous plan forward one step, and RESET sigma so this
+        # replan explores.  self._sigma is overwritten with the elite std at the
+        # end of every CEM iteration below; without re-initialising it here it
+        # carries over from the last act() at ~_sigma_min (0.05), so from step 2
+        # onward every candidate is mu + 0.05*noise around a stale, unshifted mu.
+        # The planner then effectively solves once at step 1 and coasts: it can
+        # never re-plan, and with all candidates near-identical their returns are
+        # near-identical, which also makes CVaR-alpha a no-op after step 1.
+        self._mu = np.roll(self._mu, -1, axis=0)
+        self._mu[-1] = 0.0
+        self._sigma = np.full((H, A), self._sigma_init, dtype=np.float32)
+
+        if self.record_diag:
+            self.iter_diag = []
+
         try:
-            for _ in range(self.n_cem_iters):
+            for _it in range(self.n_cem_iters):
                 # Sample J action sequences: (J, H, A)
                 noise = self.rng.normal(size=(J, H, A)).astype(np.float32)
                 candidates = self._mu + self._sigma * noise
@@ -87,13 +183,32 @@ class ContinuousCEMAgent:
                 returns = torch.zeros(total_batch, device=self.device)
                 disc = 1.0
 
+                # With K>1 posterior draws we MUST sample weights (deterministic
+                # =False), else BayesianLinear returns the mean weights for every
+                # row (see bnn/layers.py: `if not sample: use weight_mu`), the K
+                # draws collapse to identical returns, and CVaR-alpha has NO effect.
+                # K==1 keeps the deterministic mean-model rollout (risk-neutral).
+                rollout_det = (K <= 1)
                 for t in range(H):
                     act_t = torch.as_tensor(act_seqs[:, t, :], dtype=torch.float32,
                                             device=self.device)          # (J*K, act_dim)
+                    cur_obs = obs_t          # state at imagined time t (pre-transition)
                     next_obs, rew, _, _ = self.dyn.sample(
-                        act_t, state, deterministic=True)
+                        act_t, state, deterministic=rollout_det)
+                    if self.obs_project is not None:
+                        next_obs = self.obs_project(next_obs)
 
-                    returns += disc * rew.squeeze(-1)
+                    # Reward from the ANALYTIC cost r(s_t, a_t) when supplied (the
+                    # env computes its reward from the pre-transition state too);
+                    # otherwise fall back to the model's learned reward channel.
+                    if self.reward_fn is not None:
+                        step_rew = self.reward_fn(cur_obs, act_t)
+                    else:
+                        step_rew = rew.squeeze(-1)
+                    if self.reward_clip is not None:
+                        step_rew = step_rew.clamp(self.reward_clip[0],
+                                                  self.reward_clip[1])
+                    returns += disc * step_rew
                     obs_t = next_obs
                     state = self.dyn.reset(obs_t)
                     disc *= self.gamma
@@ -113,6 +228,35 @@ class ContinuousCEMAgent:
                 elite_seq = candidates[elite_idx]                        # (n_elite, H, A)
                 self._mu = elite_seq.mean(axis=0)
                 self._sigma = np.maximum(elite_seq.std(axis=0), self._sigma_min)
+                # Predicted return of the current plan (last iter's values persist).
+                self.last_plan_return = float(scores[elite_idx].mean())
+                self.last_plan_return_best = float(scores.max())
+
+                if self.record_diag:
+                    finite = scores[np.isfinite(scores)]
+                    top5 = np.sort(finite)[-5:][::-1] if len(finite) else np.array([])
+                    # epistemic spread = how differently the K posterior draws of the
+                    # SAME candidate score, averaged over candidates (diverse pool?).
+                    epi_within = (float(np.nanmean(returns_grouped.std(axis=1)))
+                                  if K > 1 else 0.0)
+                    self.iter_diag.append(dict(
+                        it=_it,
+                        # candidate-pool diversity (action space)
+                        pool_a0_std=float(candidates[:, 0, 0].std()),
+                        pool_seq_std=float(candidates.std(axis=0).mean()),
+                        # score distribution across the J candidates
+                        score_min=float(finite.min()) if len(finite) else float("nan"),
+                        score_mean=float(finite.mean()) if len(finite) else float("nan"),
+                        score_max=float(finite.max()) if len(finite) else float("nan"),
+                        score_std=float(finite.std()) if len(finite) else float("nan"),
+                        n_nonfinite=int(np.sum(~np.isfinite(scores))),
+                        # posterior-draw diversity within a candidate (epistemic)
+                        epi_within=epi_within,
+                        elite_score_mean=float(self.last_plan_return),
+                        top5_scores=[round(float(x), 3) for x in top5],
+                        mu_a0=float(self._mu[0, 0]),
+                        sigma_a0=float(self._sigma[0, 0]),
+                    ))
         finally:
             self.bnn.num_weight_groups = saved_groups
 

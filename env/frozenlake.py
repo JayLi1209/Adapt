@@ -62,17 +62,22 @@ def slip_to_dist(intended_prob):
     return [p, side, side]
 
 
-def build_scheduled_env(intended_prob_schedule=INTENDED_PROB_SCHEDULE):
+def build_scheduled_env(intended_prob_schedule=INTENDED_PROB_SCHEDULE,
+                        max_episode_steps=None):
     """4x4 ns-gym FrozenLake whose slipperiness follows `intended_prob_schedule`.
 
     `intended_prob_schedule` is a list of (timestep, intended_prob) pairs.
+    `max_episode_steps` overrides gym's TimeLimit (default None -> the registered
+    100-step limit; pass a large value to effectively disable truncation).
     """
     schedule = sorted(intended_prob_schedule, key=lambda tp: tp[0])
     dist_by_time = {int(t): slip_to_dist(p) for t, p in schedule}
     # Starting distribution = the t=0 entry if given, else deterministic.
     initial_prob_dist = dist_by_time.get(0, [1.0, 0.0, 0.0])
 
-    base_env = gym.make("FrozenLake-v1", map_name="4x4", is_slippery=False)
+    make_kwargs = {} if max_episode_steps is None else {"max_episode_steps": max_episode_steps}
+    base_env = gym.make("FrozenLake-v1", map_name="4x4", is_slippery=False,
+                        **make_kwargs)
     # DistributionStepWiseUpdate installs `update_values` one per scheduler fire,
     # in ascending-time order; the per-trial reset replays the schedule identically.
     fire_times = sorted(dist_by_time)
