@@ -19,7 +19,7 @@ import mbrl.models as models
 
 from planning.base import BNNModelPlanner
 from bnn.dirichlet_workflow import epistemic_dirichlet
-from bnn.dirichlet_model import ALPHA_FLOOR, SURPRISE_EPS, N_STATES, direction_of
+from bnn.dirichlet_model import ALPHA_FLOOR, SURPRISE_EPS
 
 # ── ADA-MCTS hyperparameters ──────────────────────────────────────────────────
 M_SIMULATIONS = 3000      # MCTS iterations per action (paper: 30000)
@@ -67,6 +67,8 @@ class ADAMCTSAgent(BNNModelPlanner):
                  **kwargs):
         super().__init__(dynamics_model, bnn, desc, device,
                          n_actions=n_actions, gamma=gamma, rng=rng, **kwargs)
+        # Grid geometry (generalises the FrozenLake 4x4 assumptions).
+        self.nrow, self.ncol = int(desc.shape[0]), int(desc.shape[1])
         self.m_simulations = m_simulations
         self.cp = cp
         self.eps_e = eps_e
@@ -114,7 +116,7 @@ class ADAMCTSAgent(BNNModelPlanner):
 
     def learn(self, s, a, s2):
         """Update online counts after observing (s,a) → s2."""
-        d = direction_of(s, a, s2)
+        d = self.bnn.grid.direction_of(s, a, s2)
         self.bnn.add_count(s, a, d)
         self._post_change_steps += 1
         if (not self._training_started and
@@ -128,7 +130,7 @@ class ADAMCTSAgent(BNNModelPlanner):
         if key in self._cache:
             return self._cache[key]
 
-        obs = np.zeros(N_STATES, dtype=np.float32)
+        obs = np.zeros(self.n, dtype=np.float32)
         obs[s] = 1.0
         act = np.zeros(self.n_actions, dtype=np.float32)
         act[a] = 1.0
@@ -241,16 +243,19 @@ class ADAMCTSAgent(BNNModelPlanner):
         1. Compute direct reward for each reachable state
         2. If all >= 0 → return p_cells (no pessimism, safe)
         3. Else → one-hot at argmin reward
+
+        Reachable cells come from the grid's K directions (grid-agnostic; the
+        cliff is read as a hole -- no teleport-to-start, the env's terminal_cliff
+        already ended the episode).
         """
-        row, col = divmod(int(s), 4)
+        grid = self.bnn.grid
+        r, c = divmod(int(s), self.ncol)
         reachable = set()
-        for d in [a, (a - 1) % 4, (a + 1) % 4]:
-            nr, nc = row, col
-            if d == 0:    nc = max(col - 1, 0)
-            elif d == 1:  nr = min(row + 1, 3)
-            elif d == 2:  nc = min(col + 1, 3)
-            elif d == 3:  nr = max(row - 1, 0)
-            reachable.add(nr * 4 + nc)
+        for d in grid.dir_actions(int(a)):
+            dr, dc = grid.deltas[int(d)]
+            nr = min(max(r + dr, 0), self.nrow - 1)
+            nc = min(max(c + dc, 0), self.ncol - 1)
+            reachable.add(nr * self.ncol + nc)
 
         # Immediate reward for each reachable state
         rewards = {s2: float(self.cell_reward[s2]) for s2 in reachable}
