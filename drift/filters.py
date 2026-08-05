@@ -8,6 +8,8 @@ DriftFilterV2 : equal-weight, SIGNED drift filter with an empirical baseline (fr
 
 Both are extracted verbatim; only the constant imports changed (now from config).
 """
+from collections import deque
+
 import numpy as np
 
 from config import ETA, GAMMA_UNCERTAINTY, KAPPA
@@ -62,13 +64,22 @@ class DriftFilterV2:
     unchanged and folded into the baseline b; reset() (fired at the change
     notification) freezes b and switches to detection, where lambda_hat is the
     signed equal-weight mean of (delta_n - b).
+
+    window=None (default) averages over ALL post-change samples (the original
+    cumulative behavior).  window=k averages over only the LAST k samples --
+    set k to the forget period so each forget application consumes exactly the
+    evidence gathered since the previous one (no sample drives two
+    applications).  Only sensible when k is large enough to average out the
+    per-sample noise in delta_n; with k ~ 1 the estimate is a single draw and
+    the (shrink-only) forgetting compounds noise instead of canceling it.
     """
 
     def __init__(self, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY,
-                 default_baseline=1.0):
+                 default_baseline=1.0, window=None):
         # eta kept for call-site compatibility; unused (equal weights, not EWMA).
         self.gamma_uncertainty = gamma_uncertainty
         self.default_baseline = default_baseline   # used until b is calibrated
+        self.window = window
         self._b_sum = 0.0
         self._b_n = 0
         self._calibrating = True
@@ -82,6 +93,7 @@ class DriftFilterV2:
         self._sum = 0.0
         self._sumsq = 0.0
         self._n = 0
+        self._buf = deque(maxlen=self.window) if self.window else None
 
     def reset(self):
         # Change notification: stop calibrating, KEEP the learned baseline, and
@@ -96,13 +108,18 @@ class DriftFilterV2:
             self._b_n += 1
             return self.lambda_hat
         excess = delta_n - self.baseline     # SIGNED, EMPIRICAL baseline (not 1.0)
-        self._sum += excess
-        self._sumsq += excess * excess
-        self._n += 1
+        if self._buf is not None:
+            self._buf.append(excess)         # windowed: only the last k samples
+        else:
+            self._sum += excess
+            self._sumsq += excess * excess
+            self._n += 1
         return self.lambda_hat
 
     @property
     def lambda_hat(self):
+        if self._buf is not None:
+            return float(np.mean(self._buf)) if self._buf else 0.0
         return self._sum / self._n if self._n > 0 else 0.0
 
     @property
@@ -112,6 +129,10 @@ class DriftFilterV2:
 
     @property
     def lambda_sd(self):
+        if self._buf is not None:
+            if not self.gamma_uncertainty or len(self._buf) < 2:
+                return 0.0
+            return float(np.sqrt(np.var(self._buf) / len(self._buf)))
         if not self.gamma_uncertainty or self._n < 2:
             return 0.0
         mean = self.lambda_hat

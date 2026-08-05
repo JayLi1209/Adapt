@@ -1,5 +1,5 @@
 """Bayesian (mean-field VI) linear layer -- the only BNN building block the
-Dirichlet world model needs.  Extracted verbatim from bnn_nsant_cem.py.
+Dirichlet world model needs.
 """
 import numpy as np
 import torch
@@ -31,6 +31,19 @@ class BayesianLinear(nn.Module):
         # gradient) pinned to the good pretrained model rather than decaying.
         self.register_buffer("prior_weight_mu", torch.zeros(out_features, in_features))
         self.register_buffer("prior_bias_mu", torch.zeros(out_features))
+
+        # Prior WIDTH for the KL term, per weight.  Initialized to prior_std, so
+        # with the default buffers the KL is exactly the old scalar-prior_std form.
+        # `anchor_prior_to_current(include_sigma=True)` snapshots the CURRENT
+        # widths here, which is what makes an online ELBO a genuine Bayesian
+        # update: forget re-inflates sigma (the "predict" step), the prior is
+        # re-anchored to that inflated belief, and fitting the buffer then
+        # CONTRACTS sigma away from it (the "update" step).  Without this the KL
+        # always pulls sigma toward prior_std = 1.0, i.e. toward more inflation.
+        self.register_buffer("prior_weight_sigma",
+                             torch.full((out_features, in_features), float(prior_std)))
+        self.register_buffer("prior_bias_sigma",
+                             torch.full((out_features,), float(prior_std)))
 
     @property
     def weight_sigma(self):
@@ -70,22 +83,36 @@ class BayesianLinear(nn.Module):
         return y.permute(1, 0, 2).reshape(B, out_f)
 
     def kl_divergence(self) -> torch.Tensor:
-        log_prior = np.log(self.prior_std)
+        """KL( q(w)=N(mu, sigma^2) || p(w)=N(prior_mu, prior_sigma^2) ), summed.
 
-        def _kl(mu, sigma, prior_mu):
+        prior_sigma is per-weight and initialized to prior_std, so unless
+        `anchor_prior_to_current(include_sigma=True)` has been called this is
+        identical to the original scalar-prior_std KL.
+        """
+
+        def _kl(mu, sigma, prior_mu, prior_sigma):
             return 0.5 * (
-                (sigma / self.prior_std) ** 2
-                + ((mu - prior_mu) / self.prior_std) ** 2
+                (sigma / prior_sigma) ** 2
+                + ((mu - prior_mu) / prior_sigma) ** 2
                 - 1.0
-                + 2.0 * (log_prior - torch.log(sigma))
+                + 2.0 * (torch.log(prior_sigma) - torch.log(sigma))
             ).sum()
 
         return (
-            _kl(self.weight_mu, self.weight_sigma, self.prior_weight_mu)
-            + _kl(self.bias_mu, self.bias_sigma, self.prior_bias_mu)
+            _kl(self.weight_mu, self.weight_sigma,
+                self.prior_weight_mu, self.prior_weight_sigma)
+            + _kl(self.bias_mu, self.bias_sigma,
+                  self.prior_bias_mu, self.prior_bias_sigma)
         )
 
-    def anchor_prior_to_current(self):
-        """Set the KL prior mean to the current weights (trust-region anchor)."""
+    def anchor_prior_to_current(self, include_sigma: bool = False):
+        """Set the KL prior mean to the current weights (trust-region anchor).
+
+        include_sigma=True additionally snapshots the current WIDTHS as the prior
+        widths -- use this right after a forget/inflation so the subsequent ELBO
+        contracts from the inflated belief instead of from N(., prior_std)."""
         self.prior_weight_mu.data.copy_(self.weight_mu.data)
         self.prior_bias_mu.data.copy_(self.bias_mu.data)
+        if include_sigma:
+            self.prior_weight_sigma.data.copy_(self.weight_sigma.data)
+            self.prior_bias_sigma.data.copy_(self.bias_sigma.data)

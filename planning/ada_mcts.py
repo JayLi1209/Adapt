@@ -26,6 +26,7 @@ M_SIMULATIONS = 3000      # MCTS iterations per action (paper: 30000)
 CP = math.sqrt(2.0)       # UCT exploration constant
 EPS_E = 0.02              # epistemic uncertainty threshold (paper line 236)
 EPS_A = 0.0               # aleatoric uncertainty threshold
+DPAS_GAMMA = 10000.0      # upstream adamcts.py `gamma` in the aleatoric likelihood
 N_POSTERIOR = 10          # posterior draws for Var_E / Var_A
 H_ROLLOUT = 6             # rollout horizon (match our planner)
 
@@ -61,6 +62,7 @@ class ADAMCTSAgent(BNNModelPlanner):
                  cp=CP,
                  eps_e=EPS_E,
                  eps_a=EPS_A,
+                 dpas_gamma=DPAS_GAMMA,
                  h_rollout=H_ROLLOUT,
                  **kwargs):
         super().__init__(dynamics_model, bnn, desc, device,
@@ -69,6 +71,7 @@ class ADAMCTSAgent(BNNModelPlanner):
         self.cp = cp
         self.eps_e = eps_e
         self.eps_a = eps_a
+        self.dpas_gamma = dpas_gamma
         self.h_rollout = h_rollout
 
         # M_{k-1} frozen snapshot (created at change notification)
@@ -87,6 +90,8 @@ class ADAMCTSAgent(BNNModelPlanner):
         self._training_started = True   # starts True (pre-change, trust model)
         self._n_threshold = 3  # min post-change samples before switching mode
         self._last_dpas_mode = "reg"  # track DPAS decisions for logging
+        self._wc_count = 0            # worst-case samples drawn this act()
+        self._reg_count = 0           # regular samples drawn this act()
 
     # ── snapshot management ──────────────────────────────────────────────────
     def notify_change(self):
@@ -172,28 +177,55 @@ class ADAMCTSAgent(BNNModelPlanner):
 
     # ── DPAS (dual-phase adaptive sampling) ──────────────────────────────────
     def _dpas(self, s, a, child_values):
-        """Return next state s' according to DPAS rule (Algorithm 2 line 53-60).
+        """Dual-Phase Adaptive Sampling -- the ADA-MCTS decision rule.
 
-        child_values: dict {s': value} for already-instantiated children.
+        Ported verbatim from the submodule's ADA-MCTS/adamcts.py
+        `Node.expand()` (chance-node branch).  Upstream names model 1 / model 2;
+        here model 1 = M_k (the CURRENT bnn, which the forget/counts loop is
+        adapting) and model 2 = M_{k-1} (the snapshot frozen at notify_change).
+
+            if (epi_1 + threshold < epi_2) or (not training_started):
+                s' ~ pessimistic(P_1)                       # worst-case, M_k
+            elif ale_1 < ale_2:
+                lik = exp(-gamma * (ale_2 - ale_1))
+                if (ale_2 - ale_1) < 1 and U(0,1) < lik:
+                    s' ~ P_2                                # regular,    M_{k-1}
+                else:
+                    s' ~ pessimistic(P_2)                   # worst-case, M_{k-1}
+            else:
+                s' ~ P_2                                    # regular,    M_{k-1}
+
+        `pessimistic(.)` is Node.pessimistic_sample with danger=False (the
+        setting act_learn.py runs): one-hot the worst-reward reachable cell if
+        any reachable cell has negative reward, else pass the distribution
+        through unchanged.  See _worst_case_sample.
         """
         q = self._query(s, a)
+        epi_k, epi_prev = q["epistemic_k"], q["epistemic_prev"]
+        ale_k, ale_prev = q["aleatoric_k"], q["aleatoric_prev"]
+        p_k, p_prev = q["p_cells_k"], q["p_cells_prev"]
 
-        # Adapted DPAS for Dirichlet BNN with online counts:
-        # Use alpha0 (Dirichlet concentration) as confidence proxy.
-        # M_k accumulates counts → alpha0_k grows → more confident.
-        # M_{k-1} is frozen snapshot at change time.
-        # If alpha0_k hasn't grown enough vs the frozen prior → worst-case.
-        a0_k = q["alpha0_k"]       # M_k concentration (grows with counts)
-        a0_prev = q["alpha0_prev"] # M_{k-1} concentration (frozen)
+        # Phase 1: uninformed about the new MDP -> act worst-case under M_k.
+        if (epi_k + self.eps_e < epi_prev) or (not self._training_started):
+            self._last_dpas_mode = "wc_k"
+            self._wc_count += 1
+            return self._worst_case_sample(s, a, child_values, p_k)
 
-        # Require alpha0_k to be sufficiently larger than alpha0_prev
-        # before trusting M_k's predictions (i.e., switching to regular).
-        confidence_ratio = a0_k / max(a0_prev, 1e-6)
+        # Phase 2: gated by the aleatoric comparison against M_{k-1}.
+        if ale_k + self.eps_a < ale_prev:
+            diff = ale_prev - ale_k
+            likelihood = math.exp(-self.dpas_gamma * diff)
+            if diff < 1.0 and float(self.rng.random()) < likelihood:
+                self._last_dpas_mode = "reg_prev"
+                self._reg_count += 1
+                return self._categorical_sample(p_prev)
+            self._last_dpas_mode = "wc_prev"
+            self._wc_count += 1
+            return self._worst_case_sample(s, a, child_values, p_prev)
 
-        # Pure regular sampling: use BNN's predictive distribution.
-        # (Set wc_weight=0 to disable worst-case, making this plain MCTS-P_{k-1})
-        self._last_dpas_mode = "reg"
-        return self._categorical_sample(q["p_cells_k"])
+        self._last_dpas_mode = "reg_prev"
+        self._reg_count += 1
+        return self._categorical_sample(p_prev)
 
     def _categorical_sample(self, probs):
         probs = np.asarray(probs, dtype=np.float64)

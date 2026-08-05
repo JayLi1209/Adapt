@@ -15,7 +15,7 @@ import torch
 from planning.base import BNNModelPlanner
 
 # ── CEM + CVaR planner hyperparameters (Ayan's note, Sec. 3) ──────────────────
-H_PLAN = 6             # planning horizon
+H_PLAN = 6             # H: planning horizon
 N_CEM_ITERS = 5        # CEM refinement iterations I
 N_CANDIDATES = 256     # action sequences J per iteration
 ELITE_FRAC = 0.1       # rho: elite fraction

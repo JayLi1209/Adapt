@@ -30,8 +30,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-_HERE = pathlib.Path(__file__).parent
-RESULTS_DIR = _HERE / "results"
+_HERE = pathlib.Path(__file__).resolve().parent
+RESULTS_DIR = _HERE.parent / "results"      # sweep logs live at the repo root
 OUT_DIR = RESULTS_DIR / "graph1"
 
 TRUE_P_DIR = np.array([0.7, 0.15, 0.15], dtype=np.float64)

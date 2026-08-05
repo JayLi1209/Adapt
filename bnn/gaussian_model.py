@@ -51,7 +51,8 @@ class BayesianDynamicsModel(models.Model):
     """
 
     def __init__(self, in_size, out_size, device, hid_size=256, num_layers=3,
-                 prior_std=1.0, beta=0.1, num_mc_samples=3, num_weight_groups=1):
+                 prior_std=1.0, beta=0.1, num_mc_samples=3, num_weight_groups=1,
+                 n_adapters=0):
         print("Entered Gaussian BNN Model")
         super().__init__(device)
         self.in_size = in_size
@@ -75,11 +76,35 @@ class BayesianDynamicsModel(models.Model):
             ]
         )
 
+        # Online-adaptation stack: n_adapters PURE linear (no activation) layers
+        # inserted between the frozen trunk and the output layer, identity-
+        # initialized so at reset the predictions are exactly the pretrained
+        # model's.  Kept OUT of bayes_layers: checkpoints load unchanged and
+        # forget/inflate never touch them -- they are gradient-retrained online
+        # instead (see gaussian_workflow.retrain_gaussian).
+        self.adapt_layers = nn.ModuleList([
+            BayesianLinear(hid_size, hid_size, prior_std=prior_std)
+            for _ in range(n_adapters)
+        ])
+        self.reset_adapters()
+
         # Smooth log-variance clamp bounds (PETS-style), learned.
         self.max_logvar = Parameter(0.5 * torch.ones(out_size))
         self.min_logvar = Parameter(-10.0 * torch.ones(out_size))
 
         self.to(device)
+
+    def reset_adapters(self):
+        """Re-init every adapter to near-deterministic identity (weight_mu = I,
+        bias 0, sigma ~ 1e-4): the stack is a no-op until it is retrained."""
+        with torch.no_grad():
+            for layer in self.adapt_layers:
+                layer.weight_mu.copy_(torch.eye(
+                    layer.out_features, layer.in_features,
+                    device=layer.weight_mu.device))
+                layer.bias_mu.zero_()
+                layer.weight_rho.fill_(-9.0)
+                layer.bias_rho.fill_(-9.0)
 
     def _run_network(self, x, sample=True, num_weight_groups=1):
         hidden_layers = self.bayes_layers[:-1]
@@ -88,6 +113,8 @@ class BayesianDynamicsModel(models.Model):
         h = x
         for layer in hidden_layers:
             h = F.silu(layer(h, sample=sample, num_weight_groups=num_weight_groups))
+        for layer in self.adapt_layers:
+            h = layer(h, sample=sample, num_weight_groups=num_weight_groups)
         raw = output_layer(h, sample=sample, num_weight_groups=num_weight_groups)
 
         mean, raw_logvar = raw.chunk(chunks=2, dim=-1)
@@ -102,9 +129,11 @@ class BayesianDynamicsModel(models.Model):
     def _total_kl(self):
         return sum(layer.kl_divergence() for layer in self.bayes_layers)
 
-    def anchor_prior_to_current(self):
-        for layer in self.bayes_layers:
-            layer.anchor_prior_to_current()
+    def anchor_prior_to_current(self, include_sigma: bool = False, layers=None):
+        """Re-anchor the KL prior.  `layers=None` anchors the whole trunk+head;
+        pass a subset to re-anchor only the layers an online ELBO will train."""
+        for layer in (self.bayes_layers if layers is None else layers):
+            layer.anchor_prior_to_current(include_sigma=include_sigma)
 
     def loss(self, model_in, target=None):
         B = model_in.numel() // self.in_size
@@ -157,24 +186,48 @@ class BayesianDynamicsModel(models.Model):
         )
 
 
-def make_gaussian_bnn(obs_dim, act_dim):
+def load_arch(model_dir):
+    """Read arch.json from a checkpoint dir; fall back to the shipped 256x2 trunk."""
+    import json as _json, pathlib as _pl
+    f = _pl.Path(model_dir) / "arch.json"
+    if f.exists():
+        d = _json.loads(f.read_text())
+        return int(d.get("hid_size", 256)), int(d.get("num_layers", 3))
+    return 256, 3
+
+
+def make_gaussian_bnn(obs_dim, act_dim, n_train_layers=1,
+                      hid_size=256, num_layers=3):
     """Gaussian-head model wrapped for the planner.
 
     target_is_delta=True -> sample() returns obs + predicted delta (a 16-cell
                             vector clamped/normalized into p(s') downstream).
     normalize=True        -> model_in is normalized by the loaded env_stats, matching
                             how the checkpoint was pretrained.
+    hid_size / num_layers -> trunk shape.  layer_sizes = [in] + [hid]*(num_layers-1)
+                            + [out*2], so num_layers=3 is the shipped 2-hidden-layer
+                            256-wide net and num_layers=5, hid_size=512 is a
+                            4-hidden-layer 512-wide net.  A checkpoint only loads
+                            into the SAME shape, so pretraining and evaluation must
+                            agree (see arch.json written by pretrain_pendulum.py).
+    n_train_layers        -> size of the online-adaptation stack COUNTING the
+                            output layer: n_train_layers-1 identity-init linear
+                            layers are inserted below it and gradient-retrained
+                            online.  The default 1 inserts nothing -- the shipped
+                            architecture, unchanged (checkpoints load at any
+                            value; the adapters are always fresh).
     """
     bnn = BayesianDynamicsModel(
         in_size=obs_dim + act_dim,
         out_size=obs_dim + 1,
         device=device,
-        hid_size=256,
-        num_layers=3,
+        hid_size=hid_size,
+        num_layers=num_layers,
         prior_std=1.0,
         beta=0.1,
         num_mc_samples=3,
         num_weight_groups=1,
+        n_adapters=n_train_layers - 1,
     )
     dynamics_model = models.OneDTransitionRewardModel(
         bnn, target_is_delta=True, normalize=True, learned_rewards=True

@@ -1,6 +1,6 @@
 """Dirichlet-head BNN world model for ns-gym FrozenLake.
 
-A K=3 Dirichlet head (over {intended, perp_-1, perp_+1}) on a shared Bayesian
+A Dirichlet head on a shared Bayesian
 trunk: the head emits concentrations alpha; the predictive categorical is
 p = alpha/alpha0 (fed to the planner directly), and alpha0 = sum(alpha) is the
 epistemic confidence the forgetting loop turns down.  See the docstring of
@@ -21,9 +21,11 @@ import mbrl.models as models
 
 from bnn.layers import BayesianLinear
 from config import SAVE_DIR, device
+from grids import GridSpec, FROZENLAKE_4x4
 
 # ── geometry / head config ─────────────────────────────────────────────────────
-NROW = NCOL = 4
+NROW = 4
+NCOL = 4
 N_STATES = NROW * NCOL
 N_ACTIONS = 4
 K_DIR = 3                    # Dirichlet categories: [intended, perp(a-1), perp(a+1)]
@@ -41,8 +43,23 @@ LOGVAR_MIN, LOGVAR_MAX = -10.0, 0.5
 # Dedicated checkpoint for the Dirichlet model -- kept separate from the shared
 # Gaussian `bnn_dynamics.pth` (which holds other models) so saving never clobbers
 # it.  The Gaussian file is only ever *read* (trunk source) by load_pretrained_trunk.
-DIRICHLET_CKPT = "bnn_dirichlet_k3.pth"
+DIRICHLET_CKPT = f"bnn_dirichlet_k{K_DIR}.pth"
 GAUSSIAN_CKPT = "bnn_dynamics.pth"
+
+
+def ckpt_name(grid, p=None) -> str:
+    """Per-grid, per-original-p checkpoint filename.
+
+    p is None or 1.0 -> the DETERMINISTIC model; FrozenLake at that setting keeps
+    the shipped name bnn_dirichlet_k3.pth (never overwritten by a p-sweep).
+    Otherwise the original intended-prob p is encoded, e.g.
+        bnn_dirichlet_cliffwalking_k4_p0p7.pth
+    """
+    deterministic = (p is None) or (abs(float(p) - 1.0) < 1e-9)
+    if grid.name == "frozenlake" and deterministic:
+        return DIRICHLET_CKPT
+    ptag = "" if deterministic else f"_p{float(p):g}".replace(".", "p")
+    return f"bnn_dirichlet_{grid.name}_k{grid.k_dir}{ptag}.pth"
 
 
 def _move(s, a, nrow=NROW, ncol=NCOL):
@@ -86,9 +103,14 @@ class DirichletDynamicsModel(models.Model):
     """
 
     def __init__(self, in_size, out_size, device, hid_size=256, num_layers=3,
-                 prior_std=1.0, beta=0.1, num_mc_samples=3, num_weight_groups=1):
-        print("Entered Dirichlet BNN Model")
+                 prior_std=1.0, beta=0.1, num_mc_samples=3, num_weight_groups=1,
+                 grid: GridSpec = FROZENLAKE_4x4):
         super().__init__(device)
+        # Grid geometry (FrozenLake 4x4 by default -- the shipped behaviour).
+        self.grid = grid
+        self.n_states = grid.n_states
+        self.n_actions = grid.n_actions
+        self.k_dir = grid.k_dir
         self.in_size = in_size           # obs_dim + act_dim (raw one-hot concat)
         self.out_size = out_size         # obs_dim + 1 (16 cells + reward)
         self.beta = beta
@@ -105,10 +127,8 @@ class DirichletDynamicsModel(models.Model):
             for i in range(len(hidden_sizes) - 1)
         ]
         self.n_trunk = len(layers)
-        # SEPARATE heads off the shared trunk: the Dirichlet concentrations and the
-        # reward have independent readouts so the reward fit can't be pooled/biased
-        # through a shared output layer.
-        layers.append(BayesianLinear(hid_size, K_DIR, prior_std=prior_std))   # dir head
+        # Separate r and s' prediction so that they don't share the same output layer.
+        layers.append(BayesianLinear(hid_size, self.k_dir, prior_std=prior_std))  # dir head
         layers.append(BayesianLinear(hid_size, 2, prior_std=prior_std))       # reward head
         self.bayes_layers = nn.ModuleList(layers)
 
@@ -116,7 +136,7 @@ class DirichletDynamicsModel(models.Model):
         # symmetric prior CONC_PRIOR (mean -> uniform, entropy up, surprise down).
         self.register_buffer("retain", torch.tensor(float(RETAIN_INIT)))
         # Direction -> cell geometry (fixed grid).
-        self.register_buffer("dir_cells", build_dir_cells())
+        self.register_buffer("dir_cells", grid.build_dir_cells())
 
         # Conjugate Dirichlet-Multinomial online counts: when `use_counts` is on,
         # per-(s,a) directional counts are ADDED to the head's alpha, so the
@@ -124,7 +144,8 @@ class DirichletDynamicsModel(models.Model):
         # the concentration (alpha0) tightens as evidence arrives -- the "learn"
         # half of the loop (forget is the "loosen" half).
         self.use_counts = False
-        self.register_buffer("counts", torch.zeros(N_STATES, N_ACTIONS, K_DIR))
+        self.register_buffer("counts",
+                             torch.zeros(self.n_states, self.n_actions, self.k_dir))
 
         # Whether `loss` trains the reward head.  Default True for generality.
         self.learn_reward = True
@@ -142,8 +163,8 @@ class DirichletDynamicsModel(models.Model):
     # ── core forward: features -> (alpha, reward mu/logvar, geometry) ──────────
     def _forward_alpha(self, x, sample=True, num_weight_groups=1):
         """Return per-row (alpha (B,K), r_mean (B,1), r_logvar (B,1), cells (B,K))."""
-        s = x[:, :N_STATES].argmax(dim=-1)                      # (B,)
-        a = x[:, N_STATES:N_STATES + N_ACTIONS].argmax(dim=-1)  # (B,)
+        s = x[:, :self.n_states].argmax(dim=-1)                          # (B,)
+        a = x[:, self.n_states:self.n_states + self.n_actions].argmax(dim=-1)
         cells = self.dir_cells[s, a]                            # (B,K) long
 
         h = x
@@ -151,6 +172,7 @@ class DirichletDynamicsModel(models.Model):
             h = F.silu(layer(h, sample=sample, num_weight_groups=num_weight_groups))
         dir_head = self.bayes_layers[self.n_trunk]
         reward_head = self.bayes_layers[self.n_trunk + 1]
+        # Separate readouts off the shared trunk features.
         raw_alpha = dir_head(h, sample=sample, num_weight_groups=num_weight_groups)  # (B,K)
         rew = reward_head(h, sample=sample, num_weight_groups=num_weight_groups)     # (B,2)
         r_mean = rew[:, 0:1]
@@ -168,7 +190,7 @@ class DirichletDynamicsModel(models.Model):
     def _cells_from_dir(self, p_dir, cells):
         """Scatter the K directional probs onto the 16-cell simplex (merges walls)."""
         B = p_dir.shape[0]
-        p_cells = torch.zeros(B, N_STATES, device=p_dir.device, dtype=p_dir.dtype)
+        p_cells = torch.zeros(B, self.n_states, device=p_dir.device, dtype=p_dir.dtype)
         p_cells.scatter_add_(1, cells, p_dir)
         return p_cells
 
@@ -218,17 +240,17 @@ class DirichletDynamicsModel(models.Model):
         # supplied by a lookup table at plan time, so the model only needs the
         # transition (Dirichlet) head.
         B = model_in.shape[0]
-        s2 = target[:, :N_STATES].argmax(dim=-1, keepdim=True)   # realized cell
-        r_tgt = target[:, N_STATES:N_STATES + 1]
+        s2 = target[:, :self.n_states].argmax(dim=-1, keepdim=True)  # realized cell
+        r_tgt = target[:, self.n_states:self.n_states + 1]
         nll_acc = torch.zeros(1, device=self.device)
         for _ in range(self.num_mc_samples):
             mean, logvar = self._run_network(model_in, sample=True)
-            p_cells = mean[:, :N_STATES].clamp_min(SURPRISE_EPS)
+            p_cells = mean[:, :self.n_states].clamp_min(SURPRISE_EPS)
             cat_nll = -torch.log(p_cells.gather(1, s2)).mean()
             nll_acc = nll_acc + cat_nll
             if self.learn_reward:
-                r_mean = mean[:, N_STATES:N_STATES + 1]
-                r_logvar = logvar[:, N_STATES:N_STATES + 1]
+                r_mean = mean[:, self.n_states:self.n_states + 1]
+                r_logvar = logvar[:, self.n_states:self.n_states + 1]
                 rew_nll = 0.5 * (r_logvar + (r_tgt - r_mean) ** 2 / torch.exp(r_logvar))
                 nll_acc = nll_acc + rew_nll.mean()
         avg_nll = nll_acc / self.num_mc_samples
@@ -240,8 +262,8 @@ class DirichletDynamicsModel(models.Model):
     def eval_score(self, model_in, target=None):
         with torch.no_grad():
             mean, _ = self._run_network(model_in, sample=False)
-            s2 = target[:, :N_STATES].argmax(dim=-1, keepdim=True)
-            p = mean[:, :N_STATES].clamp_min(SURPRISE_EPS).gather(1, s2)
+            s2 = target[:, :self.n_states].argmax(dim=-1, keepdim=True)
+            p = mean[:, :self.n_states].clamp_min(SURPRISE_EPS).gather(1, s2)
             score = (-torch.log(p)).expand(-1, 1)
         return score, {}
 
@@ -270,8 +292,13 @@ class DirichletDynamicsModel(models.Model):
         skipped = [k for k in own if k not in match]
         own.update(match)
         self.load_state_dict(own, strict=False)
+        # KL-prior buffers (prior_*_mu / prior_*_sigma) are absent from older
+        # checkpoints BY DESIGN -- they correctly fall back to their init (zeros /
+        # prior_std), so their absence is not a head mismatch and must not trigger
+        # the "retrain the head" warning.
         head_skipped = [k for k in skipped
-                        if k.startswith(f"bayes_layers.{self.n_trunk}")]
+                        if k.startswith(f"bayes_layers.{self.n_trunk}")
+                        and ".prior_" not in k]
         if head_skipped:
             print(f"WARNING: {filename} mismatched the head ({len(head_skipped)} "
                   f"tensors skipped) -- heads are FRESH; retrain pretrain_dirichlet.py.")
@@ -291,12 +318,16 @@ class DirichletDynamicsModel(models.Model):
         return sorted(loaded.keys())
 
 
-def make_dirichlet_bnn(obs_dim, act_dim):
+def make_dirichlet_bnn(obs_dim, act_dim, grid: GridSpec = FROZENLAKE_4x4):
     """Dirichlet-head model wrapped so the planner reads p(s') directly.
 
     target_is_delta=False  -> sample() returns the categorical p(s') (no delta).
     normalize=False        -> model_in is the raw (obs,act) one-hot concat, so the
                               head can recover (s,a) by argmax for the geometry.
+
+    Online adaptation is done by gradient-retraining the top layers of the
+    direction path in place (see dirichlet_workflow.unfrozen_params_dirichlet);
+    there is no inserted adapter stack.
     """
     bnn = DirichletDynamicsModel(
         in_size=obs_dim + act_dim,
@@ -308,6 +339,7 @@ def make_dirichlet_bnn(obs_dim, act_dim):
         beta=0.1,
         num_mc_samples=3,
         num_weight_groups=1,
+        grid=grid,
     )
     dynamics_model = models.OneDTransitionRewardModel(
         bnn, target_is_delta=False, normalize=False, learned_rewards=True
