@@ -52,8 +52,15 @@ def cell_reward(grid, s):
 
 
 def active_p_fn(p_schedule):
-    """Return active_p(t) for a (timestep, p) schedule (last p with ts <= t)."""
+    """Return active_p(t) for a (timestep, p) schedule (last p with ts <= t).
+
+    Timestamps must be strictly increasing; a duplicate ts silently changes
+    which p wins the "last entry" lookup, so reject it loudly.
+    """
     schedule = sorted((int(t), float(p)) for t, p in p_schedule)
+    ts = [t for t, _ in schedule]
+    if len(ts) != len(set(ts)):
+        raise ValueError(f"duplicate timestamps in p_schedule: {schedule}")
     times = [t for t, _ in schedule]
 
     def active_p(t):
@@ -361,9 +368,18 @@ def main():
         log("\n" + "=" * 90)
         log(f"2. NON-STATIONARY: p {ORIG_P} -> {p_new} at ts {args.change_step}")
         log("=" * 90)
-        p_schedule = [(0, ORIG_P), (args.change_step, p_new)]
-        dist_by_time = {0: grid.slip_dist(ORIG_P),
-                        args.change_step: grid.slip_dist(p_new)}
+        # A change at ts c means p_new is active from decision epoch c onward.
+        # With c <= 0 the first action already runs under p_new, so the ORIG_P
+        # segment is dropped entirely (two entries with the same ts would make
+        # active_p_fn return the last-sorted one -- silently keeping the env at
+        # ORIG_P forever, as happened in the first experiment round).
+        if args.change_step <= 0:
+            p_schedule = [(0, p_new)]
+            dist_by_time = {0: grid.slip_dist(p_new)}
+        else:
+            p_schedule = [(0, ORIG_P), (args.change_step, p_new)]
+            dist_by_time = {0: grid.slip_dist(ORIG_P),
+                            args.change_step: grid.slip_dist(p_new)}
         methods_map = build_methods(args, grid, bnn, dyn, dist_by_time, methods,
                                     change_step=args.change_step)
         for name, method in methods_map.items():
