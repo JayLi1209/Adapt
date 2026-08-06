@@ -11,6 +11,17 @@
   (1) K_FORGET/forget 策略调优（cliff 上 adaptive < static）；
   (2) ada_mcts bridge 配置问题（stationary 0.68 vs 0.91）。
   commit：74a9a7f（08-05 记录修正）。
+- **2026-08-06 调查完成**（§8 详见）：
+  - **adaptive 变差根因**：forget 是死代码（drift filter 从未 reset → λ̂=0 →
+    rho=1 → no-op）；counts 是毒药（α₀≈3.6 太小，噪声 counts 扭曲均值）。
+  - **修复**：`--drift-reset`（forget 真生效）+ `--k-forget 3` + counts 默认关。
+    cliff p=0.4/0.5/0.6 adaptive 0.667/0.767/0.867 vs static 0.200/0.533/0.733
+    ——**adaptive 全面反超 static**。已设为 runner 默认（commit 待 9b9c564 后）。
+  - **ada_mcts bridge**：stationary 差距主要是采样预算（m=2000 时 0.86 ≈
+    BNN-RATS 0.91）；非平稳崩盘是 DPAS 卡 worst-case（dpas_gamma=10000 →
+    regular 采样概率 exp(-10000·diff)≈0）+ worst-case one-hot 洞；另修复了
+    per-trial 重复 notify_change（每集重新快照 M_{k-1} 退回 worst-case）。
+  - 完整实验用新默认重跑中（/tmp/grid_cliff_fixed2.log、grid_bridge_fixed2.log）。
 
 ## 1. 做了什么（08-06）
 
@@ -105,13 +116,67 @@ ada_mcts             0.050   0.090   0.190   0.310   0.370   0.460
 6. bridge p=0.5 低谷（0.55）是真实结构效应：掉头 slip 下 p=0.5 时前进/后退
    各半，期望位移 0；p=0.4 时"反向意图"反而可利用掉头（slip 0.6 推向目标）。
 
-## 5. 待办调查（进行中）
+## 5. 待办调查（已完成，2026-08-06）
 
-1. **K_FORGET/forget 策略调优**：cliff p≤0.6 上 adaptive 变差，扫描
-   K_FORGET ∈ {1,3,10,20,∞}（及 surprise 阈值/retain 衰减），找 adaptive ≥ static
-   的配置。只跑 BNN 方法，cliff 30 trials，很快。
-2. **ada_mcts bridge 配置**：stationary 0.68 vs 0.91。排查 M_SIMULATIONS、
-   EPS_E、rollout heuristic、DPAS 双相采样与桥掉头 slip 的交互。
+两个调查的完整结论见 §8。runner 新增调查 knob（commit 9b9c564）：
+`--k-forget`、`--count-w`、`--persist-counts`、`--no-drift-reset`、`--counts`、
+`--dpas-gamma`；并修复 ada_mcts per-trial 重复 notify_change。
+
+## 8. 调查结论（2026-08-06）
+
+### 8.1 K_FORGET/forget 策略（cliff，30 trials，γ=0.99）
+
+**根因**：
+- `forget_dirichlet` 的 `rho = 1/max(delta_bar, 1)`：drift filter 从未被
+  `reset()`（一直在 calibrating 模式，λ̂=0 → delta_bar=1 → rho=1）→ **forget
+  永远是 no-op**，adaptive ≡ static + 在线 counts。
+- 预训练 Dirichlet 头 α₀ ≈ 3.6（极小浓度）：一集 episode 内几十个 counts 就
+  把均值从 [0.7,0.15,0.15] 拉成尖峰噪声估计 → RATS 把"自信地错"的模型当真 →
+  沿悬崖走位 → 掉洞。counts 每集清零、drift filter 每集新建，跨集无记忆。
+
+**配置矩阵（cliff p=0.4，goal rate；static=0.200）**：
+| 配置 | p=0.4 | p=0.5 | p=0.6 |
+|---|---|---|---|
+| adaptive 默认（forget 死代码 + counts） | 0.067 | — | — |
+| persist counts w=1 | 0.000 | — | — |
+| persist counts w=0.5 | 0.033 | — | — |
+| drift_reset + K=5（forget 生效 + counts） | 0.367 | 0.533 | 0.667 |
+| drift_reset + K=10 | 0.167 | 0.533 | 0.667 |
+| drift_reset + K=5 + no counts | 0.400 | 0.600 | 0.833 |
+| **drift_reset + K=3 + no counts** | **0.667** | **0.767** | **0.867** |
+| static（参照） | 0.200 | 0.533 | 0.733 |
+
+**机制**：retain 每 K 步按 rho<1 衰减 → alpha → CONC_PRIOR(0.1)→ p_dir →
+[1/3,1/3,1/3] 均匀 → RATS worst-case 在"无信息"模型上走保守路线（绕开悬崖）
+→ cliff 上有安全长路（max_steps=100）时保守 > 自信地错。K 越小先验清除越快。
+counts 有害：α₀ 太小，少量 counts 产生尖峰估计，persist 更差。
+
+**结论与默认**：`--drift-reset`（默认开）+ `--k-forget 3`（默认）+ counts 默认
+关。adaptive 在 cliff 全 p 值反超 static（0.667/0.767/0.867 vs 0.200/0.533/0.733）。
+
+**bridge 特例**：bridge episode 仅 3-4 步，`post` 每集清零到不了 K → forget
+从不触发 → adaptive ≡ static（0.360 @ p=0.4）——per-episode 自适应在短 episode
+任务上结构性失效，需跨集持久化（但 persist counts 在 cliff 上更差，需另设计）。
+
+### 8.2 ada_mcts bridge 配置（trials=50/100，m-sim 扫描）
+
+**stationary（p=0.7）**：0.68（m=1000）→ **0.86（m=2000）**，接近 BNN-RATS
+0.91 —— 主要是采样预算问题（default 1000 sims 太少；m=500 只有 0.40）。
+
+**非平稳（p=0.4）**：即使 m=3000 也只有 0.22 —— 预算不是主因：
+1. **per-trial 重复 notify_change**（已修复）：runner 的 reset() 每集重置
+   `_notified` → 每集 t=0 重新 deepcopy M_{k-1} 并把 `_training_started` 打回
+   False → DPAS 永远在"未知新 MDP"的 worst-case 阶段。修复：notify 每 phase
+   只触发一次（commit 9b9c564）。
+2. **DPAS 卡 worst-case**：phase-2 regular 采样概率
+   `exp(-dpas_gamma·(ale_prev−ale_k))`，`DPAS_GAMMA=10000` → 只要 ale_k 略低于
+   ale_prev（counts 积累后必发生），likelihood≈0 → 永不 regular → 永远
+   worst-case。而 bridge 上 worst-case 把 goal 附近的洞 one-hot 成必达 → 树被
+   毒化。`--dpas-gamma 10` 时 p=0.4 从 0.06 → 0.26，仍远低于 stationary 0.74。
+
+**结论**：baseline 在 bridge 上双重失效（预算 + DPAS 超保守）。若要与 paper
+表对比，需 m=2000+ 且 dpas_gamma 大幅调低；当前默认 m=1000/gamma=10000 的
+ada_mcts 数字代表"严重欠配的 baseline"。
 
 ## 6. 复现命令
 

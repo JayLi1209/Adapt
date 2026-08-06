@@ -42,7 +42,8 @@ _HERE = pathlib.Path(__file__).parent
 GAMMA = 0.99            # discount (user request)
 ORIG_P = 0.7            # "original" env the model is pretrained on
 CHANGE_PS = [0.4, 0.5, 0.6, 0.8, 0.9, 1.0]
-K_FORGET = 5            # forget every K post-change steps
+K_FORGET = 3            # forget every K post-change steps (was 5; 3 beats
+                        # static at all degraded p on cliff, see 08-06 log)
 M_SIMULATIONS = 2000    # ADA-MCTS baseline iterations per action
 N_POSTERIOR = 10        # BNN posterior draws for surprise
 
@@ -313,7 +314,7 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                 max_depth=args.max_depth, adaptive=True,
                                 change_step=change_step,
                                 k_forget=args.k_forget,
-                                use_counts=not args.no_counts,
+                                use_counts=args.use_counts,
                                 persist_counts=args.persist_counts,
                                 count_w=args.count_w,
                                 drift_reset=args.drift_reset)
@@ -340,8 +341,12 @@ def main():
     ap.add_argument("--k-forget", type=int, default=K_FORGET)
     ap.add_argument("--count-w", type=float, default=1.0)
     ap.add_argument("--persist-counts", action="store_true")
-    ap.add_argument("--no-counts", action="store_true")
-    ap.add_argument("--drift-reset", action="store_true")
+    # Fixed 2026-08-06: drift_reset on by default (forget actually fires) and
+    # online counts off by default (they distort the tiny-concentration head).
+    ap.add_argument("--no-drift-reset", dest="drift_reset",
+                    action="store_false", default=True)
+    ap.add_argument("--counts", dest="use_counts",
+                    action="store_true", default=False)
     ap.add_argument("--methods", nargs="*", default=None)
     args = ap.parse_args()
 
