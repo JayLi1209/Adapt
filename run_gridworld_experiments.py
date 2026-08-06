@@ -169,7 +169,8 @@ class BNNRATS:
         self._last = (obs, act_v, nxt, int(s), int(a), int(s2))
 
     def act(self, s, t, p):
-        if self.adaptive and self._last is not None and t > 0:
+        if (self.adaptive and self.change_step is not None
+                and self._last is not None and t > 0):
             obs, act_v, nxt, ps, pa, ps2 = self._last
             vs = surprise_dirichlet(self.dyn, self.bnn, obs, act_v, nxt, 0.0,
                                     n_draws=N_POSTERIOR)
@@ -253,7 +254,14 @@ def run_episode(grid, method, p_schedule, seed, max_steps):
     return G, goal, rewards
 
 
-def build_methods(args, grid, bnn, dyn, dist_by_time, names):
+def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
+    """Build method wrappers.
+
+    change_step=None (the STATIONARY phase) disables the adaptation loops: the
+    surprise/forget/counts loop and the ADA-MCTS change notification never fire,
+    so "adaptive" behaves exactly like "static" -- the stationary check measures
+    the pretrained model, not the adaptation.
+    """
     out = {}
     for name in names:
         if name == "dp_nsmdp":
@@ -269,11 +277,11 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names):
         elif name == "bnn_rats_adaptive":
             out[name] = BNNRATS(bnn, dyn, grid, gamma=GAMMA,
                                 max_depth=args.max_depth, adaptive=True,
-                                change_step=args.change_step)
+                                change_step=change_step)
         elif name == "ada_mcts":
             out[name] = ADAMCTS(bnn, dyn, grid, gamma=GAMMA,
-                                m_simulations=M_SIMULATIONS,
-                                change_step=args.change_step)
+                                m_simulations=args.m_simulations,
+                                change_step=change_step)
         else:
             raise ValueError(f"unknown method {name}")
     return out
@@ -287,6 +295,7 @@ def main():
     ap.add_argument("--change-step", type=int, default=0)
     ap.add_argument("--max-depth", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=None)
+    ap.add_argument("--m-simulations", type=int, default=M_SIMULATIONS)
     ap.add_argument("--methods", nargs="*", default=None)
     args = ap.parse_args()
 
@@ -334,7 +343,8 @@ def main():
     log("=" * 90)
     p_schedule = [(0, ORIG_P)]
     dist_by_time = {0: grid.slip_dist(ORIG_P)}
-    methods_map = build_methods(args, grid, bnn, dyn, dist_by_time, methods)
+    methods_map = build_methods(args, grid, bnn, dyn, dist_by_time, methods,
+                                change_step=None)
     for name, method in methods_map.items():
         Gs, goals = [], []
         for trial in range(args.trials):
@@ -354,7 +364,8 @@ def main():
         p_schedule = [(0, ORIG_P), (args.change_step, p_new)]
         dist_by_time = {0: grid.slip_dist(ORIG_P),
                         args.change_step: grid.slip_dist(p_new)}
-        methods_map = build_methods(args, grid, bnn, dyn, dist_by_time, methods)
+        methods_map = build_methods(args, grid, bnn, dyn, dist_by_time, methods,
+                                    change_step=args.change_step)
         for name, method in methods_map.items():
             Gs, goals = [], []
             trial0_rewards = None
