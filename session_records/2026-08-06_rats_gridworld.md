@@ -21,7 +21,8 @@
     BNN-RATS 0.91）；非平稳崩盘是 DPAS 卡 worst-case（dpas_gamma=10000 →
     regular 采样概率 exp(-10000·diff)≈0）+ worst-case one-hot 洞；另修复了
     per-trial 重复 notify_change（每集重新快照 M_{k-1} 退回 worst-case）。
-  - 完整实验用新默认重跑中（/tmp/grid_cliff_fixed2.log、grid_bridge_fixed2.log）。
+  - 完整实验用新默认重跑完成，最终表见 §9（cliff adaptive 0.800/0.833/0.800
+    vs static 0.200/0.533/0.733 @ p=0.4/0.5/0.6；bridge adaptive≡static）。
 
 ## 1. 做了什么（08-06）
 
@@ -177,6 +178,43 @@ counts 有害：α₀ 太小，少量 counts 产生尖峰估计，persist 更差
 **结论**：baseline 在 bridge 上双重失效（预算 + DPAS 超保守）。若要与 paper
 表对比，需 m=2000+ 且 dpas_gamma 大幅调低；当前默认 m=1000/gamma=10000 的
 ada_mcts 数字代表"严重欠配的 baseline"。
+
+## 9. 最终实验结果（新默认 adaptive，2026-08-06 重跑）
+
+### cliffwalking — goal rate by p
+```
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp             1.000   0.867   1.000   1.000   1.000   1.000
+dp_snapshot          1.000   0.867   1.000   1.000   1.000   1.000
+oracle_rats          0.633   0.700   0.867   1.000   1.000   1.000
+bnn_rats_static      0.200   0.533   0.733   1.000   1.000   1.000
+bnn_rats_adaptive    0.800   0.833   0.800   1.000   1.000   1.000
+ada_mcts             0.567   0.667   0.800   0.967   0.967   1.000
+```
+γ=0.99 return：dp 0.56–0.89 / oracle_rats 0.38–0.89 / static 0.10–0.87 /
+**adaptive 0.43–0.87** / ada_mcts 0.30–0.63
+
+修复后 adaptive 在 p≤0.6 全面反超 static（p=0.4：0.800 vs 0.200），
+接近 oracle_rats（0.633）并逼近 dp（1.000）。
+
+### bridge — goal rate by p
+```
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp             0.730   0.550   0.770   0.980   1.000   1.000
+dp_snapshot          0.730   0.550   0.770   0.980   1.000   1.000
+oracle_rats          0.730   0.550   0.770   0.980   1.000   1.000
+bnn_rats_static      0.360   0.540   0.770   0.980   1.000   1.000
+bnn_rats_adaptive    0.360   0.540   0.770   0.980   1.000   1.000
+ada_mcts             0.060   0.160   0.250   0.390   0.460   0.550
+```
+（bridge 上 adaptive≡static：episode 3–4 步，forget 周期内不触发；
+ada_mcts 仍受 DPAS gamma 压制，见 §8.2）
+
+### stationary（p=0.7）
+cliff：dp 1.000、oracle_rats 0.900、static/adaptive 1.000、ada_mcts 1.000；
+bridge：除 ada_mcts 外均 0.910，ada_mcts 0.710。
+
+log：`/tmp/grid_cliff_fixed2.log`、`/tmp/grid_bridge_fixed2.log`
 
 ## 6. 复现命令
 
