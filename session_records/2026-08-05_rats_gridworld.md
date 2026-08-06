@@ -14,8 +14,8 @@
   **发现更严重的 bug（§5.6）**：p_schedule 在 change_step=0 时两个 ts=0 条目被
   `sorted()` 反序，`active_p(t)` 恒返回 0.7 —— **非平稳阶段环境从未真正变化**，
   §4 全部非平稳数字无效。已修复（change_step<=0 时省略 ORIG_P 段 + active_p_fn
-  拒绝重复时间戳），修复后 dp_nsmdp==dp_snapshot==oracle_rats 于 bridge p=0.4
-  （0.730/0.700，环境真实在 0.4）。完整实验已用修复后代码重跑中，结果待填 §4。
+  拒绝重复时间戳，commit ca0cb99）。**完整实验已重跑**：bridge 结果见 §4（更新），
+  cliff 待完成。
 
 ## 1. 任务背景（用户原始请求）
 
@@ -68,33 +68,62 @@
 
 ## 4. 最终实验结果（已完成，log 在 /tmp/grid_bridge_run.log、/tmp/grid_cliff_run.log）
 
-### cliffwalking — goal rate by p（holes=0）
+### cliffwalking — goal rate by p（**修复后重跑**，环境真实变化）
 ```
 method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
-dp_nsmdp             1.000   1.000   1.000   1.000   1.000   1.000
-dp_snapshot          1.000   1.000   1.000   1.000   1.000   1.000
-oracle_rats          0.900   0.900   0.900   1.000   1.000   1.000
-bnn_rats_static      1.000   1.000   1.000   1.000   1.000   1.000
-bnn_rats_adaptive    0.833   0.833   0.833   0.933   1.000   1.000
-ada_mcts             0.800   0.900   0.933   0.933   1.000   1.000
+dp_nsmdp             1.000   0.867   1.000   1.000   1.000   1.000
+dp_snapshot          1.000   0.867   1.000   1.000   1.000   1.000
+oracle_rats          0.633   0.700   0.867   1.000   1.000   1.000
+bnn_rats_static      0.200   0.533   0.733   1.000   1.000   1.000
+bnn_rats_adaptive    0.067   0.400   0.567   0.933   1.000   1.000
+ada_mcts             0.467   0.633   0.800   0.933   0.967   1.000
 ```
-γ=0.99 折现 return：dp_nsmdp 0.72–0.89 / dp_snapshot 0.78–0.89 / oracle_rats 0.59–0.89 / bnn_static 0.70–0.87 / bnn_adaptive 0.61–0.87 / **ada_mcts 0.43–0.58**
+γ=0.99 return：dp 0.56–0.89 / oracle_rats 0.38–0.89 / bnn_static 0.10–0.87 /
+bnn_adaptive 0.04–0.87 / ada_mcts 0.25–0.61
 
-### bridge — goal rate by p
+关键观察：
+- **dp 的 oracle 几乎满格**（p=0.5 时 0.867：slip [0.5,0.25,0.25] 下最优策略含
+  ~13% 风险，属真实效应）
+- **oracle_rats 在 p≤0.6 明显低于 dp**（0.633 vs 1.000 at p=0.4）：RATS worst-case
+  半径 c=d·L_p·tau=d 过大（d 达 6），真实模型下的最优期望策略被"最坏情形"过度
+  保守化——与 paper 中"不确定半径来自数据"的设定不同
+- **BNN 快照在 p≤0.6 崩得厉害**（p=0.4 仅 0.200）：模型在 0.7 训练、后验紧致、
+  "自信地错"→ 沿悬崖激进走位 → 掉洞
+- **adaptive < static（p≤0.6）**：K_FORGET=5 每 5 步 forget + 在线 counts 被
+  20000 预训练 counts 稀释 —— 自适应反而伤害模型（§5.2 疑点坐实）。bridge 上
+  adaptive≈static 是因为 episode 太短（3–4 步）循环来不及作用
+- **ada_mcts 在 cliff 低 p 反而超过 BNN-RATS**（p=0.4：0.467 vs 0.200/0.067）——
+  其在线学习适应得快；但 return 恒低于 oracle（p=1.0 时 goal rate 1.000 但
+  return 0.61 vs 0.89），路径绕远
+
+### bridge — goal rate by p（**修复后重跑**，环境真实变化）
 ```
 method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
-dp_nsmdp             0.160   0.740   0.910   0.980   1.000   1.000
-dp_snapshot          0.910   0.910   0.910   0.980   1.000   1.000
-oracle_rats          0.910   0.910   0.910   0.980   1.000   1.000
-bnn_rats_static      0.910   0.910   0.910   0.980   1.000   1.000
-bnn_rats_adaptive    0.910   0.910   0.910   0.980   1.000   1.000
-ada_mcts             0.280   0.170   0.270   0.310   0.470   0.410
+dp_nsmdp             0.730   0.550   0.770   0.980   1.000   1.000
+dp_snapshot          0.730   0.550   0.770   0.980   1.000   1.000
+oracle_rats          0.730   0.550   0.770   0.980   1.000   1.000
+bnn_rats_static      0.360   0.540   0.770   0.980   1.000   1.000
+bnn_rats_adaptive    0.370   0.530   0.760   0.980   1.000   1.000
+ada_mcts             0.050   0.090   0.190   0.310   0.370   0.460
 ```
-γ=0.99 return：dp_nsmdp 0.15–0.98 / 其余 oracle+BNN 0.88–0.98 / **ada_mcts −0.61 至 −0.06**
+γ=0.99 return：oracle 0.52–0.98 / BNN 0.34–0.98 / **ada_mcts −0.80 至 −0.07**
 
-### stationary 验证（p=0.7）
-- bridge：全部方法（除 ada_mcts）0.875 return / 0.910 goal rate；**ada_mcts 仅 −0.562 / 0.200**
-- cliff：dp 1.000 / oracle_rats 0.900 / bnn_static 1.000 / **bnn_adaptive 0.833（bug 污染，见 §5）** / ada_mcts 0.800
+关键观察：
+- 三个 oracle 方法完全一致（真实模型下 RATS worst-case == 期望 DP）
+- **p=0.5 最差（0.55）**：bridge slip 是掉头（opposite），p=0.5 时每步前/后各半，
+  期望位移 0；p=0.4 时最优策略是"反向意图"利用掉头（slip 概率 0.6 反把 agent
+  推向目标）→ 0.73 > 0.55。bridge 结构的真实效应。
+- BNN 在 p≤0.6 明显落后 oracle（p=0.4：0.36 vs 0.73）；adaptive ≈ static：
+  **episode 只有 3–4 步就结束，surprise/forget 循环几乎无机会起作用**。
+- ada_mcts 全面最差（stationary 也仅 0.68 goal rate）——baseline 本身弱。
+
+### stationary 验证（p=0.7，修复后干净数字）
+- bridge：dp/oracle_rats/bnn_static/bnn_adaptive 均 0.875 return / 0.910 goal rate；
+  **ada_mcts 0.410 / 0.680**（旧数字 −0.562/0.200 受 stationary 误触发 bug 污染）
+- cliff：dp 0.784/1.000 / oracle_rats 0.590/0.900 / bnn_static 0.699/1.000 /
+  bnn_adaptive 0.699/1.000（**= static，修复生效**）/ ada_mcts 0.770/1.000
+- 结论：预训练模型在 stationary 表现好（cliff 1.000、bridge 0.910 goal rate）；
+  **ada_mcts 在 bridge stationary 就明显弱**（0.68 vs 0.91），cliff 上正常
 
 ## 5. 已发现的问题 / 待调查
 
