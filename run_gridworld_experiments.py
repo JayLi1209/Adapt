@@ -35,7 +35,7 @@ from drift import DriftFilterV2
 from planning.rats import (
     GridSnapshot, DynamicGridSnapshot, BNNSnapshot, RATS, DPAgent,
 )
-from planning.ada_mcts import ADAMCTSAgent
+from planning.ada_mcts import ADAMCTSAgent, DPAS_GAMMA
 
 _HERE = pathlib.Path(__file__).parent
 
@@ -135,30 +135,46 @@ class DPNSMDP:
 
 class BNNRATS:
     """RATS with the Dirichlet-BNN snapshot; adaptive=True enables the
-    surprise/forget/online-counts loop (our method)."""
+    surprise/forget/online-counts loop (our method).
+
+    knobs (for the adaptive-loop investigation, 2026-08-06):
+      use_counts     : online counts participate in the predictive mean
+      persist_counts : counts survive across episodes (else reset per episode)
+      count_w        : weight per online count observation
+      drift_reset    : switch the drift filter to detection mode at the change
+                       (without it, lambda_hat stays 0 and forget is a no-op)
+    """
 
     name = None
 
     def __init__(self, bnn, dyn, grid, gamma=GAMMA, max_depth=6,
-                 adaptive=False, change_step=0, k_forget=K_FORGET):
+                 adaptive=False, change_step=0, k_forget=K_FORGET,
+                 use_counts=True, persist_counts=False, count_w=1.0,
+                 drift_reset=False):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
         self.adaptive = adaptive
         self.change_step = change_step
         self.k_forget = k_forget
+        self.use_counts = use_counts
+        self.persist_counts = persist_counts
+        self.count_w = count_w
+        self.drift_reset = drift_reset
         self.gamma = gamma
         self.max_depth = max_depth
         self.name = "bnn_rats_adaptive" if adaptive else "bnn_rats_static"
 
     def reset(self):
-        self.bnn.use_counts = self.adaptive
+        self.bnn.use_counts = self.adaptive and self.use_counts
         self.bnn.retain.fill_(1.0)
-        self.bnn.reset_counts()
+        if not (self.adaptive and self.persist_counts):
+            self.bnn.reset_counts()
         self.snap = BNNSnapshot(self.dyn, self.bnn, self.grid)
         self._agent = RATS(self.snap, gamma=self.gamma,
                            max_depth=self.max_depth)
         self.drift = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
+        self._drift_done = False
         self.post = 0
         self._last = None        # (obs, act, next_obs, s, a, s2) of t-1
 
@@ -181,6 +197,11 @@ class BNNRATS:
             obs, act_v, nxt, ps, pa, ps2 = self._last
             vs = surprise_dirichlet(self.dyn, self.bnn, obs, act_v, nxt, 0.0,
                                     n_draws=N_POSTERIOR)
+            if self.drift_reset and not self._drift_done:
+                # change already happened at ts 0: stop "calibrating" so
+                # lambda_hat reflects the post-change surprise and forget fires
+                self.drift.reset()
+                self._drift_done = True
             self.drift.update(vs["delta_n"])
             if t >= self.change_step + 1:
                 self.post += 1
@@ -188,7 +209,7 @@ class BNNRATS:
                     self._forget()
             d = self.grid.direction_of(ps, pa, ps2)
             if d >= 0:
-                self.bnn.add_count(ps, pa, d)
+                self.bnn.add_count(ps, pa, d, w=self.count_w)
             self.snap.clear_cache()
         return self._agent.act(s, t0=t)
 
@@ -202,7 +223,7 @@ class ADAMCTS:
     name = "ada_mcts"
 
     def __init__(self, bnn, dyn, grid, gamma=GAMMA, m_simulations=M_SIMULATIONS,
-                 change_step=0, rng=None):
+                 change_step=0, rng=None, dpas_gamma=DPAS_GAMMA):
         self.bnn = bnn
         self.grid = grid
         self.change_step = change_step
@@ -210,14 +231,20 @@ class ADAMCTS:
         self._agent = ADAMCTSAgent(dyn, bnn, grid.desc_bytes(), device,
                                    n_actions=grid.n_actions, gamma=gamma,
                                    rng=self.rng,
-                                   m_simulations=m_simulations)
+                                   m_simulations=m_simulations,
+                                   dpas_gamma=dpas_gamma)
+        self._notified = False
 
     def reset(self):
         self.bnn.use_counts = True
         self.bnn.retain.fill_(1.0)
         self.bnn.reset_counts()
         self._agent.reset()
-        self._notified = False
+        # NOTE: do NOT reset _notified here.  The env changes once per phase
+        # (ts 0), so notify_change must fire once per phase -- per-trial
+        # re-notify re-snapshots M_{k-1} every episode and keeps DPAS stuck in
+        # worst-case mode (on bridge this one-hots holes near the goal and
+        # collapses the goal rate to ~0.1-0.5).
         self._last = None
 
     def observe(self, s, a, s2):
@@ -284,11 +311,17 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
         elif name == "bnn_rats_adaptive":
             out[name] = BNNRATS(bnn, dyn, grid, gamma=GAMMA,
                                 max_depth=args.max_depth, adaptive=True,
-                                change_step=change_step)
+                                change_step=change_step,
+                                k_forget=args.k_forget,
+                                use_counts=not args.no_counts,
+                                persist_counts=args.persist_counts,
+                                count_w=args.count_w,
+                                drift_reset=args.drift_reset)
         elif name == "ada_mcts":
             out[name] = ADAMCTS(bnn, dyn, grid, gamma=GAMMA,
                                 m_simulations=args.m_simulations,
-                                change_step=change_step)
+                                change_step=change_step,
+                                dpas_gamma=args.dpas_gamma)
         else:
             raise ValueError(f"unknown method {name}")
     return out
@@ -303,6 +336,12 @@ def main():
     ap.add_argument("--max-depth", type=int, default=6)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--m-simulations", type=int, default=M_SIMULATIONS)
+    ap.add_argument("--dpas-gamma", type=float, default=DPAS_GAMMA)
+    ap.add_argument("--k-forget", type=int, default=K_FORGET)
+    ap.add_argument("--count-w", type=float, default=1.0)
+    ap.add_argument("--persist-counts", action="store_true")
+    ap.add_argument("--no-counts", action="store_true")
+    ap.add_argument("--drift-reset", action="store_true")
     ap.add_argument("--methods", nargs="*", default=None)
     args = ap.parse_args()
 
