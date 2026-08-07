@@ -22,7 +22,7 @@ from bnn.dirichlet_workflow import epistemic_dirichlet
 from bnn.dirichlet_model import ALPHA_FLOOR, SURPRISE_EPS
 
 # ── ADA-MCTS hyperparameters ──────────────────────────────────────────────────
-M_SIMULATIONS = 3000      # MCTS iterations per action (paper: 30000)
+M_SIMULATIONS = 3000      # MCTS simulations (rollouts) per action (paper: 30000)
 CP = math.sqrt(2.0)       # UCT exploration constant
 EPS_E = 0.02              # epistemic uncertainty threshold (paper line 236)
 EPS_A = 0.0               # aleatoric uncertainty threshold

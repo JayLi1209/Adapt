@@ -25,6 +25,7 @@ Run:
 """
 
 import argparse
+import multiprocessing
 import pathlib
 
 import numpy as np
@@ -47,8 +48,10 @@ ORIG_P = 0.7            # "original" env the model is pretrained on
 CHANGE_PS = [0.4, 0.5, 0.6, 0.8, 0.9, 1.0]
 K_FORGET = 3            # forget every K post-change steps (was 5; 3 beats
                         # static at all degraded p on cliff, see 08-06 log)
-M_SIMULATIONS = 5000    # ADA-MCTS baseline iterations per action (paper: 30000;
-                        # upstream demo: 5000 -- see 08-07 timing test)
+M_SIMULATIONS = 30000   # ADA-MCTS baseline simulations (rollouts) per action,
+                        # per the paper.  7.3s/action (cliff) serial; the
+                        # parallel runner (--workers, 16-core machine) makes the
+                        # full sweep feasible: ~6-8h for cliff, ~1.5h for bridge.
 N_POSTERIOR = 10        # BNN posterior draws for surprise
 RATS_DEPTH = 3          # RATS depth (paper's documented value)
 DP_DEPTH = 100          # DP depth (>= horizon -> exact)
@@ -376,10 +379,51 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
     return out
 
 
+def _worker(task):
+    """Run ONE (phase, method) task in a worker process and return its results.
+
+    Each worker builds its own grid/BNN/method instance, so no state is shared
+    across tasks -- in particular the ADA-MCTS "notify once per phase" invariant
+    (M_{k-1} is snapshotted once per phase, NOT per trial) is preserved exactly
+    as in the serial runner.  Trials keep their index seeds, so every number is
+    bit-identical to a serial run.
+
+    task = (grid_name, method_name, phase_label, p_schedule, dist_by_time,
+            change_step, trials, max_steps, cfg_dict)
+    """
+    (grid_name, method_name, phase_label, p_schedule, dist_by_time,
+     change_step, trials, max_steps, cfg) = task
+    torch.manual_seed(0)   # posterior draws reproducible across workers/runs
+    grid = get_grid(grid_name)
+    bnn, dyn = make_dirichlet_bnn(grid.n_states, grid.n_actions, grid=grid)
+    ckpt = _HERE / "data" / grid_name / ckpt_name(grid, cfg["orig_p"])
+    if not ckpt.exists():
+        raise FileNotFoundError(f"{ckpt} not found -- run pretrain_gridworld.py")
+    bnn.load(ckpt.parent, filename=ckpt.name)
+    bnn.num_weight_groups = 1
+    bnn.num_train_points = 20000
+    args = argparse.Namespace(**cfg)
+    method = build_methods(args, grid, bnn, dyn, dist_by_time, [method_name],
+                           change_step=change_step)[method_name]
+    Gs, goals, trial0 = [], [], None
+    for trial in range(trials):
+        method.reset()
+        G, goal, rewards = run_episode(grid, method, p_schedule, trial, max_steps)
+        Gs.append(G)
+        goals.append(goal)
+        if trial == 0:
+            trial0 = rewards
+    return dict(phase=phase_label, method=method_name, Gs=Gs, goals=goals,
+                trial0=trial0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--grid", default="cliffwalking")
     ap.add_argument("--trials", type=int, default=30)
+    ap.add_argument("--workers", type=int, default=12,
+                    help="parallel processes (tasks = methods x phases; "
+                         "16-core machine -> 12 is a good default)")
     ap.add_argument("--change-p", type=float, nargs="*", default=None)
     ap.add_argument("--change-step", type=int, default=0)
     ap.add_argument("--max-depth", type=int, default=None,
@@ -409,7 +453,6 @@ def main():
     methods = args.methods or ["dp_nsmdp", "dp_snapshot", "oracle_rats",
                                "rats_pkminus1", "bnn_rats_static",
                                "bnn_rats_adaptive", "ada_mcts", "mcts_static"]
-    out_dir = _HERE / "data" / grid.name
     log_path = _HERE / f"gridworld_{grid.name}_results.log"
     out = open(log_path, "w")
 
@@ -425,46 +468,22 @@ def main():
     log(f"  original p={ORIG_P} | change at ts {args.change_step} -> "
         f"p in {change_ps}")
     log(f"  gamma={GAMMA} | rats_depth={args.rats_depth} dp_depth={args.dp_depth} "
-        f"| max_steps={max_steps} | trials={args.trials}")
+        f"| max_steps={max_steps} | trials={args.trials} | workers={args.workers}")
     log(f"  methods: {methods}")
+    log(f"  ADA-MCTS: {args.m_simulations} simulations/action (paper value)")
     log("=" * 90)
 
-    # ── load the pretrained BNN ────────────────────────────────────────────
-    bnn, dyn = make_dirichlet_bnn(grid.n_states, grid.n_actions, grid=grid)
-    ckpt = out_dir / ckpt_name(grid, ORIG_P)
-    if ckpt.exists():
-        bnn.load(out_dir, filename=ckpt_name(grid, ORIG_P))
-        log(f"loaded pretrained model {ckpt}")
-    else:
-        log(f"WARNING: {ckpt} not found -- run pretrain_gridworld.py first!")
-    bnn.num_weight_groups = 1
-    bnn.num_train_points = 20000
-
-    # ── 1. STATIONARY verification (p = ORIG_P throughout) ────────────────
-    log("\n" + "=" * 90)
-    log(f"1. STATIONARY verification (p={ORIG_P}) -- pretrained model must "
-        f"perform well")
-    log("=" * 90)
-    p_schedule = [(0, ORIG_P)]
-    dist_by_time = {0: grid.slip_dist(ORIG_P)}
-    methods_map = build_methods(args, grid, bnn, dyn, dist_by_time, methods,
-                                change_step=None)
-    for name, method in methods_map.items():
-        Gs, goals = [], []
-        for trial in range(args.trials):
-            method.reset()
-            G, goal, _ = run_episode(grid, method, p_schedule, trial, max_steps)
-            Gs.append(G)
-            goals.append(goal)
-        log(f"  {name:<18s}: return {np.mean(Gs):+.3f} | goal rate "
-            f"{np.mean(goals):.3f}")
-
-    # ── 2. NON-STATIONARY: introduce the change ────────────────────────────
-    summary = {}
+    # ── build (phase, method) tasks ─────────────────────────────────────────
+    cfg = dict(orig_p=ORIG_P, rats_depth=args.rats_depth, dp_depth=args.dp_depth,
+               k_forget=args.k_forget, use_counts=args.use_counts,
+               persist_counts=args.persist_counts, count_w=args.count_w,
+               drift_reset=args.drift_reset,
+               m_simulations=args.m_simulations, dpas_gamma=args.dpas_gamma)
+    tasks = []
+    # 1. stationary verification (change_step=None disables adaptation)
+    tasks.append((args.grid, "stationary", [(0, ORIG_P)],
+                  {0: grid.slip_dist(ORIG_P)}, None))
     for p_new in change_ps:
-        log("\n" + "=" * 90)
-        log(f"2. NON-STATIONARY: p {ORIG_P} -> {p_new} at ts {args.change_step}")
-        log("=" * 90)
         # A change at ts c means p_new is active from decision epoch c onward.
         # With c <= 0 the first action already runs under p_new, so the ORIG_P
         # segment is dropped entirely (two entries with the same ts would make
@@ -477,24 +496,42 @@ def main():
             p_schedule = [(0, ORIG_P), (args.change_step, p_new)]
             dist_by_time = {0: grid.slip_dist(ORIG_P),
                             args.change_step: grid.slip_dist(p_new)}
-        methods_map = build_methods(args, grid, bnn, dyn, dist_by_time, methods,
-                                    change_step=args.change_step)
-        for name, method in methods_map.items():
-            Gs, goals = [], []
-            trial0_rewards = None
-            for trial in range(args.trials):
-                method.reset()
-                G, goal, rewards = run_episode(grid, method, p_schedule, trial,
-                                               max_steps)
-                Gs.append(G)
-                goals.append(goal)
-                if trial == 0:
-                    trial0_rewards = rewards
-            summary.setdefault(name, {})[p_new] = (np.mean(Gs), np.mean(goals))
+        tasks.append((args.grid, f"p={p_new:g}", p_schedule, dist_by_time,
+                      args.change_step))
+    full_tasks = [
+        (args.grid, name, phase, p_sched, dist, cs, args.trials, max_steps, cfg)
+        for (_, phase, p_sched, dist, cs) in tasks for name in methods
+    ]
+
+    # ── run in parallel; results come back in completion order ─────────────
+    # spawn (NOT fork): torch's CUDA state cannot be re-initialized in forked
+    # children once the parent has touched the driver (torch.cuda.is_available()
+    # in config.py already does).  Workers re-import and build everything.
+    ctx = multiprocessing.get_context("spawn")
+    summary = {}
+    seen_phases = set()
+    with ctx.Pool(args.workers) as pool:
+        for res in pool.imap_unordered(_worker, full_tasks):
+            phase, name = res["phase"], res["method"]
+            if phase not in seen_phases:
+                seen_phases.add(phase)
+                log("\n" + "=" * 90)
+                if phase == "stationary":
+                    log(f"1. STATIONARY verification (p={ORIG_P}) -- pretrained "
+                        f"model must perform well")
+                else:
+                    log(f"2. NON-STATIONARY: p {ORIG_P} -> {phase} at "
+                        f"ts {args.change_step}")
+                log("=" * 90)
+            Gs, goals = res["Gs"], res["goals"]
+            if phase != "stationary":
+                p_val = float(phase.split("=")[1])
+                summary.setdefault(name, {})[p_val] = (np.mean(Gs), np.mean(goals))
             log(f"  {name:<18s}: return {np.mean(Gs):+.3f} | goal rate "
                 f"{np.mean(goals):.3f}")
-            log(f"      per-step rewards (trial 0): "
-                f"{[round(r, 1) for r in trial0_rewards]}")
+            if res["trial0"] is not None:
+                log(f"      per-step rewards (trial 0): "
+                    f"{[round(r, 1) for r in res['trial0']]}")
 
     # ── summary table ──────────────────────────────────────────────────────
     log("\n" + "=" * 90)
