@@ -5,6 +5,12 @@
 
 ## Progress Log
 
+- **2026-08-07 (docs)**: 依据 `doc_tool/` 四份文档审查 gridworld 实验保真度，
+  新建 `doc_tool/experiment_fidelity_review.md`（匹配项/偏差项逐项对照，结论：
+  大体忠实、bridge 几何与 slip、cliff 每步惩罚、MCTS 预算三处使数字不可与论文
+  直接比较）；补全 `doc_tool/Catch_Me_If_You_Can.md`（abstract、问题假设、
+  BNN 建模、offline training、FIR 算法 + confidence-gated CVaR-CEM + Algorithm 1）。
+  commit 05b5bfa（doc_tool/ 全部 5 个文件入库）。
 - **2026-08-06**: 创建本文档。完成非平稳 schedule bug 的完整实验重跑
   （cliff 30 trials、bridge 100 trials，6 方法 × 6 个 p 值，γ=0.99，m-sim=1000），
   全部数字修正为"环境真实变化"下的结果。两个待办调查启动：
