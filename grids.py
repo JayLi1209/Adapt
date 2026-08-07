@@ -39,14 +39,20 @@ class GridSpec:
     dir_offsets: Tuple[int, ...]
     # How the (1-p) slip mass is distributed among the non-intended directions:
     #   "perp"     -> split equally over the PERPENDICULAR dirs; opposite gets 0
-    #                 (FrozenLake & CliffWalking, per Luo et al.: (1-p)/2 each)
+    #                 (FrozenLake & CliffWalking & Bridge, per Luo et al. and the
+    #                 official nsbridge_v0.py: slip mass goes to the up/down cells
+    #                 of the current cell, (1-p)/2 each)
     #   "opposite" -> all of (1-p) goes to the OPPOSITE direction
-    #                 (Bridge, per Lecarpentier & Rachelson 2019)
+    #                 (deprecated; was Bridge before the 2026-08-07 fix)
     slip_mode: str = "perp"
     # char map, row strings (S start, G goal, H hole/cliff, F free)
     desc: Tuple[str, ...] = ()
     # CliffWalking-style teleport: cliff cells send the agent back to start
     cliff_to_start: bool = False
+    # per-step penalty paid on every non-goal landing (CliffWalking, per Luo
+    # et al.: "the agent concedes a penalty for each step it takes except the
+    # goal").  0.0 for the other grids.
+    step_penalty: float = 0.0
 
     @property
     def n_states(self) -> int:
@@ -160,17 +166,23 @@ CLIFFWALKING_4x12 = GridSpec(
     # ns_gym sets next_state = start_state for every cliff landing, regardless of
     # terminal_cliff (terminal_cliff only controls the `terminated` flag).
     cliff_to_start=True,
+    # per-step penalty, per Luo et al.: -1 on every step except arriving at G.
+    step_penalty=-1.0,
 )
 
-# Bridge (Lecarpentier & Rachelson 2019): intended prob p, OPPOSITE prob 1-p.
+# Bridge (Lecarpentier & Rachelson 2019 / Luo et al. 2024): intended prob p,
+# slip (1-p)/2 each to the PERPENDICULAR (up/down) cells of the current cell --
+# on the bridge row those are the shoulders, on the shoulders they are the
+# holes above/below (the official nsbridge_v0.py geometry).  K=3 support
+# [intended, perp-up, perp-down] in the LEFT/DOWN/RIGHT/UP action order.
 # 5x8 map, goals on both ends of the middle row, holes above/below the bridge.
 BRIDGE_5x8 = GridSpec(
     name="bridge",
-    nrow=5, ncol=8, n_actions=4, k_dir=2,
+    nrow=5, ncol=8, n_actions=4, k_dir=3,
     # LEFT, DOWN, RIGHT, UP  (same action order as FrozenLake)
     deltas=((0, -1), (1, 0), (0, 1), (-1, 0)),
-    dir_offsets=(0, 2),                 # intended, opposite
-    slip_mode="opposite",
+    dir_offsets=(0, 3, 1),              # intended, perp-up(3), perp-down(1)
+    slip_mode="perp",
     desc=("HHHHHHHH",
           "FFFFFHHH",
           "GFFFSFFG",

@@ -4,17 +4,20 @@ Mirrors the ADA-MCTS paper's (Luo et al. 2024) Cliff-Walking / NS-Bridge tables,
 plus our adaptive variant.  The model is pretrained on the ORIGINAL env (p=0.7);
 "introducing the new environment" changes p to {0.4, 0.5, 0.6, 0.8, 0.9, 1.0}.
 
-Methods:
-  DP-NSMDP (oracle)      omniscient -- plans with the true schedule
-  DP-snapshot (oracle)   re-plans each step with the true CURRENT model
-  Oracle RATS (P_k)      RATS with the true CURRENT model
-  BNN RATS static        RATS with the pretrained BNN (P-hat_{k-1}), no adaptation
-  BNN RATS adaptive      RATS + surprise/forget/online-counts on the same BNN
-  ADA-MCTS               the baseline (notified of the change)
+Methods (column alignment with the ADA-MCTS paper, Luo et al. 2024, Table 1/2):
+  DP-NSMDP (oracle)     omniscient -- plans with the true schedule
+  DP-snapshot (oracle)  re-plans each step with the true CURRENT model
+  RATS-P_k (oracle)     RATS with the true CURRENT model
+  RATS-P_{k-1} (oracle) RATS with the true OLD model (p=0.7, never updated)
+  RATS-P_hat_{k-1}      RATS with the pretrained BNN, no adaptation
+  FIR-RATS (ours)       RATS + surprise/forget/online-counts on the same BNN
+  ADA-MCTS              the paper's method (DPAS, notified of the change)
+  MCTS-P_hat_{k-1}      plain MCTS with the pretrained BNN, no notification
 
 gamma = 0.99 (per user request; CLAUDE.md's no-discount default is overridden).
-Per-step rewards are logged; both the raw discounted return (holes -1) and the
-goal rate (holes 0, the paper's convention) are reported.
+Per-step rewards are logged; both the raw discounted return (per-step penalty
+incl.) and the goal rate (holes 0, the paper's convention) are reported.
+RATS depth defaults to 3 (the paper's documented value); DP to 100 (exact).
 
 Run:
     python run_gridworld_experiments.py --grid cliffwalking --trials 30
@@ -44,12 +47,20 @@ ORIG_P = 0.7            # "original" env the model is pretrained on
 CHANGE_PS = [0.4, 0.5, 0.6, 0.8, 0.9, 1.0]
 K_FORGET = 3            # forget every K post-change steps (was 5; 3 beats
                         # static at all degraded p on cliff, see 08-06 log)
-M_SIMULATIONS = 2000    # ADA-MCTS baseline iterations per action
+M_SIMULATIONS = 5000    # ADA-MCTS baseline iterations per action (paper: 30000;
+                        # upstream demo: 5000 -- see 08-07 timing test)
 N_POSTERIOR = 10        # BNN posterior draws for surprise
+RATS_DEPTH = 3          # RATS depth (paper's documented value)
+DP_DEPTH = 100          # DP depth (>= horizon -> exact)
 
 
 def cell_reward(grid, s):
-    return {"G": 1.0, "H": -1.0}.get(grid.flat_desc[int(s)], 0.0)
+    c = grid.flat_desc[int(s)]
+    if c == "G":
+        return 1.0
+    if c == "H":
+        return -1.0
+    return grid.step_penalty
 
 
 def active_p_fn(p_schedule):
@@ -79,12 +90,17 @@ def active_p_fn(p_schedule):
 # ── methods (each is a class: act(s, t, p) + per-trial reset()) ────────────────
 
 class OracleRATS:
+    """RATS with the true model.  fixed_p=None -> the true CURRENT model each
+    step (the paper's RATS-P_k); fixed_p -> a FROZEN true model at that p
+    (RATS-P_{k-1}: the pre-change model, never updated)."""
+
     name = "oracle_rats"
 
-    def __init__(self, grid, gamma=GAMMA, max_depth=6):
+    def __init__(self, grid, gamma=GAMMA, max_depth=RATS_DEPTH, fixed_p=None):
         self.grid = grid
         self.gamma = gamma
         self.max_depth = max_depth
+        self.fixed_p = fixed_p
         self._agent = RATS(None, gamma=gamma, max_depth=max_depth, grid=grid)
 
     def reset(self):
@@ -94,14 +110,25 @@ class OracleRATS:
         pass
 
     def act(self, s, t, p):
-        self._agent.model = GridSnapshot(self.grid, p)
+        p_use = self.fixed_p if self.fixed_p is not None else p
+        self._agent.model = GridSnapshot(self.grid, p_use)
         return self._agent.act(s, t0=t)
+
+
+class RatsPkMinus1(OracleRATS):
+    """RATS-P_{k-1}: RATS with the true OLD model (p=0.7) -- an oracle baseline
+    that ignores the change, as in the ADA-MCTS paper's table."""
+
+    name = "rats_pkminus1"
+
+    def __init__(self, grid, gamma=GAMMA, max_depth=RATS_DEPTH):
+        super().__init__(grid, gamma=gamma, max_depth=max_depth, fixed_p=ORIG_P)
 
 
 class DPSnapshot:
     name = "dp_snapshot"
 
-    def __init__(self, grid, gamma=GAMMA, max_depth=6):
+    def __init__(self, grid, gamma=GAMMA, max_depth=DP_DEPTH):
         self.grid = grid
         self._agent = DPAgent(None, gamma=gamma, max_depth=max_depth, grid=grid)
 
@@ -119,7 +146,7 @@ class DPSnapshot:
 class DPNSMDP:
     name = "dp_nsmdp"
 
-    def __init__(self, grid, dist_by_time, gamma=GAMMA, max_depth=6):
+    def __init__(self, grid, dist_by_time, gamma=GAMMA, max_depth=DP_DEPTH):
         self._agent = DPAgent(DynamicGridSnapshot(grid, dist_by_time),
                               gamma=gamma, max_depth=max_depth,
                               is_model_dynamic=True)
@@ -148,7 +175,7 @@ class BNNRATS:
 
     name = None
 
-    def __init__(self, bnn, dyn, grid, gamma=GAMMA, max_depth=6,
+    def __init__(self, bnn, dyn, grid, gamma=GAMMA, max_depth=RATS_DEPTH,
                  adaptive=False, change_step=0, k_forget=K_FORGET,
                  use_counts=True, persist_counts=False, count_w=1.0,
                  drift_reset=False):
@@ -224,10 +251,11 @@ class ADAMCTS:
     name = "ada_mcts"
 
     def __init__(self, bnn, dyn, grid, gamma=GAMMA, m_simulations=M_SIMULATIONS,
-                 change_step=0, rng=None, dpas_gamma=DPAS_GAMMA):
+                 change_step=0, rng=None, dpas_gamma=DPAS_GAMMA, counts=True):
         self.bnn = bnn
         self.grid = grid
         self.change_step = change_step
+        self.counts = counts
         self.rng = rng or np.random.default_rng(0)
         self._agent = ADAMCTSAgent(dyn, bnn, grid.desc_bytes(), device,
                                    n_actions=grid.n_actions, gamma=gamma,
@@ -237,7 +265,7 @@ class ADAMCTS:
         self._notified = False
 
     def reset(self):
-        self.bnn.use_counts = True
+        self.bnn.use_counts = self.counts
         self.bnn.retain.fill_(1.0)
         self.bnn.reset_counts()
         self._agent.reset()
@@ -259,6 +287,20 @@ class ADAMCTS:
         obs = np.zeros(self.grid.n_states, dtype=np.float32)
         obs[int(s)] = 1.0
         return int(np.argmax(self._agent.act(obs)))
+
+
+class MCTSStatic(ADAMCTS):
+    """MCTS-P_hat_{k-1}: plain MCTS on the pretrained BNN, no change
+    notification, no online learning -- the paper's non-adaptive learned-model
+    baseline (ADA-MCTS with the DPAS adaptation disabled)."""
+
+    name = "mcts_static"
+
+    def __init__(self, bnn, dyn, grid, gamma=GAMMA,
+                 m_simulations=M_SIMULATIONS, rng=None, dpas_gamma=DPAS_GAMMA):
+        super().__init__(bnn, dyn, grid, gamma=gamma,
+                         m_simulations=m_simulations, change_step=None,
+                         rng=rng, dpas_gamma=dpas_gamma, counts=False)
 
 
 def run_episode(grid, method, p_schedule, seed, max_steps):
@@ -301,17 +343,19 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
     for name in names:
         if name == "dp_nsmdp":
             out[name] = DPNSMDP(grid, dist_by_time, gamma=GAMMA,
-                                max_depth=args.max_depth)
+                                max_depth=args.dp_depth)
         elif name == "dp_snapshot":
-            out[name] = DPSnapshot(grid, gamma=GAMMA, max_depth=args.max_depth)
+            out[name] = DPSnapshot(grid, gamma=GAMMA, max_depth=args.dp_depth)
         elif name == "oracle_rats":
-            out[name] = OracleRATS(grid, gamma=GAMMA, max_depth=args.max_depth)
+            out[name] = OracleRATS(grid, gamma=GAMMA, max_depth=args.rats_depth)
+        elif name == "rats_pkminus1":
+            out[name] = RatsPkMinus1(grid, gamma=GAMMA, max_depth=args.rats_depth)
         elif name == "bnn_rats_static":
             out[name] = BNNRATS(bnn, dyn, grid, gamma=GAMMA,
-                                max_depth=args.max_depth, adaptive=False)
+                                max_depth=args.rats_depth, adaptive=False)
         elif name == "bnn_rats_adaptive":
             out[name] = BNNRATS(bnn, dyn, grid, gamma=GAMMA,
-                                max_depth=args.max_depth, adaptive=True,
+                                max_depth=args.rats_depth, adaptive=True,
                                 change_step=change_step,
                                 k_forget=args.k_forget,
                                 use_counts=args.use_counts,
@@ -323,6 +367,10 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                 m_simulations=args.m_simulations,
                                 change_step=change_step,
                                 dpas_gamma=args.dpas_gamma)
+        elif name == "mcts_static":
+            out[name] = MCTSStatic(bnn, dyn, grid, gamma=GAMMA,
+                                   m_simulations=args.m_simulations,
+                                   dpas_gamma=args.dpas_gamma)
         else:
             raise ValueError(f"unknown method {name}")
     return out
@@ -334,7 +382,10 @@ def main():
     ap.add_argument("--trials", type=int, default=30)
     ap.add_argument("--change-p", type=float, nargs="*", default=None)
     ap.add_argument("--change-step", type=int, default=0)
-    ap.add_argument("--max-depth", type=int, default=6)
+    ap.add_argument("--max-depth", type=int, default=None,
+                    help="DEPRECATED: use --rats-depth / --dp-depth")
+    ap.add_argument("--rats-depth", type=int, default=RATS_DEPTH)
+    ap.add_argument("--dp-depth", type=int, default=DP_DEPTH)
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--m-simulations", type=int, default=M_SIMULATIONS)
     ap.add_argument("--dpas-gamma", type=float, default=DPAS_GAMMA)
@@ -349,13 +400,15 @@ def main():
                     action="store_true", default=False)
     ap.add_argument("--methods", nargs="*", default=None)
     args = ap.parse_args()
+    if args.max_depth is not None:
+        args.rats_depth = args.dp_depth = args.max_depth
 
     grid = get_grid(args.grid)
     max_steps = args.max_steps or (10 if grid.name == "bridge" else 100)
     change_ps = args.change_p if args.change_p else CHANGE_PS
     methods = args.methods or ["dp_nsmdp", "dp_snapshot", "oracle_rats",
-                               "bnn_rats_static", "bnn_rats_adaptive",
-                               "ada_mcts"]
+                               "rats_pkminus1", "bnn_rats_static",
+                               "bnn_rats_adaptive", "ada_mcts", "mcts_static"]
     out_dir = _HERE / "data" / grid.name
     log_path = _HERE / f"gridworld_{grid.name}_results.log"
     out = open(log_path, "w")
@@ -371,8 +424,8 @@ def main():
         f"K={grid.k_dir})")
     log(f"  original p={ORIG_P} | change at ts {args.change_step} -> "
         f"p in {change_ps}")
-    log(f"  gamma={GAMMA} | max_depth={args.max_depth} | max_steps={max_steps} "
-        f"| trials={args.trials}")
+    log(f"  gamma={GAMMA} | rats_depth={args.rats_depth} dp_depth={args.dp_depth} "
+        f"| max_steps={max_steps} | trials={args.trials}")
     log(f"  methods: {methods}")
     log("=" * 90)
 

@@ -5,6 +5,30 @@
 > 实验（`run_gridworld_experiments.py`）的设定逐项核对。
 > 结论速览：**大体忠实，但 bridge 环境、cliff 奖励结构、MCTS 预算三处偏差使
 > 数字不能与论文表格直接数值比较**。
+>
+> **2026-08-07 修正状态（对齐 Act As You Learn 论文，用户指示："算法对齐的
+> 不应该是 RATS 论文，而是 act as you learn 论文，找不到的设置，就用这个
+> repo 里的设置。确保公平比较，实验用的设置一致即可"）**：
+>
+> - ✅ §2.1 bridge slip 方向：**已修正**。BRIDGE_5x8 改为 K=3 垂直 slip
+>   [p,(1-p)/2,(1-p)/2]（官方 nsbridge_v0.py 几何：slip 质量去当前格的上/下格），
+>   与 ADA-MCTS 论文一致；不再采用"掉头"。
+> - ✅ §2.5 cliff 每步惩罚：**已修正**。GridSpec.step_penalty=-1.0，非目标格
+>   每步 −1（"except the goal"），G +1 / H −1 保留。
+> - ✅ §2.7 RATS 深度：**已修正**。RATS 默认深度 3（论文文档值）；DP 深度 100
+>   （精确）。新增 --rats-depth / --dp-depth。
+> - ✅ §2.6 MCTS 迭代数：**部分对齐**。30000 在 Python 移植上实测 7.5s/action
+>   （cliff 全量 ≈75h），不可行；采用 upstream demo 的 5000（ADA-MCTS/act_learn.py
+>   `search(5000)`），并在报告中声明。
+> - ✅ 方法列：**已对齐**。新增 rats_pkminus1（RATS-P_{k-1}，固定 p=0.7 oracle）
+>   与 mcts_static（MCTS-ĥP_{k-1}，无通知无在线学习）。
+> - ℹ️ §2.3 变化语义：ts-0 突变保留（ADA-MCTS 离散突变 $M_{k-1}\to M_k$ 的
+>   实例化，非 RATS 论文连续演化——对齐目标已明确为 ADA-MCTS）。
+> - ℹ️ t=0 确定斜坡（官方 nsbridge 的 T[s,a,0]=确定）：**有意不实现**——属于
+>   RATS 论文连续演化设定；且 L_p=1.0 下斜坡在 t≥1 即饱和（λ=1/(1−p)），只
+>   影响每 episode 第一步。已在实验报告中声明。
+> - ✅ 对齐决策：γ=0.99 保留（任务规格）；oracle 角色分工、p 集合、EPS、
+>   slip 结构不变。
 
 ## 1. 逐项对照表
 

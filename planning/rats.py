@@ -96,8 +96,14 @@ def worstcase_distribution_direct_method(v, w0, c, d):
 # ── grid geometry helpers ───────────────────────────────────────────────────────
 
 def cell_reward_of(grid):
-    """Reward-on-arrival per cell (goal +1, hole -1, frozen/start 0)."""
-    return np.array([{"G": 1.0, "H": -1.0}.get(c, 0.0) for c in grid.flat_desc])
+    """Reward-on-arrival per cell.
+
+    Goal +1; every other landing pays grid.step_penalty (CliffWalking -1 per
+    step, per Luo et al.); holes additionally get their -1 -- on grids without a
+    step penalty this reduces to {G:+1, H:-1, else 0}.
+    """
+    return np.array([1.0 if c == "G" else -1.0 if c == "H"
+                     else grid.step_penalty for c in grid.flat_desc])
 
 
 def bfs_dist_to_goal(grid):
