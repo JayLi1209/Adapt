@@ -78,6 +78,11 @@ trials、MCTS 迭代数）取本仓库设定或 upstream demo 设定，确保所
 | CliffWalking 4x12 | S(3,0)，G(3,11)，悬崖 H 一行 | K=3 垂直：[p, (1-p)/2, (1-p)/2] | G +1，H −1（终止），**其余每步 −1** | 100 |
 | NS-Bridge 5x8 | 中间一行桥面，两端 G，上下为洞 | K=3 垂直：[p, (1-p)/2, (1-p)/2]，滑向当前格上/下格 | G +1，H −1，其余 0 | 10 |
 
+> 两个环境均为**离散**（discrete）格子世界：状态 = 有限个格子（cliff 48、
+> bridge 40），动作 = 4 方向，转移由 K=3 方向的离散分布刻画；对应 Dirichlet
+> 头的 BNN。连续环境（pendulum / lunar lander，Gaussian 头 + CVaR-CEM 规划器）
+> 是另一组实验（`run_pendulum_all.py` 等），不在本报告。
+
 - **变化语义**：agent 在 ts 0 收到变化通知，p 从 p₀=0.7 瞬间变为
   p ∈ {0.4, 0.5, 0.6, 0.8, 0.9, 1.0} 并保持（ADA-MCTS 离散突变 $M_{k-1}\to M_k$ 的
   实例化；比"变化发生在途中"更极端——agent 没有任何 p=0.7 的在线体验）。
@@ -98,98 +103,129 @@ Dirichlet BNN：3 层贝叶斯线性主干（256 隐藏，softplus，Kaiming，K
 Adam lr=1e-3，目标分布为 p=0.7 的 slip。验证：预测 p_dir 与目标
 [0.7, 0.15, 0.15] 的 MAE：cliff 0.004、bridge 0.007（GOOD）。
 
-## 4. 方法（Method）：FIR + 风险规避规划
+## 4. 方法（Method）
 
-### 4.1 FIR 在线机制（Algorithm 1）
+### 4.0 总览：我们的方法由三个正交组件构成
 
-**记号**：变化通知后，$\bar p(\cdot|s,a)$ 为 BNN 的权重平均预测分布，
-$H(\bar p)$ 为其熵，$s_{t+1}$ 为实际转移。
+| 组件 | 是什么 | 本文的选择 |
+|---|---|---|
+| **组件 1：世界模型（world model）** | 对转移 $P(s'|s,a)$ 的（贝叶斯）估计 | 预训练 BNN，Dirichlet 头（离散环境）/ Gaussian 头（连续环境） |
+| **组件 2：适应机制（adaptation）** | 变化发生后如何更新模型 | **FIR（本文贡献）**：surprise → drift → forget → learn |
+| **组件 3：规划器（planner）** | 基于当前模型选动作的决策器 | RATS（离散，本报告实验用）或 置信门控 CVaR-CEM（连续环境用） |
 
-**Step 1 — 校准惊讶度（Surprise）**。对 Dirichlet 头：
+**回答一个易混淆点：4.1 / 4.2 / 4.3 不是三个方法，而是组件 2 / 组件 3 的两个
+选项。本报告实验中的"我们的完整方法" = 组件1(预训练 Dirichlet BNN) + 组件2(FIR)
++ 组件3(RATS)，即结果表中的 `bnn_rats_adaptive`（论文列名 FIR-RATS）。**
+CVaR-CEM 规划器用于连续环境（pendulum / lunar lander，`run_pendulum_all.py` 等
+另一组实验），不在本报告的 gridworld 实验里。
+
+**本报告的两个环境都是离散的**（格子世界 tabular gridworld：cliff 48 个格、
+bridge 40 个格，动作 = 上下左右 4 方向，转移由 K=3 方向的离散分布刻画，
+用 Dirichlet 头的 BNN）。连续环境（Gaussian 头 + CVaR-CEM）是另一套实验脚本。
+
+### 4.1 组件 2：FIR 适应机制（Forget–Inflate–Retrain，本文贡献，Algorithm 1）
+
+**记号**：变化通知后，$\bar p(\cdot|s,a)$ 为 BNN 的权重平均预测分布
+（predictive distribution），$H(\bar p)$ 为其熵（entropy），$s_{t+1}$ 为实际转移。
+
+**Step 1 — 校准惊讶度（calibrated surprise score）**。对 Dirichlet 头：
 
 $$\delta_t = \frac{-\log \bar p_{s_{t+1}}}{H(\bar p)}, \qquad \mathbb{E}[\delta_t] = 1 \ \text{（模型正确时）}$$
 
 正确模型每步"代价"约 1；真正误预测的转移（环境突变）把 δ 推到远高于 1。
 （连续环境用归一化马氏距离 $\frac1d(s_{t+1}-\mu)^\top\Sigma^{-1}(s_{t+1}-\mu)$。）
 
-**Step 2 — 漂移滤波器（Drift）**。原始惊讶度流有噪声。DriftFilterV2 在变化前处于
-校准模式，把样本折入经验基线 b（≈1）；reset()（变化通知时触发）冻结基线并进入检测
-模式：$\hat\lambda = \frac1n \sum_i (\delta_{n,i} - b)$，$\bar\delta = 1 + \hat\lambda$。
-带符号累积：如果证据实际上说"没变"，$\bar\delta$ 会被拉回 1 以下，forget 自动停止。
+**Step 2 — 漂移滤波器（drift filter）**。原始惊讶度流有噪声。DriftFilterV2 在
+变化前处于校准模式，把样本折入经验基线 b（≈1）；reset()（变化通知时触发）冻结
+基线并进入检测模式：$\hat\lambda = \frac1n \sum_i (\delta_{n,i} - b)$，
+$\bar\delta = 1 + \hat\lambda$。带符号累积：如果证据实际上说"没变"，
+$\bar\delta$ 会被拉回 1 以下，forget 自动停止。
 
-**Step 3 — 忘记 / 膨胀（Forget）**。保留因子 $\rho = 1/\max(\bar\delta, 1) \in (0,1]$，
-标量保留状态 $r \leftarrow r\cdot\rho$（每 K_FORGET=3 步施加一次）。对 Dirichlet 头：
+**Step 3 — 忘记 / 膨胀（forget / re-inflate）**。保留因子（retention factor）
+$\rho = 1/\max(\bar\delta, 1) \in (0,1]$，标量保留状态 $r \leftarrow r\cdot\rho$
+（每 K_FORGET=3 步施加一次）。对 Dirichlet 头：
 
-$$\alpha_k^{\text{eff}} = \underbrace{c + r(\alpha_k^{\text{head}} - c)}_{\text{forget 作用于此}} + \underbrace{N_k}_{\text{在线计数}}, \qquad c = 0.1 \ (\text{对称先验})$$
+$$\alpha_k^{\text{eff}} = \underbrace{c + r(\alpha_k^{\text{head}} - c)}_{\text{forget 作用于此}} + \underbrace{N_k}_{\text{在线计数}}, \qquad c = 0.1 \ (\text{对称先验 symmetric prior})$$
 
-均值被拉向均匀，更重要的是总浓度 $\alpha_0 \to Kc$ 坍缩——抽样 $p\sim\text{Dir}(\alpha)$
-的方差 $p_k(1-p_k)/(\alpha_0+1)$ 增大，实现"置信重新膨胀"。
+均值被拉向均匀，更重要的是总浓度（total concentration）$\alpha_0 \to Kc$ 坍缩——
+抽样 $p\sim\text{Dir}(\alpha)$ 的方差 $p_k(1-p_k)/(\alpha_0+1)$ 增大，实现
+"置信重新膨胀"（把旧模型"自信但错误"的置信度破坏掉）。
 
-**Step 4 — 学习 / 重训（Learn/Retrain）**。在线共轭计数 $N \leftarrow N + \mathbf{1}(s,a,s_{t+1})$
-逐 (s,a) 累积；有效后验 = 保留先验 + 新鲜计数，预测均值向变化后的经验频率迁移。
-（batched ELBO 重训在连续环境/长视界启用；本实验默认关闭——小浓度头部下计数会
-扭曲预测，08-06 调查已定论。）
+**Step 4 — 学习 / 重训（learn / retrain）**。在线共轭计数（conjugate counts）
+$N \leftarrow N + \mathbf{1}(s,a,s_{t+1})$ 逐 (s,a) 累积；有效后验 = 保留先验 +
+新鲜计数，预测均值向变化后的经验频率迁移。（batched ELBO 重训在连续环境/长视界
+启用；本实验默认关闭——小浓度头部下计数会扭曲预测，08-06 调查已定论。）
 
 **Algorithm 1: FIR 在线循环（gridworld 实例化，每 episode）**
 ```
 输入：预训练 BNN（主干冻结）、漂移滤波器 F、RATS 规划器
-1:  t₀ 时刻收到变化通知                    ▷ 有告知变化
+1:  t₀ 时刻收到变化通知                    ▷ 有告知变化（informed change）
 2:  F.reset(); r ← 1; 计数 N ← 0          ▷ 结束校准，进入检测
 3:  for 每一步 t ≥ t₀:
 4:      a_t ← RATS.act(s_t)               ▷ 在 BNN 快照上做 worst-case 极小极大
 5:      执行 a_t，观测 (s_{t+1}, r_t)
-6:      δ_t ← -log p̄(s_{t+1}) / H(p̄)     ▷ 校准惊讶度
-7:      F.update(δ_t)  →  δ̄_t = 1 + λ̂     ▷ 带符号等权滤波
+6:      δ_t ← -log p̄(s_{t+1}) / H(p̄)     ▷ 校准惊讶度（surprise）
+7:      F.update(δ_t)  →  δ̄_t = 1 + λ̂     ▷ 带符号等权滤波（drift）
 8:      if t 距上次 forget ≥ K_FORGET:
 9:          ρ ← 1/max(δ̄_t, 1);  r ← r·ρ    ▷ forget：头部浓度向对称先验收缩
 10:     N ← N + one-hot(s,a,s_{t+1})       ▷ 共轭在线计数（可选，默认关）
 11: end loop
 ```
 
-### 4.2 规划器：RATS（本实验）
+### 4.2 组件 3a：规划器 RATS（Risk-Averse Tree-Search，离散环境，本实验使用）
 
-RATS 在**当前模型快照**上做极小极大：决策节点取 max，机会节点在 Wasserstein 球
+RATS（Lecarpentier & Rachelson 2019）在**当前模型快照（snapshot）**上做
+**极小极大（minimax）**：决策节点取 max，机会节点在 Wasserstein 球
 $W_1 \le d\cdot L_p\cdot\tau$（L_p=1, τ=1）内取 worst-case（Property 3 闭式解），
 深度 3（论文文档值），叶子启发式 $\gamma^{dist(s)}$。FIR 修改后的预测均值
 （retain/counts 参与）就是规划器所用的快照——因此 forget/learn 的适应直接体现在
 规划模型上。
 
-### 4.3 规划器：置信门控 CVaR-CEM（连续环境）
+### 4.3 组件 3b：规划器 置信门控 CVaR-CEM（连续环境，不在本报告）
 
-对连续状态/动作，规划器为 CEM 动作序列搜索，评分取想象 return（K=10 后验模型
-× N=32 偶然 rollout）的经验 CVaR：
+对连续状态/动作，规划器为 CEM（Cross-Entropy Method，交叉熵方法）动作序列搜索，
+评分取想象 return（K=10 后验模型 × N=32 偶然 rollout）的经验 CVaR
+（Conditional Value-at-Risk，条件风险价值）：
 
 $$a^* = \arg\max_a \ \mathrm{CVaR}_{\alpha}[Z(a)], \qquad \alpha = \alpha_{\min} + (\alpha_{\max}-\alpha_{\min})\cdot\text{conf},$$
 
-其中 $\text{conf} = \underbrace{\min(1, n_{\text{post}}/n_{\text{conf}})}_{\text{数据门}} \cdot
-\underbrace{e^{-\max(0,\bar\delta-1)/\tau}}_{\text{惊讶度门}}$。
+其中 $\text{conf} = \underbrace{\min(1, n_{\text{post}}/n_{\text{conf}})}_{\text{数据门 data gate}} \cdot
+\underbrace{e^{-\max(0,\bar\delta-1)/\tau}}_{\text{惊讶度门 surprise gate}}$。
 变化后瞬间 conf≈0 → α≈α_min（最风险厌恶）；新证据累积、惊讶度回落，α→α_max=1
 （风险中性均值）。同一个漂移信号同时驱动模型不确定性与风险准则。
 
-### 4.4 方法列（与 Act As You Learn 表对齐）
+### 4.4 本实验的 8 个方法 = 组件组合（与 Act As You Learn 论文表对齐）
 
-| 方法 | 模型 | 适应 | 规划器 |
-|---|---|---|---|
-| DP-NSMDP (oracle) | 真实时变调度 | — | 期望 DP（精确上界） |
-| DP-snapshot (oracle) | 真实当前模型 | — | 期望 DP |
-| RATS-P_k (oracle) | 真实当前模型 | — | RATS（深度 3） |
-| RATS-P_{k-1} (oracle) | 真实旧模型 p=0.7 | 不更新 | RATS |
-| RATS-ĥP_{k-1} | 预训练 BNN | 不更新 | RATS |
-| **FIR-RATS（本文）** | 预训练 BNN | surprise/forget/counts | RATS |
-| ADA-MCTS | 预训练 BNN | DPAS + 在线学习 | MCTS（5000 次迭代） |
-| MCTS-ĥP_{k-1} | 预训练 BNN | 无通知、无学习 | MCTS |
+> 结果表（§5）里的方法名是 `run_gridworld_experiments.py` 中的运行名；下表给出
+> 每个名字的组件组合、论文列名（oracle = 用真实转移"知道真相"的参照；学习型 =
+> 只用 BNN 预测）与一句话说明。
 
-MCTS 迭代数：论文 30000；Python 移植实测 7.5 s/action，全量实验不可行
-（cliff 约 75 h + bridge 约 25 h），采用 upstream demo 的 5000 次
-（`ADA-MCTS/act_learn.py: search(5000)`）。
+| 运行名 | 论文列 | 模型 | 适应机制 | 规划器 | 一句话 |
+|---|---|---|---|---|---|
+| `dp_nsmdp` | DP-NSMDP (oracle) | 真实**时变**调度 | — | 期望 DP | 全知上界：知道 p(t) 未来怎么变 |
+| `dp_snapshot` | DP-snapshot (oracle) | 真实**当前**模型 | — | 期望 DP | 全知但短视：每步用真实当前 p 重规划 |
+| `oracle_rats` | RATS-P_k (oracle) | 真实当前模型 | — | RATS | 全知 + 风险规避 |
+| `rats_pkminus1` | RATS-P_{k-1} (oracle) | 真实**旧**模型 p=0.7 | 不更新 | RATS | 假装变化没发生（oracle 参照） |
+| `bnn_rats_static` | RATS-ĥP_{k-1} | 预训练 BNN | 无 | RATS | 学习型 + 风险规避，但**不自适应** |
+| `bnn_rats_adaptive` | **FIR-RATS（本文）** | 预训练 BNN | **FIR** | RATS | 学习型 + 风险规避 + **FIR 自适应** |
+| `ada_mcts` | ADA-MCTS | 预训练 BNN | DPAS + 在线学习 | MCTS | **论文方法**（Luo et al. 2024） |
+| `mcts_static` | MCTS-ĥP_{k-1} | 预训练 BNN | 无通知、无学习 | MCTS | 学习型 + 普通 MCTS（无自适应） |
+
+MCTS 预算：论文 30000 simulations（rollouts）/action。Python 移植串行实测
+7.3s/action（cliff），全量约 40h；将 runner 并行化（16 worker，按
+(method, phase) 任务分片，同种子结果与串行逐位一致）后全量可跑，**本报告
+cliff 与 bridge 均使用论文值 30000 simulations**。
 
 ## 5. 实验（Experiments）
 
 ### 5.1 设置
 
-见 §3。全部 8 个方法 × 6 个 p 值；每个 p 值下同种子同环境，所有方法公平对比。
-报告两种指标：**goal rate**（到达 G 的比例，论文 return 约定）与
-**折现 return**（γ=0.99，含每步惩罚）。
+见 §3（环境与变化）、§4.4（8 个方法的组件组合与一句话说明，结果表里的名字
+`dp_nsmdp`/`dp_snapshot`/`oracle_rats`/`rats_pkminus1`/`bnn_rats_static`/
+`bnn_rats_adaptive`/`ada_mcts`/`mcts_static` 都在那里解释）。全部 8 个方法 ×
+6 个 p 值；每个 p 值下同种子同环境，所有方法公平对比。报告两种指标：
+**goal rate（到达 G 的比例，论文 return 约定，holes 记 0）** 与
+**折现 return（discounted return，γ=0.99，含每步惩罚）**。
 
 ### 5.2 结果：stationary 验证（p=0.7）
 
