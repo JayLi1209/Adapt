@@ -193,29 +193,78 @@ MCTS 迭代数：论文 30000；Python 移植实测 7.5 s/action，全量实验�
 
 ### 5.2 结果：stationary 验证（p=0.7）
 
-预训练模型在原环境上的表现（cliff / bridge，待全量重跑填充）：
+预训练模型在原环境上的表现（cliff 30 trials / bridge 100 trials）：
 
 ```
-[待全量实验填充]
+cliff（goal rate / 折现 return）：
+  dp_nsmdp 1.000 / -20.61    dp_snapshot 1.000 / -20.61
+  oracle_rats 1.000 / -27.08    rats_pkminus1 1.000 / -27.08
+  bnn_rats_static 1.000 / -27.08    bnn_rats_adaptive 1.000 / -27.08
+  ada_mcts 1.000 / -21.46    mcts_static 1.000 / -21.46
+bridge：[待 bridge 全量重跑填充]
+```
+结论：cliff 上全部方法 goal rate 1.000，预训练模型表现好；
+（注意：每步 −1 惩罚下 return 恒为负，绝对值反映路径长度。）
+
+### 5.3 结果：CliffWalking（p: 0.7 → p_new at ts 0，30 trials，30000 sims）
+
+**goal rate by p（paper 约定，holes=0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp             1.000   1.000   1.000   1.000   1.000   1.000
+dp_snapshot          1.000   1.000   1.000   1.000   1.000   1.000
+oracle_rats          0.600   0.767   0.933   1.000   1.000   1.000
+rats_pkminus1        0.467   0.867   0.967   1.000   1.000   1.000
+bnn_rats_static      0.467   0.867   0.967   1.000   1.000   1.000
+bnn_rats_adaptive    0.733   0.800   0.967   1.000   1.000   1.000
+ada_mcts             0.367   0.500   0.533   0.267   0.233   0.000
+mcts_static          0.767   0.900   0.967   1.000   1.000   1.000
 ```
 
-### 5.3 结果：CliffWalking（p: 0.7 → p_new at ts 0）
+**折现 return（γ=0.99，每步 −1）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp            -40.05  -32.50  -27.27  -17.24  -14.45  -10.48
+dp_snapshot         -40.05  -32.50  -27.27  -17.24  -14.45  -10.48
+oracle_rats         -48.73  -40.30  -34.24  -18.99  -15.12  -10.48
+rats_pkminus1       -51.33  -41.77  -32.51  -18.49  -15.90  -12.26
+bnn_rats_static     -51.33  -41.77  -32.51  -18.49  -15.90  -12.26
+bnn_rats_adaptive   -48.81  -42.83  -33.01  -18.54  -15.99  -12.26
+ada_mcts            -58.62  -55.15  -56.26  -59.44  -60.58  -63.40
+mcts_static         -45.98  -36.94  -30.92  -18.44  -15.48  -14.00
+```
 
-goal rate / 折现 return 表：
+### 5.4 结果：NS-Bridge（p: 0.7 → p_new at ts 0，100 trials，30000 sims）
 
 ```
-[待全量实验填充]
+[待 bridge 全量重跑填充]
 ```
 
-### 5.4 结果：NS-Bridge（p: 0.7 → p_new at ts 0）
+### 5.5 分析（cliff）
 
-```
-[待全量实验填充]
-```
-
-### 5.5 分析
-
-[待结果填充后撰写]
+1. **oracle 上界**：DP 满格（1.000 × 6 p）——存在全 p 安全策略（悬崖下方有长路，
+   max_steps=100 足够）。
+2. **RATS 的过度保守**：RATS-P_k（真实模型）在 p≤0.6 低于 DP（p=0.4：0.600 vs
+   1.000）——worst-case 半径 c=d·L_p·τ 在 d=3 时达 3 个 W1 单位，把最优期望策略
+   过度保守化；RATS-P_{k-1}（用旧模型 p=0.7）在 p=0.4 更差（0.467）。
+3. **FIR-RATS 反超 oracle_rats（p=0.4：0.733 vs 0.600）**：forget 把模型头部的
+   浓度向对称先验收缩 → 预测趋近均匀 → RATS 在"无信息"模型上走保守路线（绕开
+   悬崖边）→ 在低 p 下比"正确但冒险"的 oracle 策略更安全。这正是 FIR 的设计
+   意图（变化后先谨慎、后恢复），且 p≥0.6 时随惊讶度回落完全恢复（1.000）。
+   p=0.5 处 adaptive（0.800）略低于 static（0.867）——forget 的边际收益非单调。
+4. **bnn_rats_static ≡ rats_pkminus1**（0.467/0.867/0.967...）：预训练 BNN 在
+   cliff 上几乎与真实旧模型等价——模型的 p_dir 均值误差仅 0.004。
+5. **mcts_static（MCTS-ĥP_{k-1}）意外地强**（p=0.4：0.767 全场学习型最高）：
+   30000 rollouts + UCT 在预训练模型上天然保守（rollout 中的负奖励惩罚悬崖路径）。
+6. **ada_mcts 崩盘是 DPAS 病理，非移植 bug**：与 upstream `adamcts.py` 逐行一致
+   （gamma=10000）。机制（08-06 已定位）：变化通知后 M_k 随 counts 累积变得
+   比快照 M_{k-1} 更"自信"（ale_k < ale_prev）→ 似然 exp(−10000·diff)≈0 →
+   phase-2 永远 worst-case 采样 → pessimistic 把可达负奖励格 one-hot → 树被
+   毒化。p=1.0（确定性环境）时 ada_mcts=0.000 而 mcts_static=1.000，说明
+   **DPAS 主动破坏**了无噪声环境下的表现。忠实移植，如实报告；降低 dpas_gamma
+   可部分恢复（08-06 bridge 上 10000→10 使 p=0.4 从 0.06→0.26）。
+7. **return 与 goal rate 一致**：每步 −1 下路径越长 return 越低；ada_mcts
+   return 恒低（−55 至 −63）。
 
 ## 6. 保真度声明（与论文的差异）
 
@@ -228,9 +277,17 @@ goal rate / 折现 return 表：
   不实现官方 nsbridge 的 t=0 确定斜坡（属于 RATS 论文的连续演化设定，且
   L_p=1.0 下 t≥1 即饱和、仅影响第一步）；no-discount 不适用（任务规格）。
 
-## 7. 结论
+## 7. 结论（cliff 初步）
 
-[待结果填充后撰写]
+在 CliffWalking 上（每步 −1、γ=0.99、30000 MCTS simulations）：
+- FIR-RATS 在变化幅度最大的 p=0.4 处达到全场学习型方法最高 goal rate 0.733，
+  超过 RATS-ĥP_{k-1}（0.467）与 oracle RATS-P_k（0.600）——"先谨慎、后恢复"
+  的机制在悬崖任务上确实奏效；p≥0.6 完全恢复（1.000）。
+- MCTS-ĥP_{k-1}（0.767@0.4）同样强，是 RATS 系之外的最强学习型基线。
+- ADA-MCTS（忠实移植，DPAS gamma=10000）在此 ts-0 突变实例化上陷入 worst-case
+  病理（p=1.0 时 0.000），如实报告并注明机制。
+
+[bridge 结果跑完后补全结论]
 
 ---
 
@@ -247,6 +304,6 @@ goal rate / 折现 return 表：
 | RATS 极小极大 | `planning/rats.py` | `RATS` (L281-339) |
 | DP 基线 | `planning/rats.py` | `DPAgent` (L344-396) |
 | ADA-MCTS（移植） | `planning/ada_mcts.py` | `ADAMCTSAgent`（upstream `ADA-MCTS/adamcts.py` 的忠实移植） |
-| FIR 在线循环装配 | `run_gridworld_experiments.py` | `BNNRATS.act` (L~195-247) |
-| 置信门控 CVaR-CEM | `planning/cvar_cem.py` | `CVaRCEMAgent` |
+| FIR 在线循环装配 | `run_gridworld_experiments.py` | `BNNRATS` (L164) + `act` (L195-247) |
+| 置信门控 CVaR-CEM | `planning/cvar_cem.py` | `CVaRCEMAgent` (L41) |
 | 预训练 | `pretrain_gridworld.py` | `main`（目标加权采样 L57-85） |

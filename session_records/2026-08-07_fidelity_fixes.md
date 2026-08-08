@@ -62,7 +62,41 @@
 
 ## 3. 实验结果（修正后全量重跑）
 
-[全量重跑进行中，完成后填充]
+### 3.0 决策：MCTS 预算 = 30000 simulations（论文值，用户选择方案 A）
+
+- 30000 sims 实测：cliff 7.28s/action、bridge 1.77s/action（预热后）。
+- 串行全量 cliff ≈ 40h 不可行 → **runner 并行化**（commit fe0b9f3）：
+  multiprocessing (spawn) 按 (method, phase) 任务 × 16 workers；每个 worker
+  自建 BNN → 保持 ada_mcts "每 phase 只 notify 一次" 不变量与逐 trial 种子
+  （结果与串行逐位一致）；`torch.manual_seed(0)` 保证后验采样可复现。
+- 显存实测：16 worker 启动后 GPU 占用 7.2GB / 剩 16.8GB，安全。
+- 日志行加 `[phase]` 标签（并行到达顺序下 phase 归属清晰）。
+
+### 3.1 cliffwalking（30 trials × 6 p，30000 sims）— 完成
+
+**goal rate by p**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp             1.000   1.000   1.000   1.000   1.000   1.000
+dp_snapshot          1.000   1.000   1.000   1.000   1.000   1.000
+oracle_rats          0.600   0.767   0.933   1.000   1.000   1.000
+rats_pkminus1        0.467   0.867   0.967   1.000   1.000   1.000
+bnn_rats_static      0.467   0.867   0.967   1.000   1.000   1.000
+bnn_rats_adaptive    0.733   0.800   0.967   1.000   1.000   1.000
+ada_mcts             0.367   0.500   0.533   0.267   0.233   0.000
+mcts_static          0.767   0.900   0.967   1.000   1.000   1.000
+```
+stationary（p=0.7）：全部 1.000（dp −20.61、RATS 系 −27.08、MCTS 系 −21.46）。
+
+**要点**：FIR-RATS p=0.4 反超 oracle_rats（0.733 vs 0.600）与 static（0.467）；
+mcts_static 意外强（0.767@0.4）；ada_mcts 崩（DPAS gamma=10000 病理，忠实移植，
+08-06 已定位；p=1.0 0.000 vs mcts_static 1.000）。
+
+log：`gridworld_cliffwalking_results.log`（2026-08-08 完成）。
+
+### 3.2 bridge（100 trials × 6 p，30000 sims）— 进行中
+
+[待完成填充]
 
 ## 4. 与论文的偏差决定（08-07 定稿）
 

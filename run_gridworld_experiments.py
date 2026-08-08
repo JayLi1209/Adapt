@@ -527,8 +527,8 @@ def main():
             if phase != "stationary":
                 p_val = float(phase.split("=")[1])
                 summary.setdefault(name, {})[p_val] = (np.mean(Gs), np.mean(goals))
-            log(f"  {name:<18s}: return {np.mean(Gs):+.3f} | goal rate "
-                f"{np.mean(goals):.3f}")
+            log(f"  [{phase:<8s}] {name:<18s}: return {np.mean(Gs):+.3f} | "
+                f"goal rate {np.mean(goals):.3f}")
             if res["trial0"] is not None:
                 log(f"      per-step rewards (trial 0): "
                     f"{[round(r, 1) for r in res['trial0']]}")
