@@ -94,9 +94,35 @@ mcts_static 意外强（0.767@0.4）；ada_mcts 崩（DPAS gamma=10000 病理，
 
 log：`gridworld_cliffwalking_results.log`（2026-08-08 完成）。
 
-### 3.2 bridge（100 trials × 6 p，30000 sims）— 进行中
+### 3.2 bridge（100 trials × 6 p，30000 sims）— 完成
 
-[待完成填充]
+**goal rate by p**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp             0.190   0.360   0.590   0.930   0.990   1.000
+dp_snapshot          0.190   0.360   0.590   0.930   0.990   1.000
+oracle_rats          0.190   0.360   0.590   0.930   0.990   1.000
+rats_pkminus1        0.190   0.360   0.590   0.930   0.990   1.000
+bnn_rats_static      0.190   0.360   0.590   0.930   0.990   1.000
+bnn_rats_adaptive    0.190   0.360   0.590   0.930   0.990   1.000
+ada_mcts             0.140   0.250   0.320   0.490   0.520   0.650
+mcts_static          0.070   0.160   0.250   0.550   0.770   1.000
+```
+stationary（p=0.7）：模型类 0.790/+0.65，ada_mcts/mcts_static 0.390/-0.22。
+
+**要点**：全部模型类规划器数字相同（桥短、预训练模型近乎精确、RATS==DP 同
+动作 → 同轨迹）；bridge 低 p 结构性无解（垂直 slip 下 p=0.4 跨最后 3 格
+成功 ~0.4³，oracle 也仅 0.190）；MCTS 系系统性弱（6 步随机 rollout 叶估计
+无启发式 + DPAS 病理）。
+
+log：`gridworld_bridge_results.log`（2026-08-08 完成）。
+
+### 3.3 全量结果总结（08-08 定稿）
+
+- cliff：FIR-RATS p=0.4 0.733（> static 0.467、> oracle_rats 0.600），p≥0.6
+  恢复 1.000；mcts_static 0.767 最强学习型基线；ada_mcts 崩（0.000@1.0）。
+- bridge：全模型类相等（0.190→1.000）；FIR 无机会生效（不劣化，与 oracle 持平）。
+- 结论写进 `doc_tool/experiment_report.md` §7；commit 待发。
 
 ## 4. 与论文的偏差决定（08-07 定稿）
 

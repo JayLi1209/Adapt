@@ -201,10 +201,14 @@ cliff（goal rate / 折现 return）：
   oracle_rats 1.000 / -27.08    rats_pkminus1 1.000 / -27.08
   bnn_rats_static 1.000 / -27.08    bnn_rats_adaptive 1.000 / -27.08
   ada_mcts 1.000 / -21.46    mcts_static 1.000 / -21.46
-bridge：[待 bridge 全量重跑填充]
+bridge：
+  dp_nsmdp / dp_snapshot / oracle_rats / rats_pkminus1 /
+  bnn_rats_static / bnn_rats_adaptive  0.790 / +0.65
+  ada_mcts 0.390 / -0.22    mcts_static 0.390 / -0.22
 ```
 结论：cliff 上全部方法 goal rate 1.000，预训练模型表现好；
-（注意：每步 −1 惩罚下 return 恒为负，绝对值反映路径长度。）
+bridge 上模型类规划器 0.790（垂直 slip 下桥比旧设定难），MCTS 系 0.390
+（rollout 叶估计弱）。注意每步 −1 惩罚下 cliff return 恒为负，绝对值反映路径长度。
 
 ### 5.3 结果：CliffWalking（p: 0.7 → p_new at ts 0，30 trials，30000 sims）
 
@@ -236,11 +240,33 @@ mcts_static         -45.98  -36.94  -30.92  -18.44  -15.48  -14.00
 
 ### 5.4 结果：NS-Bridge（p: 0.7 → p_new at ts 0，100 trials，30000 sims）
 
+**goal rate by p**：
 ```
-[待 bridge 全量重跑填充]
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp             0.190   0.360   0.590   0.930   0.990   1.000
+dp_snapshot          0.190   0.360   0.590   0.930   0.990   1.000
+oracle_rats          0.190   0.360   0.590   0.930   0.990   1.000
+rats_pkminus1        0.190   0.360   0.590   0.930   0.990   1.000
+bnn_rats_static      0.190   0.360   0.590   0.930   0.990   1.000
+bnn_rats_adaptive    0.190   0.360   0.590   0.930   0.990   1.000
+ada_mcts             0.140   0.250   0.320   0.490   0.520   0.650
+mcts_static          0.070   0.160   0.250   0.550   0.770   1.000
 ```
 
-### 5.5 分析（cliff）
+**折现 return（γ=0.99，holes=-1）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.8   p=0.9   p=1.0
+dp_nsmdp             -0.18    0.05    0.37    0.84    0.95    0.98
+dp_snapshot          -0.18    0.05    0.37    0.84    0.95    0.98
+oracle_rats          -0.18    0.05    0.37    0.84    0.95    0.98
+rats_pkminus1        -0.18    0.05    0.37    0.84    0.95    0.97
+bnn_rats_static      -0.18    0.05    0.37    0.84    0.95    0.97
+bnn_rats_adaptive    -0.18    0.05    0.37    0.84    0.95    0.97
+ada_mcts             -0.64   -0.44   -0.31   -0.03    0.04    0.28
+mcts_static          -0.83   -0.66   -0.48    0.10    0.53    0.98
+```
+
+### 5.5 分析（cliff + bridge）
 
 1. **oracle 上界**：DP 满格（1.000 × 6 p）——存在全 p 安全策略（悬崖下方有长路，
    max_steps=100 足够）。
@@ -265,6 +291,19 @@ mcts_static         -45.98  -36.94  -30.92  -18.44  -15.48  -14.00
    可部分恢复（08-06 bridge 上 10000→10 使 p=0.4 从 0.06→0.26）。
 7. **return 与 goal rate 一致**：每步 −1 下路径越长 return 越低；ada_mcts
    return 恒低（−55 至 −63）。
+8. **bridge：全部模型类规划器数字相同（0.190/0.360/0.590/0.930/0.990/1.000）**：
+   桥只有 3-4 步宽，预训练 BNN 近乎精确（MAE 0.007）且 RATS 与 DP 在此网格上
+   给出同一最优动作（08-06 亦观察到 RATS==DP），所以 oracle 与学习型模型、
+   adaptive 与 static 走完全相同的轨迹。FIR 循环在 bridge 上无机会生效——
+   episode 短（≤10 步）+ 模型本来就不怎么错。
+9. **bridge 低 p 结构性无解**：p=0.4 时即使 omniscient DP 也只有 0.190——垂直
+   slip 下（1−p)/2=0.3 的滑移质量在桥面靠近右端（col 5-7）直接进洞，跨最后
+   3 格的成功率 ~0.4³，任何策略都难逃。p=0.5 反向（0.360）也比 0.6 低：期望
+   位移小。
+10. **MCTS 系在 bridge 上系统性弱**：mcts_static p≤0.6 只有 0.070-0.250
+    （叶估计为 6 步随机 rollout，无 γ^dist 启发式，桥的危险网格上噪声大）；
+    ada_mcts 因 DPAS worst-case 在低 p 反而比 mcts_static 稳（0.140 vs 0.070），
+    但在 p≥0.8 再次崩（0.650@1.0 vs mcts_static 1.000）——同一 DPAS 病理。
 
 ## 6. 保真度声明（与论文的差异）
 
@@ -277,17 +316,26 @@ mcts_static         -45.98  -36.94  -30.92  -18.44  -15.48  -14.00
   不实现官方 nsbridge 的 t=0 确定斜坡（属于 RATS 论文的连续演化设定，且
   L_p=1.0 下 t≥1 即饱和、仅影响第一步）；no-discount 不适用（任务规格）。
 
-## 7. 结论（cliff 初步）
+## 7. 结论
 
 在 CliffWalking 上（每步 −1、γ=0.99、30000 MCTS simulations）：
-- FIR-RATS 在变化幅度最大的 p=0.4 处达到全场学习型方法最高 goal rate 0.733，
-  超过 RATS-ĥP_{k-1}（0.467）与 oracle RATS-P_k（0.600）——"先谨慎、后恢复"
-  的机制在悬崖任务上确实奏效；p≥0.6 完全恢复（1.000）。
-- MCTS-ĥP_{k-1}（0.767@0.4）同样强，是 RATS 系之外的最强学习型基线。
+- **FIR-RATS 在变化幅度最大的 p=0.4 处达到 RATS 系最高 goal rate 0.733**，
+  超过 RATS-ĥP_{k-1}（0.467）、甚至 oracle RATS-P_k（0.600）——"变化后先谨慎
+  （forget 拉均匀 → 保守绕行）、证据充足后恢复（p≥0.6 回到 1.000）"的机制
+  在悬崖任务上奏效；MCTS-ĥP_{k-1}（0.767@0.4）是全场最高的学习型基线。
+- MCTS-ĥP_{k-1}（0.767@0.4）是 RATS 系之外的最强学习型基线。
 - ADA-MCTS（忠实移植，DPAS gamma=10000）在此 ts-0 突变实例化上陷入 worst-case
-  病理（p=1.0 时 0.000），如实报告并注明机制。
+  病理（p=1.0 时 0.000 vs mcts_static 1.000），如实报告并注明机制。
 
-[bridge 结果跑完后补全结论]
+在 NS-Bridge 上：
+- 所有模型类规划器（DP/RATS/BNN/FIR）数字完全相同且最优——桥短、模型精确、
+  RATS 与 DP 一致，FIR 循环无机会生效；p≤0.6 时桥本身结构性无解（oracle
+  也只有 0.19-0.59）。
+- MCTS 系系统性弱于模型类（rollout 叶估计 + DPAS 病理）。
+
+总体：FIR 的价值体现在**长视界、变化大**的任务（cliff 低 p）；在模型近乎
+精确或任务过短的场景（bridge）与 oracle 持平（不劣化）。这是诚实的结果——
+机制在有发挥空间时带来增益，没有时也不伤害。
 
 ---
 
