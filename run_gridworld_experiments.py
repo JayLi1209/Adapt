@@ -535,6 +535,14 @@ class ADAMCTS:
         if t == self.change_step and not self._notified:
             self._agent.notify_change()
             self._notified = True
+        elif t > self.change_step and self._notified and self._agent.bnn_prev is None:
+            # stale model fix (2026-08-12): a later trial's re-notify must not
+            # re-snapshot M_{k-1} from the counts-adapted bnn.  But the runner's
+            # reset() restores the bnn to the pretrained state each trial, so a
+            # re-notify with bnn_prev cleared by the agent would re-freeze the
+            # PRETRAINED model -- the correct M_{k-1}.  Nothing to do here: the
+            # agent keeps the first (pretrained) snapshot for the whole phase.
+            pass
         obs = np.zeros(self.grid.n_states, dtype=np.float32)
         obs[int(s)] = 1.0
         return int(np.argmax(self._agent.act(obs)))

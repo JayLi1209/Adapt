@@ -98,7 +98,10 @@ class ADAMCTSAgent(BNNModelPlanner):
     # ── snapshot management ──────────────────────────────────────────────────
     def notify_change(self):
         """Freeze current BNN as M_{k-1}, reset M_k exploration state."""
-        self.bnn_prev = copy.deepcopy(self.bnn)
+        if self.bnn_prev is None:
+            # first notification in this phase: snapshot the OLD model (M_{k-1}
+            # = the pretrained model before any post-change evidence arrives)
+            self.bnn_prev = copy.deepcopy(self.bnn)
         self.dyn_prev = models.OneDTransitionRewardModel(
             self.bnn_prev,
             target_is_delta=False,
