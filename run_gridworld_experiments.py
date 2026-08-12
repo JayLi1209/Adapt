@@ -38,14 +38,19 @@ from bnn.dirichlet_model import ckpt_name
 from drift import DriftFilterV2
 from planning.rats import (
     GridSnapshot, DynamicGridSnapshot, BNNSnapshot, RATS, DPAgent,
+    _dist_matrix, worstcase_distribution_direct_method,
 )
 from planning.ada_mcts import ADAMCTSAgent, DPAS_GAMMA
+from planning.cvar_cem import CVaRCEMAgent
 
 _HERE = pathlib.Path(__file__).parent
 
 GAMMA = 0.99            # discount (user request)
-ORIG_P = 0.7            # "original" env the model is pretrained on
-CHANGE_PS = [0.4, 0.5, 0.6, 0.8, 0.9, 1.0]
+ORIG_P = 1.0            # "original" env the model is pretrained on: fully
+                        # deterministic, so the optimal policy is known and the
+                        # pretrained model can be verified to find it
+                        # (2026-08-12 setting; was 0.7)
+CHANGE_PS = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]  # degrade p from 1.0 downward
 K_FORGET = 3            # forget every K post-change steps (was 5; 3 beats
                         # static at all degraded p on cliff, see 08-06 log)
 M_SIMULATIONS = 30000   # ADA-MCTS baseline simulations (rollouts) per action,
@@ -55,6 +60,12 @@ M_SIMULATIONS = 30000   # ADA-MCTS baseline simulations (rollouts) per action,
 N_POSTERIOR = 10        # BNN posterior draws for surprise
 RATS_DEPTH = 3          # RATS depth (paper's documented value)
 DP_DEPTH = 100          # DP depth (>= horizon -> exact)
+# FIR-CEM (main method) planner settings
+CEM_CVAR_ALPHA = 1.0    # CVaR tail fraction when not adaptive (1.0 = risk-neutral)
+CEM_ADAPTIVE_ALPHA = True  # confidence-gated alpha (FIR surprise gates the tail)
+# unbounded-RATS baselines (scheme 1 worst-of-K / scheme 2 calibrated L_p)
+N_MODEL_DRAWS = 100     # posterior model draws
+RATS_CVAR_ALPHA = 0.01  # scheme 1: ~1% empirical tail over model draws
 
 
 def cell_reward(grid, s):
@@ -250,6 +261,243 @@ class BNNRATS:
         self.snap.clear_cache()
 
 
+# ── FIR-CEM (main method): CVaR-CEM planner + the FIR adaptation loop ──────────
+
+class BNNCEM:
+    """CVaR-CEM planner with the Dirichlet-BNN; adaptive=True runs the same FIR
+    loop as BNNRATS (surprise -> drift -> forget -> learn), and gates the CVaR
+    tail alpha by the smoothed surprise (the paper's confidence-gated planner).
+
+    This is the report's "FIR-CEM (本文)" method: component 1 (pretrained
+    Dirichlet BNN) + component 2 (FIR) + component 3 (CVaR-CEM, not RATS).
+    """
+
+    name = None
+
+    def __init__(self, bnn, dyn, grid, gamma=GAMMA, change_step=0,
+                 k_forget=K_FORGET, use_counts=True, persist_counts=False,
+                 count_w=1.0, drift_reset=False, adaptive=False):
+        self.bnn = bnn
+        self.dyn = dyn
+        self.grid = grid
+        self.adaptive = adaptive
+        self.change_step = change_step
+        self.k_forget = k_forget
+        self.use_counts = use_counts
+        self.persist_counts = persist_counts
+        self.count_w = count_w
+        self.drift_reset = drift_reset
+        self.name = "cem_fir" if adaptive else "cem_static"
+        self._agent = CVaRCEMAgent(
+            dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
+            gamma=gamma, horizon=RATS_DEPTH, cvar_alpha=CEM_CVAR_ALPHA,
+            adaptive_alpha=CEM_ADAPTIVE_ALPHA, rng=np.random.default_rng(0))
+
+    def reset(self):
+        self.bnn.use_counts = self.adaptive and self.use_counts
+        self.bnn.retain.fill_(1.0)
+        if not (self.adaptive and self.persist_counts):
+            self.bnn.reset_counts()
+        self._agent.reset()
+        self._agent.pi = self._agent._uniform.copy()
+        self.drift = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
+        self._drift_done = False
+        self.post = 0
+        self._last = None
+
+    def observe(self, s, a, s2):
+        if not self.adaptive:
+            return
+        n = self.grid.n_states
+        obs = np.zeros(n, dtype=np.float32)
+        obs[s] = 1.0
+        act_v = np.zeros(self.grid.n_actions, dtype=np.float32)
+        act_v[int(a)] = 1.0
+        nxt = np.zeros(n, dtype=np.float32)
+        nxt[s2] = 1.0
+        self._last = (obs, act_v, nxt, int(s), int(a), int(s2))
+
+    def act(self, s, t, p):
+        if (self.adaptive and self.change_step is not None
+                and self._last is not None and t > 0):
+            obs, act_v, nxt, ps, pa, ps2 = self._last
+            vs = surprise_dirichlet(self.dyn, self.bnn, obs, act_v, nxt, 0.0,
+                                    n_draws=N_POSTERIOR)
+            if self.drift_reset and not self._drift_done:
+                self.drift.reset()
+                self._drift_done = True
+            self.drift.update(vs["delta_n"])
+            # confidence-gated alpha: same surprise signal gates the CVaR tail
+            self._agent.surprise_bar = self.drift.delta_bar
+            self._agent.n_since_change = self.post
+            if t >= self.change_step + 1:
+                self.post += 1
+                if self.post % self.k_forget == 0:
+                    self._forget()
+            d = self.grid.direction_of(ps, pa, ps2)
+            if d >= 0:
+                self.bnn.add_count(ps, pa, d, w=self.count_w)
+        obs = np.zeros(self.grid.n_states, dtype=np.float32)
+        obs[int(s)] = 1.0
+        return int(np.argmax(self._agent.act(obs)))
+
+    def _forget(self):
+        from bnn.dirichlet_workflow import forget_dirichlet
+        forget_dirichlet(self.bnn, self.drift)
+
+
+# ── unbounded-RATS baselines (we face an UNBOUNDED change: L_p / L_r unknown) ─
+
+class RATSCV01(BNNRATS):
+    """Scheme 1: sample N posterior models, take the WORST at every chance node
+    (~1%-CVaR tail over the model posterior, matching RATS's worst-case over a
+    Wasserstein ball but without needing the Lipschitz constant L_p).
+
+    In the unbounded case there is no valid L_p, so the pessimism comes from
+    the model's own posterior spread instead of an analytically-sized ball.
+    """
+
+    name = "rats_cv01"
+
+    def __init__(self, bnn, dyn, grid, gamma=GAMMA, max_depth=RATS_DEPTH,
+                 n_draws=N_MODEL_DRAWS, alpha=RATS_CVAR_ALPHA, **kw):
+        super().__init__(bnn, dyn, grid, gamma=gamma, max_depth=max_depth,
+                         adaptive=False, **kw)
+        self.n_draws = n_draws
+        self.alpha = alpha
+
+    def reset(self):
+        super().reset()
+        self.snap = WorstKSnapshot(self.dyn, self.bnn, self.grid,
+                                   n_draws=self.n_draws)
+        self._agent = RATS(self.snap, gamma=self.gamma,
+                           max_depth=self.max_depth)
+
+    def act(self, s, t, p):
+        """Worst-of-K at the root: for each action, compute the child values v
+        on the (worst-case, mean-model) RATS tree, then pick the action whose
+        worst posterior draw -- ranked by w @ v -- is HIGHEST (the 1%-CVaR
+        analogue of RATS's worst-case ball, in the unbounded case)."""
+        self._agent._memo = {}
+        best_a, best_val = 0, -np.inf
+        for a in range(self.grid.n_actions):
+            mean = self.snap.p_cells(s, a)                     # mean row (K,)
+            p_cells = mean
+            children = [int(i) for i in range(self.grid.n_states)
+                        if p_cells[i] > 1e-12]
+            v_child = np.array([self._agent._V(s2, 1) for s2 in children])
+            rows = self.snap._draw_rows(s, a)[:, children]     # (K, |children|)
+            worst = float(np.min(rows @ v_child))              # worst draw
+            val = self.gamma * worst + self.snap.expected_reward(s, a)
+            if val > best_val:
+                best_val, best_a = val, a
+        return best_a
+
+
+class RATSCalibrated(BNNRATS):
+    """Scheme 2: sample N posterior models, CALIBRATE L_p from their Wasserstein
+    spread (the change is unbounded, so we estimate the plausible-evolution
+    radius empirically), then run the unmodified RATS worst-case over the
+    L_p-sized ball.  Minimizes changes to the existing RATS code."""
+
+    name = "rats_cal"
+
+    def __init__(self, bnn, dyn, grid, gamma=GAMMA, max_depth=RATS_DEPTH,
+                 n_draws=N_MODEL_DRAWS, **kw):
+        super().__init__(bnn, dyn, grid, gamma=gamma, max_depth=max_depth,
+                         adaptive=False, **kw)
+        self.n_draws = n_draws
+
+    def reset(self):
+        super().reset()
+        self.snap = CalibratedSnapshot(self.dyn, self.bnn, self.grid,
+                                       n_draws=self.n_draws)
+        self._agent = RATS(self.snap, gamma=self.gamma,
+                           max_depth=self.max_depth)
+
+    def act(self, s, t, p):
+        """Calibrated worst-case at the root: per action, size the chance-node
+        ball with the per-(s,a) calibrated L_p (spread of the posterior draws),
+        then apply the closed-form Property-3 worst-case distribution against
+        the tree's child values.  Interior nodes keep the model's fixed L_p."""
+        self._agent._memo = {}
+        best_a, best_val = 0, -np.inf
+        for a in range(self.grid.n_actions):
+            mean = self.snap.p_cells(s, a)
+            children = [int(i) for i in range(self.grid.n_states)
+                        if mean[i] > 1e-12]
+            v_child = np.array([self._agent._V(s2, 1) for s2 in children])
+            w0 = np.array([mean[s2] for s2 in children], dtype=np.float64)
+            w0 /= w0.sum()
+            c = self.snap.calibrated_Lp(s, a)          # calibrated ball radius
+            d_mat = _dist_matrix(self.grid, children)
+            w = worstcase_distribution_direct_method(v_child, w0, c, d_mat)
+            val = self.gamma * float(w @ v_child) + \
+                self.snap.expected_reward(s, a)
+            if val > best_val:
+                best_val, best_a = val, a
+        return best_a
+
+
+class WorstKSnapshot(BNNSnapshot):
+    """Scheme 1 model: per-(s,a) chance node, sample n_draws posterior
+    transition rows and return the one with the LOWEST expected value of the
+    reachable children -- the empirical worst over the model posterior.
+
+    RATS already memoizes _V over (state, depth), so p_cells is consulted AFTER
+    the child values v_child exist: _V_worst uses a nested RATS that reads the
+    mean row from this snapshot, then ranks draws by w @ v_child.  p_cells is
+    the plain deterministic mean (what _V computes against); the "worst-of-K"
+    only matters at the root action choice."""
+
+    def __init__(self, dyn, bnn, grid, n_draws=N_MODEL_DRAWS, L_p=1.0,
+                 L_r=0.0, tau=1.0):
+        super().__init__(dyn, bnn, grid, L_p=L_p, L_r=L_r, tau=tau)
+        self.n_draws = n_draws
+
+    @torch.no_grad()
+    def _draw_rows(self, s, a):
+        obs = np.zeros(self.n_states, dtype=np.float32)
+        obs[s] = 1.0
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        act_t = self._eye_a[a].unsqueeze(0)
+        state = self.dyn.reset(obs_t)
+        rows = []
+        for _ in range(self.n_draws):
+            next_obs, _, _, _ = self.dyn.sample(act_t, state, deterministic=False)
+            p = next_obs[0, :self.n_states].clamp_min(0.0).cpu().numpy()
+            p /= p.sum()
+            rows.append(p)
+        return np.stack(rows)                       # (K, n_states)
+
+
+def _w1_between(p, q):
+    """Wasserstein-1 surrogate between two distributions over the same cell
+    support: identical cells match exactly, the surplus mass moves at unit cost
+    (grid Manhattan >= 1 for distinct cells) -> W1 ~ half the L1 distance."""
+    p = np.clip(np.asarray(p, dtype=np.float64), 0, None)
+    q = np.clip(np.asarray(q, dtype=np.float64), 0, None)
+    p = p / max(p.sum(), 1e-12)
+    q = q / max(q.sum(), 1e-12)
+    return float(np.abs(p - q).sum() / 2.0)
+
+
+class CalibratedSnapshot(BNNSnapshot):
+    """Scheme 2 model: mean transition row (as BNNSnapshot) + a per-(s,a)
+    calibrated L_p = Wasserstein spread of the posterior draws around the mean,
+    used by RATS to size the worst-case ball per chance node."""
+
+    def __init__(self, dyn, bnn, grid, n_draws=N_MODEL_DRAWS, L_p=1.0,
+                 L_r=0.0, tau=1.0):
+        super().__init__(dyn, bnn, grid, L_p=L_p, L_r=L_r, tau=tau)
+        self.n_draws = n_draws
+
+    def calibrated_Lp(self, s, a):
+        rows = WorstKSnapshot._draw_rows(self, int(s), int(a))
+        mean = rows.mean(0)
+        return float(np.mean([_w1_between(r, mean) for r in rows]))
+
+
 class ADAMCTS:
     name = "ada_mcts"
 
@@ -370,6 +618,30 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                 m_simulations=args.m_simulations,
                                 change_step=change_step,
                                 dpas_gamma=args.dpas_gamma)
+        elif name == "cem_fir":
+            out[name] = BNNCEM(bnn, dyn, grid, gamma=GAMMA,
+                               change_step=change_step,
+                               k_forget=args.k_forget,
+                               use_counts=args.use_counts,
+                               persist_counts=args.persist_counts,
+                               count_w=args.count_w,
+                               drift_reset=args.drift_reset,
+                               adaptive=True)
+        elif name == "cem_static":
+            out[name] = BNNCEM(bnn, dyn, grid, gamma=GAMMA,
+                               change_step=change_step,
+                               k_forget=args.k_forget,
+                               use_counts=args.use_counts,
+                               persist_counts=args.persist_counts,
+                               count_w=args.count_w,
+                               drift_reset=args.drift_reset,
+                               adaptive=False)
+        elif name == "rats_cv01":
+            out[name] = RATSCV01(bnn, dyn, grid, gamma=GAMMA,
+                                 max_depth=args.rats_depth)
+        elif name == "rats_cal":
+            out[name] = RATSCalibrated(bnn, dyn, grid, gamma=GAMMA,
+                                       max_depth=args.rats_depth)
         elif name == "mcts_static":
             out[name] = MCTSStatic(bnn, dyn, grid, gamma=GAMMA,
                                    m_simulations=args.m_simulations,
@@ -450,9 +722,10 @@ def main():
     grid = get_grid(args.grid)
     max_steps = args.max_steps or (10 if grid.name == "bridge" else 100)
     change_ps = args.change_p if args.change_p else CHANGE_PS
-    methods = args.methods or ["dp_nsmdp", "dp_snapshot", "oracle_rats",
-                               "rats_pkminus1", "bnn_rats_static",
-                               "bnn_rats_adaptive", "ada_mcts", "mcts_static"]
+    methods = args.methods or ["oracle_rats", "rats_cv01", "rats_cal",
+                               "bnn_rats_static", "bnn_rats_adaptive",
+                               "cem_static", "cem_fir",
+                               "ada_mcts", "mcts_static"]
     log_path = _HERE / f"gridworld_{grid.name}_results.log"
     out = open(log_path, "w")
 

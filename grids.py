@@ -166,8 +166,9 @@ CLIFFWALKING_4x12 = GridSpec(
     # ns_gym sets next_state = start_state for every cliff landing, regardless of
     # terminal_cliff (terminal_cliff only controls the `terminated` flag).
     cliff_to_start=True,
-    # per-step penalty, per Luo et al.: -1 on every step except arriving at G.
-    step_penalty=-1.0,
+    # No per-step penalty (2026-08-12, user request): reward = +1 goal / -1 hole /
+    # 0 elsewhere, so the return is positive and reads as a discounted goal rate.
+    step_penalty=0.0,
 )
 
 # Bridge (Lecarpentier & Rachelson 2019 / Luo et al. 2024): intended prob p,
