@@ -11,11 +11,14 @@
   详见下文与 `doc_tool/experiment_report_2026-08-12.md`（新建报告）。
   commit：39e38f6（新方法+设定）、bd00d41（ADA-MCTS stale model fix）、
   bf18017（CEM gating tune）、a918345（stationary crash fix）、6b1200e（报告）。
-- **2026-08-13**: bridge 结果填入报告（commit 0cee44e）；**bridge 参数调优**：
-  K_FORGET sweep（1/2/3）证明 forget 在短 episode 已能触发但"均匀模型"在 bridge
-  上无安全路线可走（悬崖上没有保守选择）→ adaptive≡static 与 K 无关；
-  CEM horizon/n_confident/alpha_min 扫描中（--cem-horizon 等新 CLI 参数，
-  commit 4304561）；cliff 全量实验收尾中（mcts_static 是最后的方法）。
+- **2026-08-13**: bridge 结果填入报告（commit 0cee44e）；**bridge 参数调优完成**：
+  (1) K_FORGET sweep（1/2/3）证明 forget 已能触发但"均匀模型"在 bridge 上无安全
+  路线（悬崖上没有保守选择）→ adaptive≡static 与 K 无关，是结构性不是没调参；
+  (2) CEM sweep（horizon 3/4/5 × n_confident 2/3 × alpha_min 0.05/0.10）：**所有
+  配置 cem_fir 都差于 cem_static**（约 -0.10 goal rate），最优是 h=5/n_conf=2/
+  alpha_min=0.10（cem_static 0.120/0.250/0.330/0.480，cem_fir 0.090/0.150/0.270/
+  0.390）；horizon 从 3→5 只把 cem_static 从 0.48 微升到 0.48——CEM 在 bridge
+  的差距不是 horizon 能解决的；bridge 报告数字维持 h=3 默认。
 
 ## 1. 做了什么
 
