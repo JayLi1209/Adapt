@@ -19,6 +19,11 @@
   alpha_min=0.10（cem_static 0.120/0.250/0.330/0.480，cem_fir 0.090/0.150/0.270/
   0.390）；horizon 从 3→5 只把 cem_static 从 0.48 微升到 0.48——CEM 在 bridge
   的差距不是 horizon 能解决的；bridge 报告数字维持 h=3 默认。
+- **2026-08-13（完）**: cliff 全量实验完成，结果+讨论填入报告（commit f4dfa20）。
+  **核心结论**：FIR 在 cliff 对两个 planner 都有效（bnn_rats_adaptive 与 cem_fir
+  在低 p 大幅反超 static）；FIR 收益与变化幅度正相关；unbounded 两方案成立；
+  bridge 上 FIR 无效是结构性（短 episode + 无退避路线）。报告
+  `doc_tool/experiment_report_2026-08-12.md` 已完整（§4.2/4.3/4.4/§5 全填）。
 
 ## 1. 做了什么
 
