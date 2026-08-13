@@ -63,6 +63,11 @@ DP_DEPTH = 100          # DP depth (>= horizon -> exact)
 # FIR-CEM (main method) planner settings
 CEM_CVAR_ALPHA = 1.0    # CVaR tail fraction when not adaptive (1.0 = risk-neutral)
 CEM_ADAPTIVE_ALPHA = True  # confidence-gated alpha (FIR surprise gates the tail)
+CEM_ALPHA_MIN = 0.10    # most risk-averse CVaR tail (the 10% worst returns); the
+                        # planner default 0.95 is too mild to change behavior
+CEM_N_CONFIDENT = 20    # post-change samples for the data gate to saturate; with
+                        # ~40-60 steps/episode this leaves the cautious phase long
+                        # enough to matter (planner default 12 saturates too fast)
 # unbounded-RATS baselines (scheme 1 worst-of-K / scheme 2 calibrated L_p)
 N_MODEL_DRAWS = 100     # posterior model draws
 RATS_CVAR_ALPHA = 0.01  # scheme 1: ~1% empirical tail over model draws
@@ -291,7 +296,8 @@ class BNNCEM:
         self._agent = CVaRCEMAgent(
             dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
             gamma=gamma, horizon=RATS_DEPTH, cvar_alpha=CEM_CVAR_ALPHA,
-            adaptive_alpha=CEM_ADAPTIVE_ALPHA, rng=np.random.default_rng(0))
+            adaptive_alpha=CEM_ADAPTIVE_ALPHA, alpha_min=CEM_ALPHA_MIN,
+            n_confident=CEM_N_CONFIDENT, rng=np.random.default_rng(0))
 
     def reset(self):
         self.bnn.use_counts = self.adaptive and self.use_counts
