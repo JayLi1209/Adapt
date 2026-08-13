@@ -63,11 +63,13 @@ DP_DEPTH = 100          # DP depth (>= horizon -> exact)
 # FIR-CEM (main method) planner settings
 CEM_CVAR_ALPHA = 1.0    # CVaR tail fraction when not adaptive (1.0 = risk-neutral)
 CEM_ADAPTIVE_ALPHA = True  # confidence-gated alpha (FIR surprise gates the tail)
-CEM_ALPHA_MIN = 0.10    # most risk-averse CVaR tail (the 10% worst returns); the
-                        # planner default 0.95 is too mild to change behavior
-CEM_N_CONFIDENT = 20    # post-change samples for the data gate to saturate; with
-                        # ~40-60 steps/episode this leaves the cautious phase long
-                        # enough to matter (planner default 12 saturates too fast)
+CEM_ALPHA_MIN = 0.30    # most risk-averse CVaR tail (30% worst returns); 0.10 was
+                        # too conservative (over-cautious phases dragged cem_fir
+                        # below cem_static), 0.95 barely differs from risk-neutral
+CEM_N_CONFIDENT = 8     # post-change samples for the data gate to saturate
+CEM_SURPRISE_TAU = 50.0  # surprise sensitivity; p=1.0 pretraining spikes the
+                         # surprise into the hundreds, so the default tau=2.0
+                         # would pin conf at 0 for the whole episode
 # unbounded-RATS baselines (scheme 1 worst-of-K / scheme 2 calibrated L_p)
 N_MODEL_DRAWS = 100     # posterior model draws
 RATS_CVAR_ALPHA = 0.01  # scheme 1: ~1% empirical tail over model draws
@@ -749,7 +751,7 @@ def main():
     ap.add_argument("--cem-n-confident", type=int, default=CEM_N_CONFIDENT)
     ap.add_argument("--cem-cvar-alpha", type=float, default=CEM_CVAR_ALPHA,
                     help="fixed CVaR tail when adaptive_alpha is off")
-    ap.add_argument("--cem-surprise-tau", type=float, default=None,
+    ap.add_argument("--cem-surprise-tau", type=float, default=CEM_SURPRISE_TAU,
                     help="surprise sensitivity for the confidence gate (planner "
                          "default 2.0; p=1.0 pretraining makes surprise spike to "
                          "hundreds, so a larger tau relaxes the gate faster)")
