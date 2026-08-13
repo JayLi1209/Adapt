@@ -283,7 +283,8 @@ class BNNCEM:
                  k_forget=K_FORGET, use_counts=True, persist_counts=False,
                  count_w=1.0, drift_reset=False, adaptive=False,
                  horizon=RATS_DEPTH, alpha_min=CEM_ALPHA_MIN,
-                 n_confident=CEM_N_CONFIDENT, cvar_alpha=CEM_CVAR_ALPHA):
+                 n_confident=CEM_N_CONFIDENT, cvar_alpha=CEM_CVAR_ALPHA,
+                 surprise_tau=None):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -295,11 +296,14 @@ class BNNCEM:
         self.count_w = count_w
         self.drift_reset = drift_reset
         self.name = "cem_fir" if adaptive else "cem_static"
+        kw = {}
+        if surprise_tau is not None:
+            kw["surprise_tau"] = surprise_tau
         self._agent = CVaRCEMAgent(
             dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
             gamma=gamma, horizon=horizon, cvar_alpha=cvar_alpha,
             adaptive_alpha=CEM_ADAPTIVE_ALPHA, alpha_min=alpha_min,
-            n_confident=n_confident, rng=np.random.default_rng(0))
+            n_confident=n_confident, rng=np.random.default_rng(0), **kw)
 
     def reset(self):
         self.bnn.use_counts = self.adaptive and self.use_counts
@@ -352,7 +356,11 @@ class BNNCEM:
     def _forget(self):
         from bnn.dirichlet_workflow import forget_dirichlet
         forget_dirichlet(self.bnn, self.drift)
-
+        # FIR-CEM specific: after forgetting, the model no longer matches the OLD
+        # env by construction, so the stale-env surprise is no longer informative.
+        # Reset the drift accumulator so conf_surprise recovers on the NEW-env
+        # evidence instead of staying pinned to 0 for the whole episode.
+        self.drift._reset_detection()
 
 # ── unbounded-RATS baselines (we face an UNBOUNDED change: L_p / L_r unknown) ─
 
@@ -639,7 +647,8 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                horizon=args.cem_horizon,
                                alpha_min=args.cem_alpha_min,
                                n_confident=args.cem_n_confident,
-                               cvar_alpha=args.cem_cvar_alpha)
+                               cvar_alpha=args.cem_cvar_alpha,
+                               surprise_tau=args.cem_surprise_tau)
         elif name == "cem_static":
             out[name] = BNNCEM(bnn, dyn, grid, gamma=GAMMA,
                                change_step=change_step,
@@ -652,7 +661,8 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                horizon=args.cem_horizon,
                                alpha_min=args.cem_alpha_min,
                                n_confident=args.cem_n_confident,
-                               cvar_alpha=args.cem_cvar_alpha)
+                               cvar_alpha=args.cem_cvar_alpha,
+                               surprise_tau=args.cem_surprise_tau)
         elif name == "rats_cv01":
             out[name] = RATSCV01(bnn, dyn, grid, gamma=GAMMA,
                                  max_depth=args.rats_depth)
@@ -739,6 +749,10 @@ def main():
     ap.add_argument("--cem-n-confident", type=int, default=CEM_N_CONFIDENT)
     ap.add_argument("--cem-cvar-alpha", type=float, default=CEM_CVAR_ALPHA,
                     help="fixed CVaR tail when adaptive_alpha is off")
+    ap.add_argument("--cem-surprise-tau", type=float, default=None,
+                    help="surprise sensitivity for the confidence gate (planner "
+                         "default 2.0; p=1.0 pretraining makes surprise spike to "
+                         "hundreds, so a larger tau relaxes the gate faster)")
     args = ap.parse_args()
     if args.max_depth is not None:
         args.rats_depth = args.dp_depth = args.max_depth
@@ -778,7 +792,8 @@ def main():
                m_simulations=args.m_simulations, dpas_gamma=args.dpas_gamma,
                cem_horizon=args.cem_horizon, cem_alpha_min=args.cem_alpha_min,
                cem_n_confident=args.cem_n_confident,
-               cem_cvar_alpha=args.cem_cvar_alpha)
+               cem_cvar_alpha=args.cem_cvar_alpha,
+               cem_surprise_tau=args.cem_surprise_tau)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
