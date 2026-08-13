@@ -281,7 +281,9 @@ class BNNCEM:
 
     def __init__(self, bnn, dyn, grid, gamma=GAMMA, change_step=0,
                  k_forget=K_FORGET, use_counts=True, persist_counts=False,
-                 count_w=1.0, drift_reset=False, adaptive=False):
+                 count_w=1.0, drift_reset=False, adaptive=False,
+                 horizon=RATS_DEPTH, alpha_min=CEM_ALPHA_MIN,
+                 n_confident=CEM_N_CONFIDENT, cvar_alpha=CEM_CVAR_ALPHA):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -295,9 +297,9 @@ class BNNCEM:
         self.name = "cem_fir" if adaptive else "cem_static"
         self._agent = CVaRCEMAgent(
             dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
-            gamma=gamma, horizon=RATS_DEPTH, cvar_alpha=CEM_CVAR_ALPHA,
-            adaptive_alpha=CEM_ADAPTIVE_ALPHA, alpha_min=CEM_ALPHA_MIN,
-            n_confident=CEM_N_CONFIDENT, rng=np.random.default_rng(0))
+            gamma=gamma, horizon=horizon, cvar_alpha=cvar_alpha,
+            adaptive_alpha=CEM_ADAPTIVE_ALPHA, alpha_min=alpha_min,
+            n_confident=n_confident, rng=np.random.default_rng(0))
 
     def reset(self):
         self.bnn.use_counts = self.adaptive and self.use_counts
@@ -633,7 +635,11 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                persist_counts=args.persist_counts,
                                count_w=args.count_w,
                                drift_reset=args.drift_reset,
-                               adaptive=True)
+                               adaptive=True,
+                               horizon=args.cem_horizon,
+                               alpha_min=args.cem_alpha_min,
+                               n_confident=args.cem_n_confident,
+                               cvar_alpha=args.cem_cvar_alpha)
         elif name == "cem_static":
             out[name] = BNNCEM(bnn, dyn, grid, gamma=GAMMA,
                                change_step=change_step,
@@ -642,7 +648,11 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                persist_counts=args.persist_counts,
                                count_w=args.count_w,
                                drift_reset=args.drift_reset,
-                               adaptive=False)
+                               adaptive=False,
+                               horizon=args.cem_horizon,
+                               alpha_min=args.cem_alpha_min,
+                               n_confident=args.cem_n_confident,
+                               cvar_alpha=args.cem_cvar_alpha)
         elif name == "rats_cv01":
             out[name] = RATSCV01(bnn, dyn, grid, gamma=GAMMA,
                                  max_depth=args.rats_depth)
@@ -722,6 +732,13 @@ def main():
     ap.add_argument("--counts", dest="use_counts",
                     action="store_true", default=False)
     ap.add_argument("--methods", nargs="*", default=None)
+    # CEM planner tuning (2026-08-13, bridge short-episode tuning)
+    ap.add_argument("--cem-horizon", type=int, default=RATS_DEPTH,
+                    help="CEM planning horizon (bridge's full trip is ~2-4 steps)")
+    ap.add_argument("--cem-alpha-min", type=float, default=CEM_ALPHA_MIN)
+    ap.add_argument("--cem-n-confident", type=int, default=CEM_N_CONFIDENT)
+    ap.add_argument("--cem-cvar-alpha", type=float, default=CEM_CVAR_ALPHA,
+                    help="fixed CVaR tail when adaptive_alpha is off")
     args = ap.parse_args()
     if args.max_depth is not None:
         args.rats_depth = args.dp_depth = args.max_depth
@@ -758,7 +775,10 @@ def main():
                k_forget=args.k_forget, use_counts=args.use_counts,
                persist_counts=args.persist_counts, count_w=args.count_w,
                drift_reset=args.drift_reset,
-               m_simulations=args.m_simulations, dpas_gamma=args.dpas_gamma)
+               m_simulations=args.m_simulations, dpas_gamma=args.dpas_gamma,
+               cem_horizon=args.cem_horizon, cem_alpha_min=args.cem_alpha_min,
+               cem_n_confident=args.cem_n_confident,
+               cem_cvar_alpha=args.cem_cvar_alpha)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
