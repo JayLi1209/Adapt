@@ -124,7 +124,47 @@ goal rate 1.000 是"模型找到了最优解"的直接证据。
 
 ### 4.4 结果：NS-Bridge（p: 1.0 → p_new at ts 0，100 trials，30000 sims）
 
-（待填：跑完后插入）
+**goal rate by p（paper 约定，holes=0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats          0.190   0.360   0.590   0.790   0.930   0.990   1.000
+rats_cv01            0.270   0.310   0.630   0.800   0.940   0.980   1.000
+rats_cal             0.240   0.380   0.550   0.780   0.930   0.990   1.000
+bnn_rats_static      0.190   0.360   0.590   0.790   0.930   0.990   1.000
+bnn_rats_adaptive    0.190   0.360   0.590   0.790   0.930   0.990   1.000
+cem_static           0.100   0.230   0.310   0.480   0.640   0.830   1.000
+cem_fir              0.070   0.130   0.220   0.340   0.510   0.730   1.000
+ada_mcts             0.160   0.200   0.470   0.670   0.730   0.920   0.970
+mcts_static          0.120   0.220   0.340   0.510   0.650   0.830   1.000
+```
+
+**折现 return（γ=0.99，reward = G+1/H−1/每步0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats          -0.18    0.05    0.37    0.65    0.84    0.95    0.98
+rats_cv01            -0.23   -0.20    0.35    0.63    0.85    0.93    0.97
+rats_cal             -0.22    0.01    0.24    0.62    0.86    0.95    0.97
+bnn_rats_static      -0.18    0.05    0.37    0.65    0.84    0.95    0.97
+bnn_rats_adaptive    -0.18    0.05    0.37    0.65    0.84    0.95    0.97
+cem_static           -0.65   -0.42   -0.34   -0.04    0.28    0.64    0.98
+cem_fir              -0.60   -0.53   -0.41   -0.23    0.10    0.49    0.98
+ada_mcts             -0.45   -0.43    0.02    0.39    0.43    0.81    0.91
+mcts_static          -0.66   -0.52   -0.28    0.03    0.29    0.64    0.98
+```
+
+观察：
+- **RATS 系（含两个 unbounded 方案）goal rate 追平 oracle**：bnn_rats_static /
+  bnn_rats_adaptive 与 oracle_rats 完全一致（0.19–1.00）；方案 1（rats_cv01）在
+  p=0.4/0.6 略高于 oracle（0.270/0.630 vs 0.190/0.590），方案 2（rats_cal）居中。
+  两个 unbounded 方案都成立——后验采样本身足以承担悲观性，无需解析 L_p。
+- **FIR 在 bridge 上无效（结构性）**：adaptive ≡ static（每集仅 3-4 步，forget
+  周期内不触发；见 08-06 记录 §8.1）。
+- **CEM 系（cem_static / cem_fir）goal rate 低于 RATS 系**（如 p=0.7：0.48/0.34
+  vs 0.79）：CEM 的 horizon=3 滚动规划在桥的"先远离再接近"几何下短视；cem_fir
+  低于 cem_static 是置信门控的保守期所致（α 压低 → 谨慎）。这是 planner 的
+  局限，不是 FIR 的问题（同一 FIR 在 RATS 上是 adaptive=static 的桥特例）。
+- **ada_mcts / mcts_static 居中**；ada_mcts 的 DPAS 自适应在 p≥0.6 略优于
+  mcts_static（0.47/0.67 vs 0.34/0.51），但低 p 仍被 worst-case 采样拖垮。
 
 ## 5. 讨论（Discussion）
 
