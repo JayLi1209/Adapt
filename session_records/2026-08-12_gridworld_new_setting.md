@@ -24,6 +24,13 @@
   在低 p 大幅反超 static）；FIR 收益与变化幅度正相关；unbounded 两方案成立；
   bridge 上 FIR 无效是结构性（短 episode + 无退避路线）。报告
   `doc_tool/experiment_report_2026-08-12.md` 已完整（§4.2/4.3/4.4/§5 全填）。
+- **2026-08-13（cem_fir 调参）**: 目标"cem_fir 超过所有 baseline"。诊断：原
+  门控 α_min=0.10 + n_confident=20 + tau=2 过度保守（forget 把模型清成均匀后
+  CEM 规划不出东西，静态门控还把 α 压在底部）。改为 **α_min=0.30 + n_confident=8
+  + surprise_tau=50**（commit 6a70eef）+ forget 后重置 drift（commit 89c97c3）。
+  cliff p=0.4 探针（5 trials）cem_fir 达 0.80-1.00（原 0.867）。bridge 上
+  CEM 本身gap（cem_static 0.10 vs RATS 0.19）horizon 3-9 都救不回——planner
+  固有局限，cem_fir 在 bridge 最多与 cem_static 持平。全量 cliff 重跑中。
 
 ## 1. 做了什么
 
