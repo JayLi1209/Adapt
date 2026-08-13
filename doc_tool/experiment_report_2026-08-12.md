@@ -114,13 +114,66 @@ bnn_dirichlet_cliffwalking_k3.pth`、`data/bridge/bnn_dirichlet_bridge_k3.pth`�
 ### 4.2 结果：stationary 验证（p=1.0）
 
 预训练模型在原环境（确定性 p=1.0）上的表现——此环境下最优策略是确定性的，
-goal rate 1.000 是"模型找到了最优解"的直接证据。
+goal rate 1.000 是"模型找到了最优解"的直接证据：
 
-（待填：跑完后插入）
+```
+cliff（goal rate / 折现 return）：全部 9 个方法 goal rate 1.000
+  oracle_rats / rats_cv01 / rats_cal / bnn_rats_static / bnn_rats_adaptive /
+  cem_static / cem_fir / ada_mcts / mcts_static = 1.000（return +0.886）
+bridge：全部 9 个方法 goal rate 1.000（return +0.970 / +0.980）
+```
+结论：p=1.0 确定性环境下预训练模型表现好（两个环境 goal rate 全 1.000），
+验证通过。
 
 ### 4.3 结果：CliffWalking（p: 1.0 → p_new at ts 0，30 trials，30000 sims）
 
-（待填：跑完后插入）
+**goal rate by p（paper 约定，holes=0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats          0.833   0.767   0.933   1.000   1.000   1.000   1.000
+rats_cv01            0.300   0.767   0.800   0.967   1.000   1.000   1.000
+rats_cal             0.233   0.700   0.800   0.967   1.000   1.000   1.000
+bnn_rats_static      0.300   0.800   0.800   1.000   1.000   1.000   1.000
+bnn_rats_adaptive    1.000   1.000   1.000   1.000   0.933   0.800   1.000
+cem_static           0.333   0.733   0.867   1.000   1.000   1.000   1.000
+cem_fir              0.867   0.933   0.933   0.900   0.800   0.700   1.000
+ada_mcts             0.533   0.700   0.800   0.900   0.933   1.000   1.000
+mcts_static          0.600   0.800   0.933   1.000   1.000   1.000   1.000
+```
+
+**折现 return（γ=0.99，reward = G+1/H−1/每步0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats           0.48    0.51    0.63    0.72    0.80    0.84    0.89
+rats_cv01             0.17    0.46    0.53    0.69    0.81    0.84    0.89
+rats_cal              0.14    0.43    0.53    0.69    0.81    0.84    0.89
+bnn_rats_static       0.17    0.48    0.51    0.71    0.81    0.84    0.89
+bnn_rats_adaptive     0.57    0.59    0.65    0.63    0.56    0.59    0.89
+cem_static            0.19    0.44    0.57    0.75    0.81    0.85    0.89
+cem_fir               0.47    0.53    0.55    0.52    0.50    0.50    0.89
+ada_mcts              0.29    0.40    0.49    0.61    0.66    0.73    0.77
+mcts_static           0.37    0.46    0.63    0.77    0.81    0.84    0.87
+```
+
+观察：
+- **FIR 在 cliff 上有效且显著**：bnn_rats_adaptive（FIR-RATS）在 p=0.4/0.5/0.6
+  达 1.000/1.000/1.000，远超 static（0.300/0.800/0.800）与 oracle_rats
+  （0.833/0.767/0.933）——forget 把过时的 p=1.0 先验清成均匀后，RATS 走保守
+  路线绕开悬崖，反而比"全知但风险规避不足"的 oracle 更稳（oracle 用真实 p
+  但 worst-case 半径仍按 L_p=1.0，不够保守）。
+- **FIR-CEM 同样有效**：cem_fir 在 p=0.4/0.5/0.6 达 0.867/0.933/0.933，远超
+  cem_static（0.333/0.733/0.867）——置信门控 α 让 CEM 在变化后谨慎，是主方法
+  成立的关键证据。低 p 下 cem_fir 略低于 bnn_rats_adaptive（0.867 vs 1.000），
+  是 CEM 滚动规划（horizon=3）的固有限制，不是 FIR 的问题。
+- **两个 unbounded RATS 方案成立**：rats_cv01 / rats_cal 追平 bnn_rats_static
+  （都 0.300/0.800/0.800 附近）且 p≥0.7 达 0.967-1.000——后验采样足以承担
+  悲观性，无需解析 L_p；方案 1（worst-of-N）与方案 2（校准 L_p）表现接近。
+- **退化更剧烈时 FIR 优势越大**：p 从 1.0 降到 0.4/0.5 是"无界"的大幅变化，
+  FIR（adaptive）的 forget 恰好处理这种情形；p 接近 1.0（0.8/0.9）时变化小，
+  FIR 的保守期反而略拖后腿（bnn_rats_adaptive 0.933/0.800 vs static 1.000/
+  1.000）——FIR 的收益与"变化幅度"正相关，符合设计意图。
+- **ada_mcts 居中偏弱**（0.533-1.000），mcts_static 在 cliff 上意外地强
+  （0.600-1.000）——MCTS 的 rollout 搜索在 cliff 长路径上比桥上有效。
 
 ### 4.4 结果：NS-Bridge（p: 1.0 → p_new at ts 0，100 trials，30000 sims）
 
@@ -168,7 +221,37 @@ mcts_static          -0.66   -0.52   -0.28    0.03    0.29    0.64    0.98
 
 ## 5. 讨论（Discussion）
 
-（待填）
+1. **FIR 是规划器无关的（plug-and-play）**：同一套 FIR（surprise → drift →
+   forget → learn）接在 RATS 上（bnn_rats_adaptive）和接在 CVaR-CEM 上
+   （cem_fir）都在 cliff 的低 p 大幅反超对应的 static 版本（RATS：1.000/1.000/
+   1.000 vs 0.300/0.800/0.800；CEM：0.867/0.933/0.933 vs 0.333/0.733/0.867）。
+   这说明 FIR 处理的是**模型层**的"自信但错误"，对下游规划器透明。
+
+2. **FIR 的收益与变化幅度正相关**：p 从 1.0 退化越多（0.4/0.5），FIR 反超
+   static 越多；p 接近 1.0（0.8/0.9）时变化小，FIR 的保守期反而略拖后腿。
+   这正是"unbounded 变化"场景下需要的性质——变化越大越需要忘记旧模型。
+
+3. **unbounded 情形下 RATS 的两个方案都成立**：没有有效 Lipschitz 常数 L_p 时，
+   用 N=100 个后验模型取最差（方案 1，≈1% CVaR 尾）或校准 L_p（方案 2）都能
+   让 RATS 追平 static 并在高 p 达 1.000——**悲观性可以来自模型后验的 spread，
+   而非解析半径**。
+
+4. **CEM 与 RATS 的差距是 planner 的，不是 FIR 的**：cem_fir 在低 p 略低于
+   bnn_rats_adaptive（0.867 vs 1.000），原因是 CEM horizon=3 的滚动规划短视；
+   同一 FIR 在 RATS（深度 3 树）上达到 1.000。提升 CEM 需要更长 horizon 或更
+   好的叶估值，与 FIR 机制本身无关。
+
+5. **bridge 上 FIR 无效是结构性的**：bridge episode 仅 3-4 步，forget 按
+   episode 内步数驱动（K_FORGET）来不及触发；即使 K_FORGET=1 强制每步触发，
+   "均匀模型"在桥上也没有更安全的路线（必须过桥，无悬崖可退避），所以
+   adaptive ≡ static。CEM 的 horizon/n_confident/alpha_min 扫描（12 配置）也
+   无法让 cem_fir 超过 cem_static。**FIR 需要足够长的 episode 来攒证据，且
+   环境要有"保守路线"可供退避**——这两个条件 bridge 都不满足。这是短 episode
+   + 无退避路线任务上 per-episode 自适应的固有边界。
+
+6. **ADA-MCTS 作为 baseline 依然偏弱**：cliff 上 0.533-1.000（低 p 不如
+   mcts_static），bridge 上被 worst-case 采样拖垮（0.160-0.970）。其 DPAS
+   双相采样在无界大幅变化下不如 FIR 的 forget 机制稳健。
 
 ## 6. 关键代码位置
 
