@@ -39,6 +39,22 @@
   和 bnn_rats_adaptive（FIR-RATS 仍是 cliff 最强）。**主方法 FIR-CEM 在所有
   非 oracle baseline 之上**。报告 `doc_tool/experiment_report_2026-08-12.md`
   §4.3/§5 已更新。
+- **2026-08-14（新设定+调参）**: 用户要求 cem_fir 在两环境成为"除 oracle 外
+  最强"，bridge 加 hole（对齐 Act As You Learn），并解释 bnn_rats_adaptive 超
+  oracle。完成：
+  (1) **bridge_hole 环境**（grids.py BRIDGE_HOLE_5x8，起点上方 (1,4) 加 hole，
+      预训练 p=1.0 ckpt，commit 8465a7d）；
+  (2) **oracle 诊断**：oracle_rats 的 L_p=1.0 worst-case 球过保守（p=0.4 时策略
+      在 (2,10/11) 撞墙停下，goal rate 0.833），而 bnn_rats_adaptive forget 后的
+      均匀模型让 RATS 走全程贴顶行的更安全路线（1.000）——不是 adaptive 真超
+      "知道真相的上界"，是 L_p 未校准的伪影；
+  (3) **cem_fir 调参**：cliff 加 `--cem-candidates 512`（0.38→0.88 追平
+      bnn_rats_adaptive 同种子）；bridge_hole 用 `--k-forget 1 --cem-horizon 6
+      --cem-n-confident 8`（p=0.6 达 0.30-0.38，cem_fir≥cem_static 但 CEM 系仍
+      落后 RATS 系——planner 固有局限）。新报告 `experiment_report_2026-08-14.md`
+      （commit 5e71cf1）。全量 cliff（cand512）+ bridge_hole 重跑中。
+  (4) 试过 cross-trial persistence（跨集累积 counts/drift）但 cliff 退化
+      （0.833→0.62），已 revert。
 
 ## 1. 做了什么
 
