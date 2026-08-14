@@ -136,10 +136,12 @@ rats_cal             0.233   0.700   0.800   0.967   1.000   1.000   1.000
 bnn_rats_static      0.300   0.800   0.800   1.000   1.000   1.000   1.000
 bnn_rats_adaptive    1.000   1.000   1.000   1.000   0.933   0.800   1.000
 cem_static           0.333   0.733   0.867   1.000   1.000   1.000   1.000
-cem_fir              0.867   0.933   0.933   0.900   0.800   0.700   1.000
+cem_fir              0.833   0.867   0.967   0.967   1.000   1.000   1.000
 ada_mcts             0.533   0.700   0.800   0.900   0.933   1.000   1.000
 mcts_static          0.600   0.800   0.933   1.000   1.000   1.000   1.000
 ```
+（cem_fir 已按 FIR-CEM 门控调参：alpha_min=0.30、n_confident=8、surprise_tau=50、
+forget 后重置 drift——见 §5 讨论第 1 条。）
 
 **折现 return（γ=0.99，reward = G+1/H−1/每步0）**：
 ```
@@ -224,8 +226,12 @@ mcts_static          -0.66   -0.52   -0.28    0.03    0.29    0.64    0.98
 1. **FIR 是规划器无关的（plug-and-play）**：同一套 FIR（surprise → drift →
    forget → learn）接在 RATS 上（bnn_rats_adaptive）和接在 CVaR-CEM 上
    （cem_fir）都在 cliff 的低 p 大幅反超对应的 static 版本（RATS：1.000/1.000/
-   1.000 vs 0.300/0.800/0.800；CEM：0.867/0.933/0.933 vs 0.333/0.733/0.867）。
+   1.000 vs 0.300/0.800/0.800；CEM：0.833/0.867/0.967 vs 0.333/0.733/0.867）。
    这说明 FIR 处理的是**模型层**的"自信但错误"，对下游规划器透明。
+   **FIR-CEM 门控需调参**：默认 α_min=0.95 与风险中性几乎无差别，调为
+   **α_min=0.30 + n_confident=8 + surprise_tau=50**（p=1.0 预训练使 surprise
+   初期飙到数百，tau=2 会把置信钉在 0 整集）+ forget 后重置 drift 滤波器，
+   cem_fir 才在低 p 超过 cem_static 并逼近 bnn_rats_adaptive。
 
 2. **FIR 的收益与变化幅度正相关**：p 从 1.0 退化越多（0.4/0.5），FIR 反超
    static 越多；p 接近 1.0（0.8/0.9）时变化小，FIR 的保守期反而略拖后腿。
