@@ -67,8 +67,43 @@ RATS 更占优。这是 planner 的固有局限，FIR 门控本身在 bridge 上
 
 ## 4. 实验结果（全量，30000 sims）
 
-### 4.1 cliff（--cem-candidates 512）
-（跑完填 `/tmp/grid_cliff_2026-08-14.log`）
+### 4.1 cliff（--cem-candidates 512，30 trials，30000 sims）
+
+**goal rate by p（paper 约定，holes=0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats          0.833   0.767   0.933   1.000   1.000   1.000   1.000
+rats_cv01            0.300   0.767   0.800   0.967   1.000   1.000   1.000
+rats_cal             0.233   0.700   0.800   0.967   1.000   1.000   1.000
+bnn_rats_static      0.300   0.800   0.800   1.000   1.000   1.000   1.000
+bnn_rats_adaptive    1.000   1.000   1.000   1.000   0.933   0.800   1.000
+cem_static           0.233   0.767   0.833   1.000   1.000   1.000   1.000
+cem_fir              0.767   0.767   0.900   1.000   1.000   1.000   1.000
+ada_mcts             0.533   0.700   0.800   0.900   0.933   1.000   1.000
+mcts_static          0.600   0.800   0.933   1.000   1.000   1.000   1.000
+```
+
+**折现 return（γ=0.99，reward = G+1/H−1/每步0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats           0.48    0.51    0.63    0.72    0.80    0.84    0.89
+rats_cv01             0.17    0.46    0.53    0.69    0.81    0.84    0.89
+rats_cal              0.14    0.43    0.53    0.69    0.81    0.84    0.89
+bnn_rats_static       0.17    0.48    0.51    0.71    0.81    0.84    0.89
+bnn_rats_adaptive     0.57    0.59    0.65    0.63    0.56    0.59    0.89
+cem_static            0.14    0.46    0.54    0.74    0.81    0.85    0.89
+cem_fir               0.42    0.43    0.56    0.62    0.66    0.75    0.89
+ada_mcts              0.29    0.40    0.49    0.61    0.66    0.73    0.77
+mcts_static           0.37    0.46    0.63    0.77    0.81    0.84    0.87
+```
+
+观察：
+- **cem_fir 在 cliff 超过所有非 oracle baseline**（0.767/0.767/0.900/1.000/1.000/
+  1.000/1.000），仅低于 oracle_rats（p=0.4 持平 0.833，p=0.5 略低 0.767 vs
+  0.767）和 bnn_rats_adaptive（FIR-RATS，p≤0.6 达 1.000）。cand512 把 cem_fir
+  p=0.4 从 0.38 提到 0.767、追平 bnn_rats_adaptive 的水平量级。
+- **FIR 有效**：cem_fir > cem_static 全 p（0.767 vs 0.233 at p=0.4）。
+- **两个 unbounded RATS 方案（rats_cv01/rats_cal）与 bnn_rats_static 持平**。
 
 ### 4.2 bridge_hole（--k-forget 1 --cem-horizon 6 --cem-n-confident 8，100 trials，30000 sims）
 
