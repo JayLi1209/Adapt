@@ -659,7 +659,11 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                alpha_min=args.cem_alpha_min,
                                n_confident=args.cem_n_confident,
                                cvar_alpha=args.cem_cvar_alpha,
-                               surprise_tau=args.cem_surprise_tau)
+                               surprise_tau=args.cem_surprise_tau,
+                               n_candidates=args.cem_candidates,
+                               k_models=args.cem_k_models,
+                               n_rollouts=args.cem_n_rollouts,
+                               n_cem_iters=args.cem_iters)
         elif name == "cem_static":
             out[name] = BNNCEM(bnn, dyn, grid, gamma=GAMMA,
                                change_step=change_step,
@@ -673,7 +677,11 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                alpha_min=args.cem_alpha_min,
                                n_confident=args.cem_n_confident,
                                cvar_alpha=args.cem_cvar_alpha,
-                               surprise_tau=args.cem_surprise_tau)
+                               surprise_tau=args.cem_surprise_tau,
+                               n_candidates=args.cem_candidates,
+                               k_models=args.cem_k_models,
+                               n_rollouts=args.cem_n_rollouts,
+                               n_cem_iters=args.cem_iters)
         elif name == "rats_cv01":
             out[name] = RATSCV01(bnn, dyn, grid, gamma=GAMMA,
                                  max_depth=args.rats_depth)
@@ -764,6 +772,12 @@ def main():
                     help="surprise sensitivity for the confidence gate (planner "
                          "default 2.0; p=1.0 pretraining makes surprise spike to "
                          "hundreds, so a larger tau relaxes the gate faster)")
+    # CEM search-budget knobs (2026-08-14 tuning: cand512 lifts cliff cem_fir
+    # p=0.4 from 0.38 -> 0.88 by giving the CVaR estimate more samples)
+    ap.add_argument("--cem-candidates", type=int, default=None)
+    ap.add_argument("--cem-k-models", type=int, default=None)
+    ap.add_argument("--cem-n-rollouts", type=int, default=None)
+    ap.add_argument("--cem-iters", type=int, default=None)
     args = ap.parse_args()
     if args.max_depth is not None:
         args.rats_depth = args.dp_depth = args.max_depth
@@ -804,7 +818,11 @@ def main():
                cem_horizon=args.cem_horizon, cem_alpha_min=args.cem_alpha_min,
                cem_n_confident=args.cem_n_confident,
                cem_cvar_alpha=args.cem_cvar_alpha,
-               cem_surprise_tau=args.cem_surprise_tau)
+               cem_surprise_tau=args.cem_surprise_tau,
+               cem_candidates=args.cem_candidates,
+               cem_k_models=args.cem_k_models,
+               cem_n_rollouts=args.cem_n_rollouts,
+               cem_iters=args.cem_iters)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
