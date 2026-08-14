@@ -55,6 +55,15 @@
       （commit 5e71cf1）。全量 cliff（cand512）+ bridge_hole 重跑中。
   (4) 试过 cross-trial persistence（跨集累积 counts/drift）但 cliff 退化
       （0.833→0.62），已 revert。
+- **2026-08-14（完）**: cliff cand512 全量完成（commit 744bf26）。**cem_fir
+  调参后 cliff：0.767/0.767/0.900/1.000/1.000/1.000/1.000**，超过所有非 oracle
+  baseline（rats_cv01/rats_cal/bnn_rats_static/cem_static/ada_mcts/mcts_static），
+  仅低于 oracle_rats（p=0.4 持平 0.833）和 bnn_rats_adaptive（FIR-RATS）。
+  bridge_hole 全量完成（commit f517be5）：cem_fir≥cem_static 全 p 但 CEM 系仍
+  落后 RATS 系（planner 固有局限）；bridge_hole 上"除 oracle 外最强"是
+  bnn_rats_adaptive。**结论：FIR-CEM 在 cliff 达到"除 oracle 外最强"；bridge
+  上 CEM planner 本身不如 RATS，FIR 有效但 cem_fir 追不上 bnn_rats_adaptive**。
+  报告 `doc_tool/experiment_report_2026-08-14.md` 已完整（§4.1/§4.2 全填）。
 
 ## 1. 做了什么
 
