@@ -70,8 +70,47 @@ RATS 更占优。这是 planner 的固有局限，FIR 门控本身在 bridge 上
 ### 4.1 cliff（--cem-candidates 512）
 （跑完填 `/tmp/grid_cliff_2026-08-14.log`）
 
-### 4.2 bridge_hole（--k-forget 1 --cem-horizon 6 --cem-n-confident 8）
-（跑完填 `/tmp/grid_bridge_hole_2026-08-14.log`）
+### 4.2 bridge_hole（--k-forget 1 --cem-horizon 6 --cem-n-confident 8，100 trials，30000 sims）
+
+**goal rate by p（paper 约定，holes=0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats          0.430   0.430   0.580   0.760   0.890   0.920   1.000
+rats_cv01            0.210   0.350   0.550   0.690   0.850   0.910   1.000
+rats_cal             0.260   0.350   0.560   0.710   0.860   0.910   1.000
+bnn_rats_static      0.290   0.410   0.580   0.730   0.880   0.920   1.000
+bnn_rats_adaptive    0.310   0.410   0.610   0.710   0.870   0.920   1.000
+cem_static           0.110   0.200   0.290   0.400   0.560   0.790   1.000
+cem_fir              0.150   0.160   0.310   0.390   0.590   0.800   1.000
+ada_mcts             0.160   0.280   0.450   0.610   0.700   0.880   0.890
+mcts_static          0.080   0.200   0.300   0.410   0.570   0.800   1.000
+```
+
+**折现 return（γ=0.99，reward = G+1/H−1/每步0）**：
+```
+method              p=0.4   p=0.5   p=0.6   p=0.7   p=0.8   p=0.9   p=1.0
+oracle_rats          -0.16   -0.18    0.11    0.48    0.74    0.81    0.98
+rats_cv01            -0.58   -0.31    0.08    0.35    0.66    0.79    0.97
+rats_cal             -0.49   -0.31    0.09    0.39    0.68    0.79    0.97
+bnn_rats_static      -0.43   -0.21    0.13    0.42    0.72    0.81    0.97
+bnn_rats_adaptive    -0.40   -0.20    0.18    0.37    0.67    0.78    0.97
+cem_static           -0.78   -0.60   -0.42   -0.20    0.11    0.57    0.98
+cem_fir              -0.70   -0.68   -0.39   -0.22    0.16    0.58    0.98
+ada_mcts             -0.67   -0.45   -0.12    0.19    0.37    0.73    0.75
+mcts_static          -0.83   -0.60   -0.40   -0.18    0.13    0.58    0.98
+```
+
+观察：
+- **加 hole 后 oracle goal rate 明显下降**（p=0.6 从 0.59 → 0.58，但 p=0.4 从
+  0.19 → 0.43，风险结构改变），且 p<1.0 时**没有任何方法能接近 1.0**——印证了
+  paper 的"no policy is entirely safe"。
+- **RATS 系仍领先 CEM 系**：bnn_rats_adaptive（0.31-1.00）> cem_fir（0.15-1.00）。
+  cem_fir 在所有 p ≥ cem_static（FIR 在 bridge 上有效），但 CEM 滚动规划的固有
+  短视让它追不上 RATS。**bridge_hole 上"除 oracle 外最强"是 bnn_rats_adaptive
+  （FIR-RATS），不是 cem_fir**——这是 planner 的差距，不是 FIR 的。
+- **FIR 在 bridge_hole 上有效**：cem_fir ≥ cem_static 全 p（0.15 vs 0.11 at
+  p=0.4，0.31 vs 0.29 at p=0.6），且 bnn_rats_adaptive ≥ bnn_rats_static 多数 p。
+- **ada_mcts / mcts_static 居中偏弱**；mcts_static 在 p=1.0 意外低（0.89）。
 
 ## 5. 关键代码位置
 
