@@ -31,6 +31,14 @@
   cliff p=0.4 探针（5 trials）cem_fir 达 0.80-1.00（原 0.867）。bridge 上
   CEM 本身gap（cem_static 0.10 vs RATS 0.19）horizon 3-9 都救不回——planner
   固有局限，cem_fir 在 bridge 最多与 cem_static 持平。全量 cliff 重跑中。
+- **2026-08-14（cem_fir 调参完成）**: cliff 全量重跑完成（commit 2010b41）。
+  **cem_fir 调参后 cliff：0.833/0.867/0.967/0.967/1.000/1.000/1.000**，
+  全 p 超过 cem_static（0.333/0.733/0.867/1.000/...）、rats_cv01（0.300/...）、
+  rats_cal（0.233/...）、bnn_rats_static（0.300/...）、ada_mcts（0.533/...）、
+  mcts_static（0.600/...），仅低于 oracle_rats（0.833 持平 p=0.4，p=0.5 略低）
+  和 bnn_rats_adaptive（FIR-RATS 仍是 cliff 最强）。**主方法 FIR-CEM 在所有
+  非 oracle baseline 之上**。报告 `doc_tool/experiment_report_2026-08-12.md`
+  §4.3/§5 已更新。
 
 ## 1. 做了什么
 
