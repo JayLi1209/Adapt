@@ -191,7 +191,27 @@ BRIDGE_5x8 = GridSpec(
           "HHHHHHHH"),
 )
 
-REGISTRY = {g.name: g for g in (FROZENLAKE_4x4, CLIFFWALKING_4x12, BRIDGE_5x8)}
+# Bridge with one extra hole (Act As You Learn, Luo et al. 2024: "We add an extra
+# hole to make the environment more challenging").  The hole sits on the upper
+# shoulder directly above the start (1,4): crossing the bridge now risks slipping
+# up into it, so even the safest route is not entirely safe -- the paper's point
+# about the bridge ("no policy is entirely safe").  A path S->G still exists
+# (dist 3), so there is an optimal route; oracle goal rate at p=0.6 drops 0.59->0.30.
+BRIDGE_HOLE_5x8 = GridSpec(
+    name="bridge_hole",
+    nrow=5, ncol=8, n_actions=4, k_dir=3,
+    deltas=((0, -1), (1, 0), (0, 1), (-1, 0)),
+    dir_offsets=(0, 3, 1),
+    slip_mode="perp",
+    desc=("HHHHHHHH",
+          "FFFFHHHH",
+          "GFFFSFFG",
+          "FFFFFHHH",
+          "HHHHHHHH"),
+)
+
+REGISTRY = {g.name: g for g in (FROZENLAKE_4x4, CLIFFWALKING_4x12, BRIDGE_5x8,
+                                BRIDGE_HOLE_5x8)}
 
 
 def get_grid(name: str) -> GridSpec:

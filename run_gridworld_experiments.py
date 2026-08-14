@@ -286,7 +286,8 @@ class BNNCEM:
                  count_w=1.0, drift_reset=False, adaptive=False,
                  horizon=RATS_DEPTH, alpha_min=CEM_ALPHA_MIN,
                  n_confident=CEM_N_CONFIDENT, cvar_alpha=CEM_CVAR_ALPHA,
-                 surprise_tau=None):
+                 surprise_tau=None, n_candidates=None, k_models=None,
+                 n_rollouts=None, n_cem_iters=None):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -301,6 +302,14 @@ class BNNCEM:
         kw = {}
         if surprise_tau is not None:
             kw["surprise_tau"] = surprise_tau
+        if n_candidates is not None:
+            kw["n_candidates"] = n_candidates
+        if k_models is not None:
+            kw["k_models"] = k_models
+        if n_rollouts is not None:
+            kw["n_rollouts"] = n_rollouts
+        if n_cem_iters is not None:
+            kw["n_cem_iters"] = n_cem_iters
         self._agent = CVaRCEMAgent(
             dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
             gamma=gamma, horizon=horizon, cvar_alpha=cvar_alpha,
