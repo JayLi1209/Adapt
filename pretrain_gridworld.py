@@ -54,10 +54,15 @@ def bfs_dist_to_goal(grid):
     return np.array([dist.get(i, far) for i in range(grid.n_states)], dtype=np.float64)
 
 
-def build_dataset(grid, goal_weight, n_rows, p):
+def build_dataset(grid, goal_weight, n_rows, p, balance_terminal=False):
     """Sample (s,a) rows weighted toward the goal; realized direction ~ slip_dist(p).
 
     p=1.0 reduces to the deterministic dataset (always the intended direction).
+    balance_terminal=True (2026-08-22): subsample so that transitions INTO a
+    terminal cell (G or H) are as frequent as transitions within F -- under the
+    goal-weighted sampling the near-goal states dominate and terminal landings
+    are over-represented, so the Dirichlet head sees mostly "goal/hole" rows and
+    undertrains the "safe step" rows that dominate an episode.
     """
     flat = grid.flat_desc
     usable = [s for s in range(grid.n_states) if flat[s] not in "HG"]
@@ -71,18 +76,26 @@ def build_dataset(grid, goal_weight, n_rows, p):
     acts = rng.integers(0, grid.n_actions, size=n_rows)
     dirs = rng.choice(grid.k_dir, size=n_rows, p=slip)     # realized slip direction
 
-    X = np.zeros((n_rows, grid.n_states + grid.n_actions), dtype=np.float32)
-    Y = np.zeros((n_rows, grid.n_states + 1), dtype=np.float32)
+    X, Y = [], []
+    term = 0
     for i, (u, a, k) in enumerate(zip(idx, acts, dirs)):
         s = usable[u]
         d_action = grid.dir_actions(a)[k]    # which of the K directions realized
         s2 = grid.move(s, d_action)
-        X[i, s] = 1.0
-        X[i, grid.n_states + a] = 1.0
-        Y[i, s2] = 1.0
-        Y[i, grid.n_states] = 1.0 if flat[s2] == "G" else (
+        is_term = flat[s2] in "GH"
+        if balance_terminal and is_term and term * 2 >= n_rows:
+            continue                        # keep terminal rows at ~ n_rows/2
+        term += int(is_term)
+        xi = np.zeros(grid.n_states + grid.n_actions, dtype=np.float32)
+        yi = np.zeros(grid.n_states + 1, dtype=np.float32)
+        xi[s] = 1.0
+        xi[grid.n_states + a] = 1.0
+        yi[s2] = 1.0
+        yi[grid.n_states] = 1.0 if flat[s2] == "G" else (
             -1.0 if flat[s2] == "H" else 0.0)
-    return torch.from_numpy(X), torch.from_numpy(Y), d, usable, w
+        X.append(xi); Y.append(yi)
+    X = torch.from_numpy(np.stack(X)); Y = torch.from_numpy(np.stack(Y))
+    return X, Y, d, usable, w
 
 
 def main():
@@ -97,6 +110,10 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--goal-weight", type=float, default=1.35,
                     help="w(s) = goal_weight^(-dist(s,goal)); >1 upweights goal-near")
+    ap.add_argument("--balance-terminal", action="store_true",
+                    help="subsample so transitions into terminal cells (G/H) are "
+                         "as frequent as transitions within F -- fixes the "
+                         "goal-weighted over-representation of terminal landings")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-dir", default=None)
     args = ap.parse_args()
@@ -106,7 +123,8 @@ def main():
     out_dir = pathlib.Path(args.out_dir) if args.out_dir else SAVE_DIR.parent / grid.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    X, Y, dist, usable, w = build_dataset(grid, args.goal_weight, args.rows, args.p)
+    X, Y, dist, usable, w = build_dataset(grid, args.goal_weight, args.rows, args.p,
+                                          balance_terminal=args.balance_terminal)
     X, Y = X.to(device), Y.to(device)
     target = grid.slip_dist(args.p)
     print(f"[{grid.name}] grid {grid.nrow}x{grid.ncol} n_states={grid.n_states} "
