@@ -80,7 +80,7 @@ def cell_reward(grid, s):
     if c == "G":
         return 1.0
     if c == "H":
-        return -1.0
+        return grid.hole_reward      # 0.0 per the paper's "holes = 0" convention
     return grid.step_penalty
 
 

@@ -99,10 +99,12 @@ def cell_reward_of(grid):
     """Reward-on-arrival per cell.
 
     Goal +1; every other landing pays grid.step_penalty (CliffWalking -1 per
-    step, per Luo et al.); holes additionally get their -1 -- on grids without a
-    step penalty this reduces to {G:+1, H:-1, else 0}.
+    step, per Luo et al.).  Holes pay grid.hole_reward (default 0.0 -- a hole
+    ends the episode with no further reward, matching the paper's convention
+    that "holes = 0" in the goal-rate report).  On grids without a step penalty
+    this reduces to {G:+1, H:hole_reward, else 0}.
     """
-    return np.array([1.0 if c == "G" else -1.0 if c == "H"
+    return np.array([1.0 if c == "G" else grid.hole_reward if c == "H"
                      else grid.step_penalty for c in grid.flat_desc])
 
 

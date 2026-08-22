@@ -30,7 +30,7 @@ class BNNModelPlanner(planning.Agent):
     """
 
     def __init__(self, dynamics_model, bnn, desc, device, n_actions=4,
-                 gamma=0.97, hole_reward=-1.0, rng=None, **kwargs):
+                 gamma=0.97, hole_reward=0.0, rng=None, **kwargs):
         self.dyn = dynamics_model
         self.bnn = bnn
         self.device = device
@@ -43,7 +43,8 @@ class BNNModelPlanner(planning.Agent):
         # Absorbing cell values: goal = 1, hole = 0 (both terminal).
         self.terminal = np.zeros(self.n, dtype=bool)
         self.cell_value = np.zeros(self.n, dtype=np.float32)
-        # Reward-on-arrival map: hole = hole_reward (<0), goal = +1, frozen = 0.
+        # Reward-on-arrival map: hole = hole_reward (default 0.0 -- a hole ends
+        # the episode with no further reward), goal = +1, frozen = 0.
         self.cell_reward = np.zeros(self.n, dtype=np.float64)
         for i, ch in enumerate(flat):
             if ch in "GH":

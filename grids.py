@@ -53,6 +53,10 @@ class GridSpec:
     # et al.: "the agent concedes a penalty for each step it takes except the
     # goal").  0.0 for the other grids.
     step_penalty: float = 0.0
+    # reward on arriving at a hole.  0.0 per the paper's "holes = 0" convention
+    # (a hole just ends the episode); -1.0 would make a fall strictly worse than
+    # never arriving, which the goal-rate report does not intend.
+    hole_reward: float = 0.0
 
     @property
     def n_states(self) -> int:
