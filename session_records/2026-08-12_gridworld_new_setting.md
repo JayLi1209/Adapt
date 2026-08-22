@@ -55,6 +55,17 @@
       （commit 5e71cf1）。全量 cliff（cand512）+ bridge_hole 重跑中。
   (4) 试过 cross-trial persistence（跨集累积 counts/drift）但 cliff 退化
       （0.833→0.62），已 revert。
+- **2026-08-22（修正）**: 用户指出三个问题并修正：
+  (1) **hole reward 0.0 不是 -1**（paper 约定 "holes=0"，goal rate 与 return 对齐）：
+      `grids.py` 新增 `hole_reward` 字段，`planning/rats.py` cell_reward_of、
+      `planning/base.py` hole_reward 默认 0.0、`run_gridworld_experiments.py`
+      cell_reward 全部改为用 `grid.hole_reward`（commit b4852e4）；
+  (2) **gamma 仍为 0.99**（planner 用；0.9999 是评估折现，不改 planner）；
+  (3) **bridge 用原始环境不加 hole**（bridge_hole 仅作参考，主实验回退到 bridge）；
+  (4) **pretraining 平衡**：`pretrain_gridworld.py` 新增 `--balance-terminal`
+      （commit 026ae7a）——目标加权采样让终态（G/H）过度代表，平衡后 cliff/bridge
+      新模型 MAE 不变（0.0003/0.0002）。验证：平衡模型在 cliff p=0.4 仍 1.000、
+      bridge p=0.4 仍 0.167（与不平衡一致——**当前模型质量不是瓶颈，MAE 已极低**）。
 - **2026-08-14（完）**: cliff cand512 全量完成（commit 744bf26）。**cem_fir
   调参后 cliff：0.767/0.767/0.900/1.000/1.000/1.000/1.000**，超过所有非 oracle
   baseline（rats_cv01/rats_cal/bnn_rats_static/cem_static/ada_mcts/mcts_static），
