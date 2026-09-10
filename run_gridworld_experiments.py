@@ -45,7 +45,9 @@ from planning.cvar_cem import CVaRCEMAgent
 
 _HERE = pathlib.Path(__file__).parent
 
-GAMMA = 0.99            # discount (user request)
+GAMMA = 0.9999          # discount (user request 2026-08-22: 0.9999 for BOTH
+                        # planning and evaluation -- planners receive this gamma,
+                        # run_episode discounts returns with it)
 ORIG_P = 1.0            # "original" env the model is pretrained on: fully
                         # deterministic, so the optimal policy is known and the
                         # pretrained model can be verified to find it
@@ -266,6 +268,21 @@ class BNNRATS:
         from bnn.dirichlet_workflow import forget_dirichlet
         forget_dirichlet(self.bnn, self.drift)
         self.snap.clear_cache()
+        # BUG FIX (2026-09-03, matches BNNCEM._forget): without this, delta_bar
+        # is a cumulative mean of ALL post-detection excess -- one huge spike
+        # from the FIRST slip under p=1.0 pretraining (near-deterministic model,
+        # so any slip has near-zero predicted probability -> NLL/entropy blows
+        # up into the hundreds) stays baked into delta_bar for the rest of the
+        # episode, since it decays only as 1/n.  Every subsequent k_forget tick
+        # then computes another near-zero rho and multiplies retain down AGAIN,
+        # driving it to a hard 0.0 (all prior directional signal lost, not just
+        # down-weighted) regardless of how large the actual change was.  This
+        # made bnn_rats_adaptive WORSE at small changes (p=0.9, where the old
+        # prior was still ~90% correct) than at large ones (p=0.4) --
+        # non-monotonic in p.  Resetting the drift accumulator after forgetting
+        # lets delta_bar reflect only NEW evidence, so retain stops crashing
+        # from stale surprise it has already acted on.
+        self.drift._reset_detection()
 
 
 # ── FIR-CEM (main method): CVaR-CEM planner + the FIR adaptation loop ──────────
@@ -287,7 +304,9 @@ class BNNCEM:
                  horizon=RATS_DEPTH, alpha_min=CEM_ALPHA_MIN,
                  n_confident=CEM_N_CONFIDENT, cvar_alpha=CEM_CVAR_ALPHA,
                  surprise_tau=None, n_candidates=None, k_models=None,
-                 n_rollouts=None, n_cem_iters=None):
+                 n_rollouts=None, n_cem_iters=None, warm_blend=0.0,
+                 do_forget=True, n_unfrozen=0, retrain_every=3,
+                 retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -298,6 +317,30 @@ class BNNCEM:
         self.persist_counts = persist_counts
         self.count_w = count_w
         self.drift_reset = drift_reset
+        # SFIR ablation knobs (2026-09-10).  do_forget=False removes the "F"
+        # (retain never decays); n_unfrozen>0 adds gradient "R" -- retrain the
+        # top n_unfrozen layers of the Dirichlet DIRECTION path
+        # (1=head only = "our method", 3=head+whole trunk) on the post-change
+        # buffer via retrain_dirichlet, every retrain_every post-change steps.
+        self.do_forget = do_forget
+        self.n_unfrozen = int(n_unfrozen)
+        self.retrain_every = int(retrain_every)
+        self.retrain_steps = int(retrain_steps)
+        self.retrain_lr = float(retrain_lr)
+        self.retrain_buf_cap = int(retrain_buf_cap)
+        # Gradient retrain mutates weight_mu/bias_mu IN PLACE, and the bnn object
+        # is shared across all trials in a _worker -- retain/counts are reset in
+        # reset() but weights are not.  Snapshot the direction path's mean
+        # weights (superset: n_unfrozen=3) so reset() can restore a pristine
+        # model each trial.
+        self._retrain_pristine = []
+        if self.n_unfrozen > 0:
+            from bnn.dirichlet_workflow import unfrozen_params_dirichlet
+            self._retrain_pristine = [
+                (p, p.detach().clone())
+                for p in unfrozen_params_dirichlet(bnn, 3)]
+        self._retrain_buf = []
+        self._opt = None
         self.name = "cem_fir" if adaptive else "cem_static"
         kw = {}
         if surprise_tau is not None:
@@ -310,6 +353,8 @@ class BNNCEM:
             kw["n_rollouts"] = n_rollouts
         if n_cem_iters is not None:
             kw["n_cem_iters"] = n_cem_iters
+        if warm_blend:
+            kw["warm_blend"] = warm_blend
         self._agent = CVaRCEMAgent(
             dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
             gamma=gamma, horizon=horizon, cvar_alpha=cvar_alpha,
@@ -323,10 +368,22 @@ class BNNCEM:
             self.bnn.reset_counts()
         self._agent.reset()
         self._agent.pi = self._agent._uniform.copy()
+        # Per-trial gate state: trials must be i.i.d. -- previously
+        # surprise_bar / n_since_change persisted across trials, so trial 2+
+        # started with the data gate already saturated.
+        self._agent.surprise_bar = 1.0
+        self._agent.n_since_change = 0
+        self._agent.plan_retain = None
         self.drift = DriftFilterV2(eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY)
         self._drift_done = False
         self.post = 0
         self._last = None
+        # undo any gradient retrain from the previous trial (weights are shared
+        # across trials; restore the pristine direction path so trials stay i.i.d.)
+        for p, c in self._retrain_pristine:
+            p.data.copy_(c)
+        self._retrain_buf = []
+        self._opt = None
 
     def observe(self, s, a, s2):
         if not self.adaptive:
@@ -355,11 +412,29 @@ class BNNCEM:
             self._agent.n_since_change = self.post
             if t >= self.change_step + 1:
                 self.post += 1
-                if self.post % self.k_forget == 0:
+                if self.do_forget and self.post % self.k_forget == 0:
                     self._forget()
+                # SFIR "R": buffer this post-change transition, gradient-retrain
+                # the top n_unfrozen direction-path layers every retrain_every
+                # steps (no-op when n_unfrozen == 0).
+                if self.n_unfrozen > 0:
+                    self._retrain_buf.append((obs, act_v, ps2))
+                    if len(self._retrain_buf) > self.retrain_buf_cap:
+                        self._retrain_buf = self._retrain_buf[-self.retrain_buf_cap:]
+                    if self.post % self.retrain_every == 0:
+                        self._retrain()
             d = self.grid.direction_of(ps, pa, ps2)
             if d >= 0:
                 self.bnn.add_count(ps, pa, d, w=self.count_w)
+        # Planning-time uncertainty gate (SFI "inflate before planning"): scale
+        # the planner's view of the pretrained model by the same confidence that
+        # gates the CVaR tail.  At the announced change (no post-change data)
+        # conf = 0 -> the planner scores candidates on an inflated (near-uniform)
+        # model, so the CVaR tail is real even though the pretrained alpha0 is
+        # large; as counts accumulate conf -> 1 and the true model is trusted.
+        # Static / stationary phases keep plan_retain = None (full trust).
+        if self.adaptive and self.change_step is not None:
+            self._agent.plan_retain = self._agent._confidence()
         obs = np.zeros(self.grid.n_states, dtype=np.float32)
         obs[int(s)] = 1.0
         return int(np.argmax(self._agent.act(obs)))
@@ -372,6 +447,110 @@ class BNNCEM:
         # Reset the drift accumulator so conf_surprise recovers on the NEW-env
         # evidence instead of staying pinned to 0 for the whole episode.
         self.drift._reset_detection()
+
+    def _retrain(self):
+        """SFIR "R": gradient-retrain the top n_unfrozen layers of the direction
+        path (head only for n_unfrozen=1) on the post-change buffer, via the bare
+        categorical NLL (no KL -- matches retrain_dirichlet's design).  retain /
+        counts participate in the forward exactly as at plan time."""
+        if not self._retrain_buf:
+            return
+        import torch
+        from bnn.dirichlet_workflow import (retrain_dirichlet,
+                                            unfrozen_params_dirichlet)
+        if self._opt is None:
+            self._opt = torch.optim.Adam(
+                unfrozen_params_dirichlet(self.bnn, self.n_unfrozen),
+                lr=self.retrain_lr)
+        obs = torch.as_tensor(np.stack([b[0] for b in self._retrain_buf]),
+                              dtype=torch.float32, device=device)
+        act = torch.as_tensor(np.stack([b[1] for b in self._retrain_buf]),
+                              dtype=torch.float32, device=device)
+        model_in = self.dyn._get_model_input(obs, act)
+        s2_idx = torch.as_tensor([[int(b[2])] for b in self._retrain_buf],
+                                 dtype=torch.long, device=device)
+        with torch.enable_grad():
+            retrain_dirichlet(self.bnn, self._opt, model_in, s2_idx,
+                              n_steps=self.retrain_steps)
+
+ADA_CEM_N_THRESHOLD = 3   # post-change samples before switching phases -- matches
+                          # ADA-MCTS's DPAS _n_threshold (planning/ada_mcts.py)
+
+
+class CEMADA:
+    """CVaR-CEM planner + ADA-MCTS's adaptation instead of SFI (2026-09-03 user
+    request: "ada-cem-cvar是把sfir-cem-cvar中的sfir换成ada-mcts的方法").
+
+    Same planner as cem_fir/cem_static (CVaRCEMAgent), but the adaptation loop
+    is ADA-MCTS's DPAS two-phase switch, not surprise/forget/plan_retain:
+      - notified once at change_step (like ADAMCTS.notify_change), not via a
+        surprise detector.
+      - ONLY online counts accumulate post-notification (no retain decay, no
+        forget) -- bnn.add_count every step, matching ADAMCTS.learn().
+      - the CVaR tail is a HARD two-phase switch: alpha_min (worst-case) until
+        n_threshold post-change samples observed, then alpha=1.0 (risk-neutral)
+        -- the direct analogue of DPAS's `_training_started` boolean gate,
+        applied to the CEM tail instead of MCTS's chance-node sampling rule.
+    """
+
+    name = "cem_ada"
+
+    def __init__(self, bnn, dyn, grid, gamma=GAMMA, change_step=0,
+                 n_threshold=ADA_CEM_N_THRESHOLD, alpha_min=CEM_ALPHA_MIN,
+                 horizon=RATS_DEPTH, n_candidates=None, k_models=None,
+                 n_rollouts=None, n_cem_iters=None):
+        self.bnn = bnn
+        self.dyn = dyn
+        self.grid = grid
+        self.change_step = change_step
+        self.n_threshold = n_threshold
+        self.alpha_min = alpha_min
+        kw = {}
+        if n_candidates is not None:
+            kw["n_candidates"] = n_candidates
+        if k_models is not None:
+            kw["k_models"] = k_models
+        if n_rollouts is not None:
+            kw["n_rollouts"] = n_rollouts
+        if n_cem_iters is not None:
+            kw["n_cem_iters"] = n_cem_iters
+        self._agent = CVaRCEMAgent(
+            dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
+            gamma=gamma, horizon=horizon, cvar_alpha=1.0,
+            adaptive_alpha=False,   # alpha driven manually below (two-phase)
+            alpha_min=alpha_min, rng=np.random.default_rng(0), **kw)
+        self._notified = False
+        self._post = 0
+
+    def reset(self):
+        self.bnn.use_counts = True
+        self.bnn.retain.fill_(1.0)   # ADA never forgets -- no retain decay
+        self.bnn.reset_counts()
+        self._agent.reset()
+        self._agent.pi = self._agent._uniform.copy()
+        self._notified = False
+        self._post = 0
+
+    def observe(self, s, a, s2):
+        if not self._notified:
+            return
+        d = self.grid.direction_of(s, a, s2)
+        if d >= 0:
+            self.bnn.add_count(int(s), int(a), d)
+        self._post += 1
+
+    def act(self, s, t, p):
+        if (self.change_step is not None and t == self.change_step
+                and not self._notified):
+            self._notified = True
+            self._post = 0
+        self._agent.cvar_alpha = (
+            1.0 if (not self._notified) or self._post >= self.n_threshold
+            else self.alpha_min)
+        obs = np.zeros(self.grid.n_states, dtype=np.float32)
+        obs[int(s)] = 1.0
+        return int(np.argmax(self._agent.act(obs)))
+
 
 # ── unbounded-RATS baselines (we face an UNBOUNDED change: L_p / L_r unknown) ─
 
@@ -647,7 +826,8 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                 change_step=change_step,
                                 dpas_gamma=args.dpas_gamma)
         elif name == "cem_fir":
-            out[name] = BNNCEM(bnn, dyn, grid, gamma=GAMMA,
+            out[name] = BNNCEM(bnn, dyn, grid,
+                               gamma=args.cem_plan_gamma or GAMMA,
                                change_step=change_step,
                                k_forget=args.k_forget,
                                use_counts=args.use_counts,
@@ -663,9 +843,16 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                n_candidates=args.cem_candidates,
                                k_models=args.cem_k_models,
                                n_rollouts=args.cem_n_rollouts,
-                               n_cem_iters=args.cem_iters)
+                               n_cem_iters=args.cem_iters,
+                               warm_blend=args.cem_warm_blend,
+                               do_forget=args.do_forget,
+                               n_unfrozen=args.n_unfrozen,
+                               retrain_every=args.retrain_every,
+                               retrain_steps=args.retrain_steps,
+                               retrain_lr=args.retrain_lr)
         elif name == "cem_static":
-            out[name] = BNNCEM(bnn, dyn, grid, gamma=GAMMA,
+            out[name] = BNNCEM(bnn, dyn, grid,
+                               gamma=args.cem_plan_gamma or GAMMA,
                                change_step=change_step,
                                k_forget=args.k_forget,
                                use_counts=args.use_counts,
@@ -681,7 +868,54 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                n_candidates=args.cem_candidates,
                                k_models=args.cem_k_models,
                                n_rollouts=args.cem_n_rollouts,
+                               n_cem_iters=args.cem_iters,
+                               warm_blend=args.cem_warm_blend)
+        elif name == "cem_ada":
+            out[name] = CEMADA(bnn, dyn, grid,
+                               gamma=args.cem_plan_gamma or GAMMA,
+                               change_step=change_step,
+                               n_threshold=args.cem_ada_threshold,
+                               alpha_min=args.cem_alpha_min,
+                               horizon=args.cem_horizon,
+                               n_candidates=args.cem_candidates,
+                               k_models=args.cem_k_models,
+                               n_rollouts=args.cem_n_rollouts,
                                n_cem_iters=args.cem_iters)
+        elif name == "oracle_cem":
+            # Same planner/params as cem_static; _worker loads a checkpoint
+            # pretrained DIRECTLY on this phase's true p (see _worker), so no
+            # adaptation loop is needed -- the model already matches the
+            # post-change env from t=0 (oracle upper bound for the CEM family,
+            # the CEM analogue of oracle_rats).
+            out[name] = BNNCEM(bnn, dyn, grid,
+                               gamma=args.cem_plan_gamma or GAMMA,
+                               change_step=change_step,
+                               adaptive=False,
+                               horizon=args.cem_horizon,
+                               alpha_min=args.cem_alpha_min,
+                               n_confident=args.cem_n_confident,
+                               cvar_alpha=args.cem_cvar_alpha,
+                               n_candidates=args.cem_candidates,
+                               k_models=args.cem_k_models,
+                               n_rollouts=args.cem_n_rollouts,
+                               n_cem_iters=args.cem_iters)
+            out[name].name = "oracle_cem"
+            # BUG FIX (2026-09-08): CVaRCEMAgent.adaptive_alpha is hardwired True
+            # (CEM_ADAPTIVE_ALPHA) inside BNNCEM.__init__ regardless of `adaptive`,
+            # but the two state vars that DRIVE its confidence gate
+            # (self._agent.n_since_change, self._agent.surprise_bar) are only ever
+            # updated inside BNNCEM.act()'s `if self.adaptive and ...:` block --
+            # which never runs for oracle_cem (adaptive=False).  So n_since_change
+            # stays at its reset() value of 0 forever -> conf_data=0 forever ->
+            # alpha = alpha_min (the MOST risk-averse worst-case CVaR tail) for
+            # the entire episode, even though the oracle already has the TRUE
+            # post-change model and has no regime uncertainty left to resolve.
+            # This silently made oracle_cem plan under needless permanent worst-
+            # case pessimism instead of the risk-neutral cvar_alpha it was given
+            # (args.cem_cvar_alpha, default 1.0) -- plausible cause of the
+            # oracle sometimes losing to cem_fir at low p (09-06 report).  Force
+            # the fixed tail here; cem_fir/cem_static are untouched.
+            out[name]._agent.adaptive_alpha = False
         elif name == "rats_cv01":
             out[name] = RATSCV01(bnn, dyn, grid, gamma=GAMMA,
                                  max_depth=args.rats_depth)
@@ -712,9 +946,23 @@ def _worker(task):
     (grid_name, method_name, phase_label, p_schedule, dist_by_time,
      change_step, trials, max_steps, cfg) = task
     torch.manual_seed(0)   # posterior draws reproducible across workers/runs
+    if cfg.get("conc_prior") is not None:
+        # Must patch the ATTRIBUTE on the actual module object: dirichlet_model.py
+        # resolves CONC_PRIOR as a plain module-global at every _forward_alpha
+        # call, so this needs to happen before any such call in this process
+        # (fresh spawn per task -> once here is enough for the whole task).
+        import bnn.dirichlet_model as _dm
+        _dm.CONC_PRIOR = float(cfg["conc_prior"])
     grid = get_grid(grid_name)
     bnn, dyn = make_dirichlet_bnn(grid.n_states, grid.n_actions, grid=grid)
-    ckpt = _HERE / "data" / grid_name / ckpt_name(grid, cfg["orig_p"])
+    if method_name == "oracle_cem":
+        # Oracle: pretrained DIRECTLY on this phase's true p, not on orig_p --
+        # "stationary" (p=orig_p, no change) still matches orig_p exactly.
+        p_ckpt = cfg["orig_p"] if phase_label == "stationary" \
+            else float(phase_label.split("=")[1])
+    else:
+        p_ckpt = cfg["orig_p"]
+    ckpt = _HERE / "data" / grid_name / ckpt_name(grid, p_ckpt)
     if not ckpt.exists():
         raise FileNotFoundError(f"{ckpt} not found -- run pretrain_gridworld.py")
     bnn.load(ckpt.parent, filename=ckpt.name)
@@ -736,8 +984,14 @@ def _worker(task):
 
 
 def main():
+    global ORIG_P
     ap = argparse.ArgumentParser()
     ap.add_argument("--grid", default="cliffwalking")
+    ap.add_argument("--orig-p", type=float, default=None,
+                    help="override ORIG_P (the pretraining p / stationary-phase "
+                         "p / non-oracle checkpoint to load); default: module "
+                         "ORIG_P=1.0.  Needs a matching checkpoint from "
+                         "pretrain_gridworld.py --p <orig-p> --balance-terminal.")
     ap.add_argument("--trials", type=int, default=30)
     ap.add_argument("--workers", type=int, default=12,
                     help="parallel processes (tasks = methods x phases; "
@@ -761,6 +1015,22 @@ def main():
     ap.add_argument("--counts", dest="use_counts",
                     action="store_true", default=False)
     ap.add_argument("--methods", nargs="*", default=None)
+    # SFIR ablation knobs (2026-09-10) -- cem_fir only.  Default = "our method"
+    # today, i.e. SFI (forget on, no gradient retrain).
+    ap.add_argument("--no-forget", dest="do_forget", action="store_false",
+                    default=True,
+                    help="cem_fir: remove the 'F' -- retain never decays")
+    ap.add_argument("--n-unfrozen", type=int, default=0,
+                    help="cem_fir gradient retrain 'R': # of top DIRECTION-path "
+                         "layers to retrain on the post-change buffer.  0=off, "
+                         "1=Dirichlet head only ('our method' with retrain), "
+                         "2=head+top trunk, 3=head+whole trunk (retrain-all).")
+    ap.add_argument("--retrain-every", type=int, default=3,
+                    help="cem_fir: gradient-retrain cadence in post-change steps")
+    ap.add_argument("--retrain-steps", type=int, default=5,
+                    help="cem_fir: Adam steps per retrain call")
+    ap.add_argument("--retrain-lr", type=float, default=1e-2,
+                    help="cem_fir: Adam lr for the retrain (bare NLL, no KL)")
     # CEM planner tuning (2026-08-13, bridge short-episode tuning)
     ap.add_argument("--cem-horizon", type=int, default=RATS_DEPTH,
                     help="CEM planning horizon (bridge's full trip is ~2-4 steps)")
@@ -778,9 +1048,41 @@ def main():
     ap.add_argument("--cem-k-models", type=int, default=None)
     ap.add_argument("--cem-n-rollouts", type=int, default=None)
     ap.add_argument("--cem-iters", type=int, default=None)
+    ap.add_argument("--cem-plan-gamma", type=float, default=None,
+                    help="CEM-internal planning discount (default: GAMMA=0.99).  "
+                         "At gamma=0.99 with horizon 6 the heuristic bootstrap "
+                         "gamma^dist(~0.93-0.99) nearly matches actually reaching "
+                         "the goal (gamma^4=0.96), which makes CEM dither next "
+                         "to the goal; a smaller plan gamma sharpens the "
+                         "goal-vs-hover contrast.  Evaluation gamma unchanged.")
+    ap.add_argument("--cem-ada-threshold", type=int, default=ADA_CEM_N_THRESHOLD,
+                    help="cem_ada: post-change samples before switching from "
+                         "worst-case (alpha_min) to risk-neutral (alpha=1.0) "
+                         "-- the DPAS _training_started threshold, ported from "
+                         "ADA-MCTS (default 3, matches planning/ada_mcts.py)")
+    ap.add_argument("--cem-warm-blend", type=float, default=0.0,
+                    help="fraction of the previous step's refit plan (shifted "
+                         "forward) blended into the CEM init; 0 = re-seed from "
+                         "the model policy every step.  Commitment against "
+                         "per-step re-planning noise (dithering).")
+    ap.add_argument("--conc-prior", type=float, default=None,
+                    help="override bnn.dirichlet_model.CONC_PRIOR (default 1.0 "
+                         "as of 2026-09-09, was 0.1 -- see the module docstring), "
+                         "the symmetric Dirichlet concentration that retain=0 "
+                         "(fully forgotten / fully plan_retain-deflated) decays "
+                         "toward.  Lower -> more extreme/high-variance posterior "
+                         "draws when uncertain (spikier CVaR tail); higher -> "
+                         "draws stay closer to uniform (milder tail).  Does NOT "
+                         "need repretraining: pretrain_alpha0 uses it only as a "
+                         "negligible +K*conc_prior regularizer on top of real "
+                         "counts (~100s), so old checkpoints stay valid -- only "
+                         "the retain-blend formula (evaluated fresh each forward "
+                         "pass) sees the new value.")
     args = ap.parse_args()
     if args.max_depth is not None:
         args.rats_depth = args.dp_depth = args.max_depth
+    if args.orig_p is not None:
+        ORIG_P = args.orig_p
 
     grid = get_grid(args.grid)
     max_steps = args.max_steps or (10 if grid.name == "bridge" else 100)
@@ -807,6 +1109,12 @@ def main():
         f"| max_steps={max_steps} | trials={args.trials} | workers={args.workers}")
     log(f"  methods: {methods}")
     log(f"  ADA-MCTS: {args.m_simulations} simulations/action (paper value)")
+    if args.conc_prior is not None:
+        log(f"  CONC_PRIOR override: {args.conc_prior} (module default 1.0)")
+    if not args.do_forget or args.n_unfrozen > 0:
+        log(f"  cem_fir SFIR ablation: do_forget={args.do_forget} "
+            f"n_unfrozen={args.n_unfrozen} retrain_every={args.retrain_every} "
+            f"retrain_steps={args.retrain_steps} retrain_lr={args.retrain_lr}")
     log("=" * 90)
 
     # ── build (phase, method) tasks ─────────────────────────────────────────
@@ -822,7 +1130,14 @@ def main():
                cem_candidates=args.cem_candidates,
                cem_k_models=args.cem_k_models,
                cem_n_rollouts=args.cem_n_rollouts,
-               cem_iters=args.cem_iters)
+               cem_iters=args.cem_iters,
+               cem_plan_gamma=args.cem_plan_gamma,
+               cem_warm_blend=args.cem_warm_blend,
+               cem_ada_threshold=args.cem_ada_threshold,
+               conc_prior=args.conc_prior,
+               do_forget=args.do_forget, n_unfrozen=args.n_unfrozen,
+               retrain_every=args.retrain_every,
+               retrain_steps=args.retrain_steps, retrain_lr=args.retrain_lr)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
@@ -895,7 +1210,7 @@ def main():
             else:
                 line += "       "
         log(line)
-    log("\nSUMMARY: discounted return (gamma=0.99, holes = -1)")
+    log(f"\nSUMMARY: discounted return (gamma={GAMMA}, holes = 0)")
     log("-" * 90)
     header = f"{'method':<18s}"
     for p in change_ps:

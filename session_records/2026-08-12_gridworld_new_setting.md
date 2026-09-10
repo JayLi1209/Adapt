@@ -66,6 +66,73 @@
       （commit 026ae7a）——目标加权采样让终态（G/H）过度代表，平衡后 cliff/bridge
       新模型 MAE 不变（0.0003/0.0002）。验证：平衡模型在 cliff p=0.4 仍 1.000、
       bridge p=0.4 仍 0.167（与不平衡一致——**当前模型质量不是瓶颈，MAE 已极低**）。
+- **2026-08-25（alpha0 标定）**: 排查"pretraining 效果差"的剩余问题：**concentration
+  α0 与数据量脱钩**。诊断：categorical NLL 只依赖均值 p=α/α0，对 α 缩放不变 →
+  α0 完全由 KL→prior 决定，实测 cliff α0≈7.5 / bridge≈11，而 20000 行数据下
+  共轭后验应为 ~135/312。纯 Dirichlet-multinomial count loss 也救不了（确定性
+  数据下空类别触底后 α0 梯度≈0，MLE 是 α0→∞ 的渐近线）；log 空间回归项
+  （conf_weight）Adam 步长限制 400 epochs 只能爬到 α0≈14。最终方案：**预训练计数
+  表**——`DirichletDynamicsModel` 新增 `pretrain_alpha0` buffer（α0[s,a]=
+  预训练 counts + K·CONC_PRIOR），head 的 softplus 输出只管方向均值，表管浓度
+  （`set_pretrain_counts()`，全零行回退 head 幅度，旧 checkpoint 行为不变）。
+  表在 retain 变换**之前**进入 α → forget 照样能把预训练置信度衰减到均匀先验，
+  在线 counts 照常叠加。顺带修 bug：pretrain 的 reward 标签里 hole 硬编码 -1.0，
+  与 8-22 的 hole_reward=0.0 不一致 → 改用 `grid.hole_reward`。
+  重训 cliff/bridge p=1.0 ckpt（--balance-terminal）：MAE 0.0003/0.0002 不变，
+  α0 mean=135.4/312.8 精确跟踪 counts（mean 135/312）。探针实验重跑中
+  （/tmp/probe_cliff_p04_alphatab.log, /tmp/probe_bridge_p04_alphatab.log）。
+- **2026-08-25（bridge cem_fir 调参 + plan_retain 门控）**: 用户目标：bridge 上
+  cem_fir 超所有非 oracle baseline（新模型全量 baseline：bnn_rats_static
+  0.240/0.430/0.620 @ p=0.4/0.5/0.6）。
+  (1) **轨迹诊断**（/tmp/diag_bridge_traj.py）：bridge 两端都有 G——右桥近
+      (dist 3) 但两侧是 H，左岸远 (dist 4) 全程安全。CEM（static 和 fir）直冲
+      右桥掉洞（≈p³ 运气）；bnn_rats_static 全走左岸 7/8 成功。RATS 的保守来自
+      L_p worst-case 球（解析 adversary），α0 变锐利后不受影响；但 CEM 的 CVaR
+      尾部依赖后验弥散，α0=312 后 100 个采样全同 → CVaR≈均值 → 风险盲区。
+      **α 旋钮在锐利模型下是死的**（alpha_min 0.3→0.5 结果逐点不变）。
+  (2) **plan_retain 门控**（main_cl.tex 的 "restore uncertainty BEFORE
+      planning"）：`planning/cvar_cem.py` 新增 plan_retain——规划读模型时把
+      bnn.retain 临时乘上 conf（与 CVaR α 同一 confidence 信号）；counts 在
+      retain 变换之后叠加、始终全信；static/stationary 不受影响。附带修
+      BNNCEM.reset 不重置 surprise_bar/n_since_change 的跨 trial 泄漏。
+      门控后 cem_fir 轨迹立即改走左岸。
+  (3) **horizon 是关键**：sweep2/3 忘传 --cem-horizon（默认 h3），h3 看不到
+      左岸 goal（dist 4）→ 被启发式 γ^dist 误导。h6 + kf1 后 100-trial：
+      H(kf1,h6,nc2) 0.220/0.290/0.480，J(kf3,h6,nc2) 0.160/0.330/0.540。
+  (4) plan_gamma 假设被否：pg0.9 (K) 0.230/0.240/0.400 反而更差（K<L? 待确认）。
+  (5) sweep7 在测：nc99/nc20（门控整段关闭，纯 counts 模型）、amin0.1。
+  扫描日志：/tmp/bridge_cem_sweep{2..7}.log。
+  cliff 全量（α0 表模型+旧门控）/tmp/grid_cliff_2026-08-25.log 收尾中；
+  cem_fir/cem_static 需用新门控代码重跑。新报告
+  `doc_tool/experiment_report_2026-08-25.md`；handoff
+  `session_records/2026-08-25_handoff.md`。
+- **2026-08-25/26（bridge 调参完成 + 全量收尾）**: sweep2-10 共 20+ 配置
+  （100 trials）：plan_gamma 有害（K/L）、大预算无用（R）、warm-blend 有害
+  （Y/Z/AA）、nc99/nc20 有害（N/P）、it8 无用（S）；有效的是
+  **kf1 + h6 + nc2 + amin0.1（Q 配置）**。最终 bridge 全 p：
+  cem_fir 0.200/0.350/0.540/0.610/0.860/0.950/1.000（门控前 0.09/0.18/0.25/...），
+  超 cem_static/ada_mcts/mcts_static 全部，p=0.4 超 oracle（0.20 vs 0.19），
+  p=0.5 追平 oracle；未超 RATS 家族（残余差距 = CEM 开环候选评估 vs RATS 闭环
+  minimax，budget×4 无改善 → 结构性）。cliff 全量（α0 表模型）完成；cem 用
+  新门控代码重跑：cem_fir 0.767/0.867/0.900/0.967/1.000/1.000/1.000，仍超所有
+  非 oracle、非 SFI-RATS baseline（p=0.4：0.767 vs 次优 0.567）。报告
+  `doc_tool/experiment_report_2026-08-25.md` 完整。
+- **2026-08-26/27（γ 统一 0.9999 全量重跑）**: 用户指出 γ 应统一 0.9999（此前
+  规划+评估都是 0.99，"评估 0.9999"的说法是错的）。`GAMMA=0.9999`
+  （run_gridworld_experiments.py L48，规划评估共用）。γ≈1 + holes=0 →
+  return ≈ goal rate 逐点对齐（用户要求）。**格局变化**：
+  (1) bridge：γ^dist 启发式拉平 → "存活≈满分" → cem_static 无需适配即成纯避洞
+      （0.11/0.22/0.31 → 0.16/0.34/0.60）；SFI-CEM 各 g9999 配置（W/X/Y 系列 +
+      Q）与 static 持平未超过；RATS 家族仍领先（结构性：开环 CEM vs 闭环
+      minimax）。bridge cem 报告 Q 配置全 p：0.16/0.35/0.52/0.61/0.86/0.95/1.00。
+  (2) cliff：MCTS 系大涨（ada_mcts 0.667/0.900/1.000，mcts_static
+      0.633/0.967/1.000）——掉 cliff 是传送回起点非终止，γ≈1 + 100 步预算 →
+      p≥0.7 饱和。cem_fir 最终用 **h6**（cand512）：全 p
+      **0.767/0.900/0.933/1.000/1.000/1.000/1.000**（/tmp/grid_cliff_2026-08-27_cem_h6.log）；
+      p=0.4 超所有非 oracle baseline（0.767 vs ada 0.667），对 cem_static
+      （0.367/0.800/0.867）增益翻倍；p=0.5 平 ada_mcts、低于 mcts_static 0.967。
+      oracle_rats p=0.4 降到 0.600（γ 改变其 worst-case 策略）。
+  报告已重写为 γ=0.9999 版（含 §7/§8 双语设计说明）。
 - **2026-08-14（完）**: cliff cand512 全量完成（commit 744bf26）。**cem_fir
   调参后 cliff：0.767/0.767/0.900/1.000/1.000/1.000/1.000**，超过所有非 oracle
   baseline（rats_cv01/rats_cal/bnn_rats_static/cem_static/ada_mcts/mcts_static），

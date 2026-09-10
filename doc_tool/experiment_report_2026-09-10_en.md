@@ -1,0 +1,562 @@
+# Non-Stationary CliffWalking — Consolidated Report (2026-09-10)
+
+> Code: `run_gridworld_experiments.py`, `grids.py`, `bnn/dirichlet_model.py`,
+> `planning/cvar_cem.py`, `planning/ada_mcts.py`.
+> Prior reports: `experiment_report_2026-08-25.md` / `_en.md` (background:
+> γ=0.9999, α0 calibration, plan_retain gating); `experiment_report_2026-09-04.md`
+> (step-by-step log of this round's work — this report is its cleaned-up
+> consolidation).
+> Read-only (do not edit): `experiment_report.md`, `experiment_report_new.md`,
+> `20260509_yuanheli2.md`, `20260509_yuanheli2_modified.md`.
+> Chinese version: `experiment_report_2026-09-10.md`.
+
+---
+
+## 0. Executive summary
+
+For the non-stationary control methods in `main_cl.tex`, this round ran a full
+3-config × 5-method comparison on **CliffWalking 4×12**, and along the way fixed
+two bugs and settled one hyperparameter:
+
+1. **Bug 1 fix (`bnn_rats_adaptive` / SFI-RATS)**: `BNNRATS._forget()` was
+   missing `drift._reset_detection()`, so under p=1.0 pretraining the huge
+   surprise spike from the first slip stayed baked into every subsequent
+   `forget` call, crashing `bnn.retain` to a hard 0 — and **worse for small
+   changes than large ones** (p=0.9 worse than p=0.4), i.e. goal rate
+   non-monotone in p. Fixed; monotonicity restored.
+2. **The 3 main experiments** (original cliff / first cliff cell removed /
+   pretrain at p=0.7), p swept 1.0→0.3 (incl. 0.4 and 0.7), 5 methods × 8
+   p-points × 30 trials.
+3. **CONC_PRIOR tuning**: swept the symmetric prior `c` that the "forgotten"
+   Dirichlet decays toward, from 0.1 to 10. **c=1.0 (the actual uniform
+   distribution over the simplex, Dirichlet(1,1,1)) beat the old 0.1 at every
+   tested point**, making `sfir-cem-cvar` the tied-or-best non-oracle method
+   at 20 of 21 (config,p) combinations. `CONC_PRIOR` is now formally 1.0.
+4. **Bug 2 fix (`oracle_cem`)**: `oracle_cem` reuses `cem_fir`'s
+   `CVaRCEMAgent`, but that class's confidence-gate state is only updated when
+   `self.adaptive=True` — `oracle_cem` has `adaptive=False`, so it was
+   permanently pinned to the most risk-averse worst-30% CVaR tail, even though
+   it holds the true post-change model. Fixed (forced risk-neutral);
+   `oracle_cem` is a credible upper bound again at all 21 points.
+
+**One-liner**: after both bug fixes and settling on c=1.0, `sfir-cem-cvar`
+(our method) is the **best non-oracle method** (only exception: config2
+p=0.4, loses to ada-mcts 0.800 vs 0.867), and `oracle_cem` is restored as a
+trustworthy upper bound.
+
+---
+
+## 1. Methods (aligned to main_cl.tex / NSMDP.md / Catch_Me_If_You_Can.md)
+
+| Name in report/prompt | Code `name` | Description |
+|---|---|---|
+| **ada-mcts** | `ada_mcts` | ADA-MCTS / DPAS (`planning/ada_mcts.py`). `notify_change()` freezes the pre-change model M_{k−1}, online counts build M_k, chance nodes sampled by the DPAS two-phase rule. Unchanged this round. |
+| **rats** | `bnn_rats_static` | The paper's **RATS-P̂^{k−1}** (NSMDP.md / Catch_Me_If_You_Can.md): run RATS minimax with the pretrained BNN as the model, **no online adaptation**. Note: CliffWalking here is the **original** map — no extra hole from Catch_Me_If_You_Can. |
+| **ada-cem-cvar** | `cem_ada` | Replace the SFI part of our method with ADA-MCTS's adaptation: same CVaR-CEM planner, but the adaptation is DPAS's two-phase hard switch — notified at `change_step`, then only accumulates online counts (no forget, no retain decay); the CVaR tail α is `alpha_min` (most pessimistic) until `n_threshold=3` post-change samples, then hard-switches to 1.0 (risk-neutral). |
+| **sfir-cem-cvar** (our method) | `cem_fir` | = the existing **SFI-CEM**. Component 1 (pretrained Dirichlet BNN) + component 2 (SFI: surprise → drift → forget → learn loop) + component 3 (CVaR-CEM planning, not RATS). CliffWalking's "learn" is a closed-form conjugate count update, no gradient retraining → the SFI variant (not SFIR). |
+| **oracle bnn+cem+cvar** | `oracle_cem` | CVaR-CEM planner + a BNN **pretrained directly on the true post-change p** (each p-point loads its own p-matched checkpoint; the `stationary` phase uses `ORIG_P`). No online adaptation / SFI needed — the model matches the changed env from t=0. The CEM-family upper bound; the CEM analogue of `oracle_rats`. |
+
+`cem_static` / `bnn_rats_static` are the no-adaptation ablations of their
+methods; `oracle_rats` runs RATS with the true model. The 5 methods run by
+default this round are exactly the 5 in the table above.
+
+---
+
+## 2. Experimental setup (item-by-item per CLAUDE.md)
+
+### 2.1 Nature of the change (at what timestep, to what)
+
+- **When**: `change_step = 0`. With `c ≤ 0` the first decision epoch is
+  already in the new environment; the pretraining-p segment never appears —
+  so this is "the environment has already changed drastically when the
+  simulation starts".
+- **What**: the intended (no-slip) probability `p` of the transition. Slip
+  structure (Luo et al.): move to the intended direction w.p. `p`, to each
+  perpendicular direction w.p. `(1−p)/2`, **no reverse direction**. The
+  reward structure does not change over time.
+- **The 3 configs**:
+
+  | config | grid | pretrain p (=`ORIG_P`) | post-change p sweep |
+  |---|---|---|---|
+  | **config1** | original CliffWalking 4×12 | 1.0 (deterministic) | 1.0→ {0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0} |
+  | **config2** | CliffWalking with the first cliff cell right of Start removed | 1.0 | same |
+  | **config3** | original CliffWalking 4×12 | **0.7** (pretraining env is itself stochastic) | 0.7→ {same 8 p-points} |
+
+  - The `p=1.0` column of config1/2 = no actual change (control).
+  - The `p=0.7` column of config3 = no actual change; `p>0.7` means the env
+    got **better** (less slip), `p<0.7` worse.
+  - config2 vs config1 differs by one cell: the cliff cell directly right of
+    `S` changes from `H` to `F` (safe ground) — to see how much of the
+    low-p gap is due to that one cell.
+
+### 2.2 Grid geometry and reward structure
+
+- **CliffWalking 4×12**, K=3 directions `[intended, perp+, perp−]`, 4 actions
+  UP/RIGHT/DOWN/LEFT. Start = bottom-left `(3,0)`, Goal = bottom-right
+  `(3,11)`, cliff = bottom row `(3,1..10)` (config2: `(3,2..10)`).
+- **Reward**: reaching the goal `+1.0`; stepping into a cliff `0.0` (the
+  paper's "holes = 0" convention: falling just ends/teleports, no extra
+  penalty); every other step `0.0` (**no per-step penalty**, per the
+  2026-08-12 user request).
+- **`cliff_to_start = True`**: stepping into a cliff cell → **teleport back
+  to Start, does NOT terminate the episode** (ns_gym's CliffWalking
+  behavior). Hence **the goal is the only terminal state**; an episode can
+  only end by "reached the goal" or "truncated at step 100".
+
+### 2.3 All hyperparameters
+
+**General / evaluation**
+| Param | Value | Note |
+|---|---|---|
+| discount γ | **0.9999** | Same γ for planning and evaluation (2026-08-22 user request). γ≈1 + holes=0 ⇒ discounted return ≈ goal rate (return is slightly lower in the 3rd decimal on cliff — teleport-to-start delays reaching the goal). |
+| trials | 30 | Per (method, phase) point; trial index seeds the RNG, reproducible. |
+| truncation max_steps | 100 | See 2.5. |
+| BNN posterior draws (surprise) | `N_POSTERIOR = 10` | |
+| drift filter | `DriftFilterV2(eta=0.2, gamma_uncertainty=True)` | `delta_bar = 1 + lambda_hat`, `lambda_hat` = **cumulative mean** (not EMA) of `(delta_n − baseline)` since the last `_reset_detection()`. |
+
+**BNN world-model architecture (`make_dirichlet_bnn`)**
+- Bayesian trunk: `in_size = n_states + n_actions = 48 + 4 = 52` → hidden
+  `hid_size = 256`, `num_layers = 3` (i.e. 2 BayesianLinear layers in the
+  trunk: 52→256, 256→256), SiLU activations.
+- Two separate readout heads (no shared output layer): direction head
+  `256→3` (K=3 Dirichlet concentrations), reward head `256→2` (reward
+  mean / logvar).
+- `prior_std = 1.0`, `beta = 0.1`, `num_mc_samples = 3`,
+  `num_weight_groups = 1`.
+- Predictive distribution: a categorical over the K=3 directions
+  `p = α/α0`, then scattered onto the 48 cells by geometry. **The
+  concentration α0 comes from a pretrain-counts table**
+  (`pretrain_alpha0` buffer, `α0[s,a] = counts + K·CONC_PRIOR`), not the
+  head's softplus magnitude — the categorical NLL is scale-invariant in α
+  and cannot learn α0.
+- **CONC_PRIOR = 1.0** (changed from 0.1 this round, see §4). The `retain`
+  buffer pulls the head's α toward this symmetric prior:
+  `alpha = CONC_PRIOR + retain·(alpha_head − CONC_PRIOR)`, `retain=1` fully
+  trusts the head, `retain→0` sends every direction to `CONC_PRIOR`
+  (predictive mean → uniform).
+
+**Pretraining (`pretrain_gridworld.py`)**
+- Goal-weighted sampling: `w(s) = goal_weight^(−BFS_dist(s→goal))`,
+  `goal_weight = 1.35` ⇒ **transitions near the goal are upsampled**
+  (CLAUDE.md: "pretraining should prioritize transitions close to the
+  goal").
+- `--balance-terminal`: subsample transitions landing on a terminal cell so
+  they don't dominate after goal-weighting.
+- 20000 rows, per-row categorical NLL. Each `(grid, p)` gets its own
+  checkpoint.
+
+**SFI-CEM (`cem_fir` = sfir-cem-cvar, our method)**
+| Param | Value | Note |
+|---|---|---|
+| forget cadence `k_forget` | 3 | forget once every 3 post-change steps. |
+| forget rule | `retain ← retain · ρ`, `ρ = 1/max(delta_bar, 1)`, clipped to [1e-3, 1] | `delta_bar ≤ 1` is a no-op. Calls `drift._reset_detection()` after forgetting (see §3). |
+| CVaR tail α | adaptive, `alpha_min + (1 − alpha_min)·conf` | |
+| `alpha_min` (`CEM_ALPHA_MIN`) | **0.30** | most-pessimistic end (CVaR over the worst 30%). 0.10 was too conservative (dragged below cem_static), 0.95 barely differs from risk-neutral. |
+| `conf` | `conf_data · conf_surprise` | `conf_data = min(1, n_since_change / n_confident)`; `conf_surprise = exp(−max(0, delta_bar−1) / surprise_tau)`. |
+| `n_confident` (`CEM_N_CONFIDENT`) | 8 | post-change samples for the data gate to saturate. |
+| `surprise_tau` (`CEM_SURPRISE_TAU`) | 50.0 | p=1.0 pretraining spikes surprise into the hundreds; the default 2.0 would pin conf at 0 for the whole episode. |
+| plan_retain (planning-time uncertainty gate) | `= conf` | scale `bnn.retain` by conf while the planner reads the model (inflate the pretrained part, fully trust online counts), restore afterward. |
+| planning horizon `--cem-horizon` | **6** | |
+| CEM candidates `--cem-candidates` | **512** | module default 256; 512 gives the CVaR estimate more samples (2026-08-14 tuning: cliff cem_fir p=0.4 went 0.38→0.88). |
+| K posterior models `k_models` | 10 | epistemic axis. |
+| aleatoric rollouts per model `n_rollouts` | 32 | |
+| CEM iterations `n_cem_iters` | 5 | |
+| elite fraction | 0.1 | |
+| CEM-internal planning γ | GAMMA = 0.9999 | `--cem-plan-gamma` not passed. |
+| exploration bonus β | 0.0 (off) | |
+
+**ada-cem-cvar (`cem_ada`)**: same planner; `n_threshold = 3` (matches
+ADA-MCTS's `_training_started` threshold); CVaR α = `alpha_min = 0.30`
+until 3 post-change samples observed, then hard-switch to 1.0; only
+accumulates online counts, no forget, no retain decay.
+
+**oracle_cem (after fix)**: same planner; **`adaptive_alpha = False`**
+(§5 fix), fixed `cvar_alpha = 1.0` (risk-neutral); `retain` always 1.0;
+loads its own p-matched checkpoint per p-point.
+
+**ada-mcts (`ada_mcts`)**
+| Param | Value |
+|---|---|
+| simulations per action `M_SIMULATIONS` | **30000** (paper value) |
+| UCT constant `CP` | √2 |
+| epistemic threshold `EPS_E` | 0.02 (paper line 236) |
+| aleatoric threshold `EPS_A` | 0.0 |
+| DPAS aleatoric-likelihood `gamma` | 10000.0 |
+| posterior draws (Var_E/Var_A) | 10 |
+| rollout horizon | 6 |
+| min post-change samples before switching `_n_threshold` | 3 |
+
+**RATS family (`bnn_rats_static` = rats)**: `rats_depth = 3` (paper value),
+`dp_depth = 100`. Runs RATS minimax with the pretrained BNN's mean model, no
+online update.
+
+### 2.4 discount / truncation
+
+- **No extra discounting**: γ=0.9999 is the unified value agreed under
+  CLAUDE.md's "no discount" convention (since 2026-08-22), used for both
+  planning and evaluation.
+- **Truncation**: `max_steps = 100`. Because `cliff_to_start=True` (falling
+  teleports to Start, does not terminate), an episode that never reaches the
+  goal can only end by truncation — so **goal rate = X literally means
+  "(1−X) of the 30 trials ran the full 100 steps without ever reaching the
+  goal"**. At high p (≥0.6–0.7) nearly every trial reaches the goal within
+  100 steps; at low p (0.3–0.4) truncation is frequent, which is exactly why
+  goal rate drops. Spot-check of config1 trial 0: 8 of the 45
+  (method,phase) trial-0 episodes ran the full 100 steps.
+
+### 2.5 Stationary verification
+
+Each config, each method first runs a `p = ORIG_P` no-change stationary
+phase. **All 5 methods × 3 configs = 15 points: goal rate = 1.000**
+(return 0.997–0.999) — the pretrained model finds the optimal policy in the
+un-changed environment, so the premise holds.
+
+---
+
+## 3. Bug fix 1: the drift accumulator in `bnn_rats_adaptive` (SFI-RATS)
+
+**Symptom** (user-flagged): `bnn_rats_adaptive`'s goal rate is non-monotone
+in p, with small changes worse than large ones.
+
+**Root cause**: `BNNRATS._forget()` was missing
+`self.drift._reset_detection()` (present in `BNNCEM._forget()`).
+`DriftFilterV2.delta_bar` is a **cumulative mean since the last reset** (not
+an EMA). p=1.0 pretraining ⇒ near-deterministic model ⇒ the first slip has
+predicted probability ≈ 0 ⇒ NLL / surprise spikes into the hundreds.
+Without a reset, that spike dilutes only as 1/n and drags on every
+subsequent `k_forget`-cadence forget call for the rest of the episode: each
+one computes a near-zero `ρ = 1/max(delta_bar,1)` and multiplies `retain`
+down again, eventually to a hard `0.0` (not down-weighted — *all* prior
+directional signal lost). And that spike comes entirely from "seeing a slip
+for the first time", **independent of how large the post-change p is** — so a
+small change (p=0.9, where the old prior is still ~90% right) gets hammered
+just as hard as a large one (p=0.4), giving non-monotone goal rate.
+
+**Fix** (`run_gridworld_experiments.py:285`, with a detailed comment): add
+`self.drift._reset_detection()` at the end of `_forget()`, matching
+`BNNCEM._forget()`. After forgetting, the model no longer matches the old
+environment, so the old-env surprise is no longer informative — reset the
+accumulator so `delta_bar` reflects only new evidence.
+
+**Verification**: 30-trial rerun, retain stabilizes at ~1e-3 instead of a
+hard 0, goal rate near-monotone again
+(`1.000/0.833/1.000/0.967/0.933/0.867/0.767`, p=1.0→0.4).
+
+> Note: the `rats` method in the 3 main experiments is `bnn_rats_static`
+> (static, no adaptation), not `bnn_rats_adaptive`. This fix stands on its
+> own; `bnn_rats_adaptive` is now correct for use in other experiments.
+
+---
+
+## 4. Main results
+
+Goal rate, 30 trials, **current default settings** (`CONC_PRIOR = 1.0`,
+`oracle_cem` fixed). Bold = highest value among all methods in that
+(config, column).
+
+### config1: original cliff, pretrain p=1.0
+
+| method | p=0.3 | p=0.4 | p=0.5 | p=0.6 | p=0.7 | p=0.8 | p=0.9 | p=1.0 |
+|---|---|---|---|---|---|---|---|---|
+| ada-mcts | 0.367 | 0.667 | 0.900 | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+| rats (bnn_rats_static) | 0.100 | 0.300 | 0.800 | 0.800 | **1.000** | **1.000** | **1.000** | **1.000** |
+| ada-cem-cvar (cem_ada) | 0.100 | 0.233 | 0.667 | 0.800 | **1.000** | **1.000** | **1.000** | **1.000** |
+| **sfir-cem-cvar (cem_fir)** | **0.700** | 0.900 | 0.933 | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+| oracle-cem | **0.700** | **0.933** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+
+### config2: first cliff cell removed, pretrain p=1.0
+
+| method | p=0.3 | p=0.4 | p=0.5 | p=0.6 | p=0.7 | p=0.8 | p=0.9 | p=1.0 |
+|---|---|---|---|---|---|---|---|---|
+| ada-mcts | 0.400 | **0.867** | 0.900 | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+| rats | 0.100 | 0.267 | 0.767 | 0.733 | **1.000** | **1.000** | **1.000** | **1.000** |
+| ada-cem-cvar | 0.167 | 0.267 | 0.633 | 0.900 | **1.000** | **1.000** | **1.000** | **1.000** |
+| **sfir-cem-cvar** | 0.700 | 0.800 | 0.967 | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+| oracle-cem | **0.767** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+
+### config3: original cliff, pretrain p=0.7
+
+| method | p=0.3 | p=0.4 | p=0.5 | p=0.6 | p=0.7 | p=0.8 | p=0.9 | p=1.0 |
+|---|---|---|---|---|---|---|---|---|
+| ada-mcts | 0.533 | 0.700 | 0.967 | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+| rats | 0.300 | 0.600 | 0.800 | 0.933 | **1.000** | **1.000** | **1.000** | **1.000** |
+| ada-cem-cvar | 0.533 | 0.767 | 0.900 | 0.967 | **1.000** | **1.000** | **1.000** | **1.000** |
+| **sfir-cem-cvar** | 0.633 | 0.900 | 0.967 | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+| oracle-cem | **0.700** | **0.933** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** | **1.000** |
+
+**Reading the tables**:
+- Beyond p ≥ 0.6 every method saturates to 1.000 — at high p everyone reaches
+  the goal within the 100-step budget, no discrimination. The informative
+  columns are p ∈ {0.3, 0.4, 0.5}.
+- **`sfir-cem-cvar` is the tied-or-best non-oracle method at 20 of 21
+  (config, p≤0.5) combinations**; the sole exception is config2 p=0.4
+  (0.800 < ada-mcts 0.867).
+- After the fix, `oracle-cem` is ≥ every other method (including
+  `sfir-cem-cvar`) at **all** points — restored as a credible upper bound.
+- `rats` (static BNN, no adaptation) and `ada-cem-cvar` clearly trail at
+  low p — a static pretrained model is unprepared for a p=1.0→0.3 shock,
+  and `ada-cem-cvar`'s two-phase hard switch + online-counts-only adaptation
+  is too slow.
+
+### 4.1 For comparison: the pre-fix / pre-tuning numbers
+
+| | config1 p=0.3/0.4/0.5 | config2 p=0.3/0.4/0.5 | config3 p=0.3/0.4/0.5 |
+|---|---|---|---|
+| sfir-cem-cvar (old c=0.1) | 0.567 / 0.767 / 0.900 | 0.367 / 0.733 / 0.833 | 0.300 / 0.800 / 0.933 |
+| sfir-cem-cvar (new c=1.0) | **0.700 / 0.900 / 0.933** | **0.700 / 0.800 / 0.967** | **0.633 / 0.900 / 0.967** |
+| oracle-cem (old, buggy) | 0.400 / 0.967 / 0.933 | 0.433 / 0.967 / 0.933 | 0.400 / 0.967 / 0.933 |
+| oracle-cem (fixed) | **0.700 / 0.933 / 1.000** | **0.767 / 1.000 / 1.000** | **0.700 / 0.933 / 1.000** |
+
+The numbers for `ada-mcts` / `rats` / `ada-cem-cvar` are **unaffected by
+either change** (their `retain` is always 1, so CONC_PRIOR cancels exactly
+in the blend formula; and they don't go through `oracle_cem`'s construction
+path) — confirmed both algebraically and empirically.
+
+---
+
+## 5. CONC_PRIOR tuning → formally set to 1.0
+
+### 5.1 Motivation and mechanism
+
+User's question: "would lowering the concentration prior `c`, to make the
+model more random after forgetting, make `sfir-cem-cvar` better?"
+
+`c` is the symmetric Dirichlet concentration that α decays toward when
+`retain→0` (fully forgotten, or temporarily deflated by plan_retain during
+planning). Smaller `c` pushes the Dirichlet toward the **corners** of the
+simplex (each posterior draw looks more like "put 100% of the mass on one
+random direction"); `c = 1` is Dirichlet(1,1,1), the **actual uniform
+distribution over the simplex**; larger `c` concentrates around the mean.
+Added a `--conc-prior` CLI (`run_gridworld_experiments.py:981`); **no
+re-pretraining needed** — `pretrain_alpha0` only picks up a negligible
+`+K·c` regularizer, and the thing that actually matters is the blend formula
+read at every forward pass in `_forward_alpha`. **Only affects methods whose
+retain leaves 1.0** (`cem_fir`, `bnn_rats_adaptive`).
+
+### 5.2 c sweep (cem_fir, the weak p-points, 30 trials)
+
+| config | p | c=0.01 | c=0.03 | c=0.1 (old) | c=0.3 | c=1.0 | c=3.0 | c=10.0 |
+|---|---|---|---|---|---|---|---|---|
+| config1 | 0.3 | 0.367 | 0.567 | 0.567 | 0.467 | 0.700 | 0.833 | **0.900** |
+| config1 | 0.4 | 0.767 | 0.567 | 0.767 | 0.767 | 0.900 | 0.967 | **1.000** |
+| config2 | 0.3 | 0.267 | 0.400 | 0.367 | 0.500 | 0.700 | 0.700 | **0.767** |
+| config2 | 0.4 | 0.533 | 0.567 | 0.733 | 0.633 | 0.800 | **1.000** | 0.967 |
+| config2 | 0.5 | 0.867 | 0.933 | 0.833 | 0.900 | 0.967 | **1.000** | 0.933 |
+| config3 | 0.3 | 0.500 | 0.433 | 0.300 | 0.500 | **0.633** | 0.600 | 0.567 |
+| config3 | 0.4 | 0.867 | 0.833 | 0.800 | 0.700 | 0.900 | 0.833 | **0.967** |
+
+(The `c=0.1` column exactly reproduces the old numbers from §4.1 — a
+pipeline-correctness check.)
+
+**Key findings**:
+1. **The direction is opposite to the user's guess**: not "more random
+   (more extreme) is better", but "closer to the true uniform distribution
+   (less extreme) is better". At `c=0.1` the post-forget posterior draws are
+   near one-hot, and CVaR-over-worst-30% gets dominated by these
+   pathological spikes rather than real uncertainty; at `c=1.0` the
+   uncertainty is still real but not pathological, so the CVaR estimate is
+   more trustworthy. Going below 0.1 (0.01/0.03) gives no consistent
+   benefit and hurts several points.
+2. **`c=1.0` beats `c=0.1` at all 7 tested points**, with config2/config3
+   p=0.3 up ~0.33 (≈ 3.7 std at n=30 — not explainable by noise).
+3. **`c>1.0` is not "higher is always better"**: 4/7 points still climb to
+   c=10, but 3/7 have already peaked by c=1.0–3.0. In particular config3
+   (pretrain p=0.7) p=0.3 declines monotonically from c=1.0
+   (0.633→0.600→0.567, though within noise, so not a confirmed reversal) —
+   consistent with the theoretical worry: at large `c` the post-forget
+   Dirichlet becomes sharp again, circling back to the "empty CVaR tail"
+   problem plan_retain was introduced to solve, from the other direction.
+
+### 5.3 Decision
+
+**`bnn/dirichlet_model.py:54`: `CONC_PRIOR` changed from `0.1` to `1.0`.**
+
+Rationale: `0.1→1.0` is a clean, uniform, significant improvement;
+`1.0→3.0/10.0` gains are small, inconsistent, and already reversing at some
+points, and `3`/`10` are fitted numbers with no clean theoretical story
+like `1.0` (the actual uniform distribution over the simplex,
+Dirichlet(1,1,1)). Changing the module default means future runs of this
+code don't need `--conc-prior 1.0`. Verified: with no flag, `cem_fir`
+config1 p=0.3 gives 0.700 directly — the new default takes effect.
+
+---
+
+## 6. Bug fix 2: `oracle_cem`'s confidence gate never opened
+
+**Background**: before the CONC_PRIOR fix, the true-model `oracle_cem` was
+being out-performed by `sfir-cem-cvar` at low p. Testing `oracle_cem` at
+c=1.0 gave **identical numbers** (algebraically necessary: `oracle_cem`'s
+`retain` is always 1, so `c` cancels). Tracking down *why* it was being
+beaten:
+
+**Root cause**: in `BNNCEM.__init__`, the underlying `CVaRCEMAgent`'s
+`adaptive_alpha` is hardwired to the constant `CEM_ADAPTIVE_ALPHA = True`
+(regardless of `self.adaptive`), meaning the CVaR tail fraction is driven by
+the confidence `_confidence()`. But the two state variables that drive that
+confidence (`self._agent.n_since_change`, `self._agent.surprise_bar`) are
+only updated inside `BNNCEM.act()`'s `if self.adaptive and ...:` block.
+`oracle_cem` has `self.adaptive = False`, so that block never runs:
+`n_since_change` stays at its `reset()` value of 0 ⇒
+`conf_data = min(1, 0/n_confident) = 0` ⇒ `conf = 0` ⇒
+`alpha = alpha_min = 0.30`. **`oracle_cem` is pinned to the worst-30% CVaR
+tail for the entire episode, never reaching risk-neutral** — even though it
+holds the true post-change model and has no regime uncertainty to resolve.
+At low p (worst slipping, behavior matters most) this needless permanent
+pessimism makes the planner take over-conservative detours that time out
+within the 100-step budget — the same cost as the earlier
+"`CEM_ALPHA_MIN=0.10` too conservative dragged down `cem_fir`" finding.
+(`cem_static` shares this construction path and in principle has the same
+bug; it is not among the default 5 methods, so it was not verified.)
+
+**Fix** (`run_gridworld_experiments.py:847`, with a detailed comment): in
+`build_methods`'s `oracle_cem` branch, after construction, add
+```python
+out[name]._agent.adaptive_alpha = False
+```
+so it uses the `cvar_alpha` already passed at construction
+(`args.cem_cvar_alpha`, default 1.0 = risk-neutral), bypassing the
+never-opening confidence gate. **Does not touch the class shared by
+`cem_fir` / `cem_static` / `cem_ada`** (`cem_ada` already sets
+`adaptive_alpha=False` explicitly and switches the two phases manually).
+
+**Before / after** (c=0.1, 30 trials; p≥0.5 already saturated in both, only
+the changed points shown):
+
+| config | p | before (pinned worst-30%) | after (risk-neutral) |
+|---|---|---|---|
+| config1 | 0.3 | 0.400 | **0.700** |
+| config1 | 0.4 | 0.967 | 0.933 (within noise) |
+| config2 | 0.3 | 0.433 | **0.767** |
+| config2 | 0.4 | 0.967 | 1.000 (within noise) |
+| config3 | 0.3 | 0.400 | **0.700** |
+| config3 | 0.4 | 0.967 | 0.933 (within noise) |
+
+p=0.3 up +0.3–0.367 everywhere (well beyond noise); the p=0.4 ±0.033
+(1/30 trial) is within noise. **After the fix `oracle_cem` is the upper
+bound again at all 21 points**, and the "beats oracle" points from §4.1 are
+gone — that was neither noise nor CONC_PRIOR, it was this gate bug.
+
+---
+
+## 7. Cross-config observations
+
+1. **`oracle_cem` determinism check**: config1 and config3 use the same map,
+   and `oracle_cem` loads its own p-matched checkpoint per non-stationary
+   p-point (independent of `ORIG_P`), so the two configs' numbers should be
+   pointwise identical — and they are exactly
+   (0.700/0.933/1.000/...), a clean "same seed, same input → same output"
+   check. config2 (different map) differs only at p=0.3 (0.700→0.767); the
+   rest unchanged — as expected, since the first cliff cell only matters at
+   low p.
+2. **Pretraining at p=0.7 (config3) substantially improves low-p robustness
+   for the non-oracle methods** (vs config1's pretrain p=1.0): at p=0.3,
+   `rats` 0.100→0.300, `ada-cem-cvar` 0.100→0.533, `ada-mcts` 0.367→0.533.
+   Direction is intuitive: the p=0.7→0.3 distribution jump is smaller than
+   p=1.0→0.3, surprise is milder, adaptation burden lighter.
+   `sfir-cem-cvar` at config3 p=0.3 is 0.633, slightly below config1's
+   0.700, and it is also the point most sensitive to `c` and the one that
+   reverses for `c>1` (see 5.2) — the p=0.7 "small jump" regime may need
+   different SFI hyperparameters from the p=1.0 regime (`surprise_tau` /
+   `k_forget` are currently tuned for the "surprise spikes into the
+   hundreds" p=1.0 case).
+3. **Removing the first cliff cell (config2) has an effect concentrated at
+   p=0.3**, and the direction isn't fully consistent — within the
+   high-variance 30-trial band, no conclusion drawn.
+4. **p=0.3 is the hardest, highest-variance column**: the binomial std at
+   n=30 near 0.3–0.5 is ~0.09; the std of the difference between two
+   independent methods is ~0.13. In this column, gaps of 0.1–0.15 between
+   methods should be treated cautiously as noise — only gaps ≥0.25 (e.g.
+   `sfir-cem-cvar` c=1.0 vs `rats` / `ada-cem-cvar`) are solid.
+
+---
+
+## 8. Code changes (this round)
+
+| File | Location | Change |
+|---|---|---|
+| `grids.py` | `221-232` | New `CLIFFWALKING_4x12_NOFIRSTHOLE` GridSpec (original cliff, first `H` right of Start → `F`); `234-236` added to `REGISTRY`. |
+| `run_gridworld_experiments.py` | `285` | **Bug 1 fix**: `self.drift._reset_detection()` at the end of `BNNRATS._forget()` (with comment). |
+| | `410-499` | New `ADA_CEM_N_THRESHOLD = 3` + `CEMADA` class (`name="cem_ada"` = ada-cem-cvar). |
+| | `802-812` | `build_methods` new `elif name == "cem_ada":` branch. |
+| | `813-847` | `build_methods` new `elif name == "oracle_cem":` branch; line `847` is the **Bug 2 fix**: `out[name]._agent.adaptive_alpha = False` (with comment). |
+| | `863-890` | `_worker`: `oracle_cem` selects a p-matched checkpoint per phase; `878-884` patches `bnn.dirichlet_model.CONC_PRIOR` from `cfg["conc_prior"]`. |
+| | `919`, `981-999` | New `--orig-p`, `--conc-prior` CLIs; `1024-1026`, `1045` log line + cfg passthrough. |
+| `bnn/dirichlet_model.py` | `54` | **CONC_PRIOR changed from `0.1` to `1.0`** (with a ~20-line comment on the sweep evidence); `34-53` comment updated. |
+
+`planning/cvar_cem.py` and `pretrain_gridworld.py` were already in a modified
+state at the start of the session (not changed this round).
+
+---
+
+## 9. Reproduction
+
+**Checkpoints** (`pretrain_gridworld.py --grid <g> --p <p> --balance-terminal`,
+goal-weighted `goal_weight=1.35`, 20000 rows; generated, all `VERDICT: GOOD`):
+- `data/cliffwalking/bnn_dirichlet_cliffwalking_k3{,_p0p{3..9}}.pth` (p=1.0
+  has the un-suffixed name)
+- `data/cliffwalking_nofirsthole/bnn_dirichlet_cliffwalking_nofirsthole_k3{,_p0p{3..9}}.pth`
+
+**Main experiment commands** (current code defaults are already
+`CONC_PRIOR=1.0` and the fixed `oracle_cem`, no extra flags needed):
+```bash
+METHODS="ada_mcts bnn_rats_static cem_ada cem_fir oracle_cem"
+PS="0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0"
+CEM="--cem-horizon 6 --cem-candidates 512"
+
+# config1
+python run_gridworld_experiments.py --grid cliffwalking --trials 30 --workers 16 \
+  --methods $METHODS --change-p $PS $CEM
+# config2
+python run_gridworld_experiments.py --grid cliffwalking_nofirsthole --trials 30 --workers 16 \
+  --methods $METHODS --change-p $PS $CEM
+# config3
+python run_gridworld_experiments.py --grid cliffwalking --trials 30 --workers 16 \
+  --methods $METHODS --change-p $PS $CEM --orig-p 0.7
+```
+
+> **The §4 numbers are NOT from a single run of these commands**: `ada_mcts`
+> / `rats` / `cem_ada` come from the original 2026-09-03 3-config run (old
+> `CONC_PRIOR=0.1`, but confirmed to not matter for those 3); `cem_fir` from
+> the 2026-09-06 `--conc-prior 1.0` run; `oracle_cem` from the 2026-09-08
+> post-fix run. The commands above now reproduce all of §4 in one shot, but
+> that **has not yet been done as a single full run** — recommend re-running
+> once before making paper figures, as an independent check.
+
+**Runtime reference** (16-core machine): a full config of 45 (method,phase)
+tasks is ~13–14 h, bottlenecked by `ada_mcts` (30000 sims/action, pure-Python
+tree search, CPU-bound; GPU ~1% throughout — same for the CEM methods, whose
+`_rollout_returns` is pure NumPy). CEM-only sub-experiments run at
+~0.45 h/task-slot.
+
+**Raw logs** (`/tmp`, lost on reboot):
+- `grid_cliff_2026-09-03_config{1,2,3}.log` (old c=0.1, 3 configs)
+- `conc_sweep_c{0.01,0.03,0.1,0.3,1.0,3.0,10.0}_config{1,2,3}.log`,
+  `conc1_rest_config{1,2,3}.log` (CONC_PRIOR sweep)
+- `oracle_conc1_config{1,2,3}.log` (oracle at c=1.0, proving no change),
+  `oracle_fixed_config{1,2,3}.log` (oracle after the fix)
+
+---
+
+## 10. Open / uncertain items
+
+1. **The §4 table has not been reproduced as one full run** (numbers are
+   stitched from three runs on different dates; the per-method defaults have
+   been confirmed consistent). It should be re-run with the §9 commands
+   before going into the paper.
+2. **Error bars at p=0.3 (maybe p=0.4) are large** (30 trials). Gaps < 0.15
+   between methods are not solid; a definitive conclusion on this column
+   needs 60–100 trials.
+3. **config3 (pretrain p=0.7) SFI hyperparameters may be mistuned**:
+   `surprise_tau=50` / `k_forget=3` are tuned for the p=1.0 "big jump" case;
+   for the p=0.7→0.3 small jump, `sfir-cem-cvar` is relatively weak at p=0.3
+   and it is the point that reverses for `c>1` — worth a dedicated
+   `surprise_tau` / `k_forget` sweep.
+4. **`cem_static` in principle has the same confidence-gate bug as
+   `oracle_cem`** (same `adaptive=False` construction path); it is not among
+   the default 5 methods, so it is neither verified nor fixed.
+5. **Whether `c>1.0` still helps at some points is unresolved**: config1
+   climbs all the way to c=10, but config3 p=0.3 peaks at c=1. Squeezing
+   that out needs a per-scenario finer sweep (and items 2–3 resolved first).
+6. **A formal English write-up / figures for `main_cl.tex`**: this report
+   has a Chinese counterpart `experiment_report_2026-09-10.md`, but the
+   paper figures are not done.

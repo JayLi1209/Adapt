@@ -214,7 +214,25 @@ BRIDGE_HOLE_5x8 = GridSpec(
           "HHHHHHHH"),
 )
 
-REGISTRY = {g.name: g for g in (FROZENLAKE_4x4, CLIFFWALKING_4x12, BRIDGE_5x8,
+# CliffWalking with the FIRST cliff cell (the one immediately right of S, bottom
+# row) flattened to safe ground -- 2026-09-03 user request, to see how much of
+# the low-p goal-rate gap is driven specifically by the step-0 cliff-adjacent
+# cell (the state every trial starts next to) vs. the cliff in general.
+CLIFFWALKING_4x12_NOFIRSTHOLE = GridSpec(
+    name="cliffwalking_nofirsthole",
+    nrow=4, ncol=12, n_actions=4, k_dir=3,
+    deltas=((-1, 0), (0, 1), (1, 0), (0, -1)),
+    dir_offsets=(0, 1, -1),
+    desc=("FFFFFFFFFFFF",
+          "FFFFFFFFFFFF",
+          "FFFFFFFFFFFF",
+          "SFHHHHHHHHHG"),        # col1 ('H' in the original) -> 'F'
+    cliff_to_start=True,
+    step_penalty=0.0,
+)
+
+REGISTRY = {g.name: g for g in (FROZENLAKE_4x4, CLIFFWALKING_4x12,
+                                CLIFFWALKING_4x12_NOFIRSTHOLE, BRIDGE_5x8,
                                 BRIDGE_HOLE_5x8)}
 
 
