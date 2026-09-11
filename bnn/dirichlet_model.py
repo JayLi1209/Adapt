@@ -36,22 +36,31 @@ RETAIN_INIT = 1.0          # initial retention (1 = trust the head fully)
 # pulled toward uniform (max entropy) -- which is what makes a slip stop being
 # surprising.  A *multiplicative* scale would leave the mean p=alpha/alpha0 fixed
 # (scale cancels) and could never lower delta_n; a symmetric affine retention can.
-# 1.0 = Dirichlet(1,1,1), the actual uniform distribution OVER the simplex, not
-# just uniform in expectation.  Was 0.1 (pulls toward the simplex CORNERS: a
-# "fully forgotten" posterior draw is then near one-hot on a random direction),
-# which made cem_fir's CVaR-over-worst-30% get dominated by these pathological
-# near-deterministic draws instead of real uncertainty.  Swept c in
-# {0.01,0.03,0.1,0.3,1.0,3.0,10.0} on cliffwalking (2026-09-06/09): 1.0 was a
-# clean, uniform win over 0.1 at every tested (config,p) point; 3.0/10.0 helped
-# a few points further but not all (one point -- pretrain-p=0.7, p=0.3 --
-# already trends back down past 1.0, consistent with the model getting sharp
-# again at large c, the same "empty CVaR tail" failure plan_retain exists to
-# avoid) and needs materially more validation to trust, so 1.0 (the principled,
-# argument-free value) is the chosen default.  Only affects methods whose
-# retain actually leaves 1.0 (cem_fir, bnn_rats_adaptive) -- see
-# doc_tool/experiment_report_2026-09-04.md SS4-5 for the full sweep + the
-# oracle_cem confidence-gate bug this investigation also turned up.
-CONC_PRIOR = 1.0
+#
+# 2026-09-06: swept c in {0.01..10} on cem_fir WITHOUT gradient retrain (SFI):
+# c=1.0 (Dirichlet(1,1,1), the actual uniform distribution over the simplex,
+# vs 0.1's near-one-hot corners) was a clean win everywhere.
+#
+# 2026-09-10/11: that result turned out to be a "not really adapting" artifact.
+# At c=1.0, a forgotten belief is already so tightly uniform that forget/retrain
+# barely move it -- an ablation with NEITHER forget NOR retrain (just the
+# planning-time plan_retain inflate + confidence-gated CVaR) beats c=1.0 SFI at
+# every tested point, and c=1.0 SFIR (+ gradient retrain, see
+# bnn/dirichlet_workflow.retrain_dirichlet) is WORSE than c=1.0 SFI -- retrain
+# has nothing useful to correct when forget already washed the belief to ~uniform.
+# Reverted to c=0.1 (small -> forgetting genuinely damages the belief, so there
+# is something real for retrain to fix) specifically to make SFIR ("our method"
+# per main_cl_2.tex: Surprise-Forget-Inflate-RETRAIN, gradient-retrains the
+# adapter head -- see run_gridworld_experiments.py's --n-unfrozen, default 1)
+# demonstrate genuine adaptation rather than the confidence-gate's cautious
+# planning alone.  At c=0.1, SFIR does beat SFI on cliffwalking config1
+# (0.65/0.80 vs 0.55/0.70 at p=0.3/0.4, candidates=256/trials=20) though by a
+# modest margin, and still below the c=1.0/no-adapt numbers -- an accepted
+# tradeoff for reporting genuine adaptation rather than a caution artifact.
+# Only affects methods whose retain actually leaves 1.0 (cem_fir,
+# bnn_rats_adaptive).  Full sweep + the "Neither"/oracle_cem findings:
+# doc_tool/experiment_report_2026-09-04.md SS4-6, session notes 2026-09-11.
+CONC_PRIOR = 0.1
 SURPRISE_EPS = 1e-6
 LOGVAR_MIN, LOGVAR_MAX = -10.0, 0.5
 

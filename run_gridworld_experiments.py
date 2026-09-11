@@ -1015,16 +1015,19 @@ def main():
     ap.add_argument("--counts", dest="use_counts",
                     action="store_true", default=False)
     ap.add_argument("--methods", nargs="*", default=None)
-    # SFIR ablation knobs (2026-09-10) -- cem_fir only.  Default = "our method"
-    # today, i.e. SFI (forget on, no gradient retrain).
+    # SFIR ablation knobs (2026-09-10, default flipped 2026-09-11) -- cem_fir
+    # only.  Default = "our method" = SFIR (main_cl_2.tex: Surprise-Forget-
+    # Inflate-RETRAIN): forget on, gradient retrain of the adapter HEAD on.
+    # Pass --n-unfrozen 0 to get the older SFI ablation (no retrain).
     ap.add_argument("--no-forget", dest="do_forget", action="store_false",
                     default=True,
                     help="cem_fir: remove the 'F' -- retain never decays")
-    ap.add_argument("--n-unfrozen", type=int, default=0,
+    ap.add_argument("--n-unfrozen", type=int, default=1,
                     help="cem_fir gradient retrain 'R': # of top DIRECTION-path "
-                         "layers to retrain on the post-change buffer.  0=off, "
-                         "1=Dirichlet head only ('our method' with retrain), "
-                         "2=head+top trunk, 3=head+whole trunk (retrain-all).")
+                         "layers to retrain on the post-change buffer.  0=off "
+                         "(SFI, the pre-09-11 default), 1=Dirichlet head only "
+                         "('our method' = SFIR, default), 2=head+top trunk, "
+                         "3=head+whole trunk (retrain-all ablation).")
     ap.add_argument("--retrain-every", type=int, default=3,
                     help="cem_fir: gradient-retrain cadence in post-change steps")
     ap.add_argument("--retrain-steps", type=int, default=5,
@@ -1066,8 +1069,9 @@ def main():
                          "the model policy every step.  Commitment against "
                          "per-step re-planning noise (dithering).")
     ap.add_argument("--conc-prior", type=float, default=None,
-                    help="override bnn.dirichlet_model.CONC_PRIOR (default 1.0 "
-                         "as of 2026-09-09, was 0.1 -- see the module docstring), "
+                    help="override bnn.dirichlet_model.CONC_PRIOR (default 0.1 "
+                         "as of 2026-09-11, was briefly 1.0 -- see the module "
+                         "comment), "
                          "the symmetric Dirichlet concentration that retain=0 "
                          "(fully forgotten / fully plan_retain-deflated) decays "
                          "toward.  Lower -> more extreme/high-variance posterior "
@@ -1110,7 +1114,7 @@ def main():
     log(f"  methods: {methods}")
     log(f"  ADA-MCTS: {args.m_simulations} simulations/action (paper value)")
     if args.conc_prior is not None:
-        log(f"  CONC_PRIOR override: {args.conc_prior} (module default 1.0)")
+        log(f"  CONC_PRIOR override: {args.conc_prior} (module default 0.1)")
     if not args.do_forget or args.n_unfrozen > 0:
         log(f"  cem_fir SFIR ablation: do_forget={args.do_forget} "
             f"n_unfrozen={args.n_unfrozen} retrain_every={args.retrain_every} "
