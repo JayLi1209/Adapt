@@ -490,3 +490,89 @@ CEM-only 的子实验约 0.45 小时/任务-槽。
    扫描（而且要先把第 2、3 条的噪声/调参问题解决）。
 6. **英文正式报告 / 进 `main_cl.tex` 的图表**：本报告有英文版
    `experiment_report_2026-09-10_en.md`，但还没整理成论文用的图。
+
+---
+
+## 11. 我们的方法定为 SFIR（2026-09-11）：retrain 接进代码 + CONC_PRIOR 回退到 0.1
+
+### 11.1 起因：`main_cl_2.tex` 澄清了 retrain 的含义
+
+`doc_tool/main_cl_2.tex` 明确了方法名是 **SFIR**（Surprise-Forget-Inflate-
+**Retrain**，不是 SFI），且 retrain = **对 adapter head 做梯度更新**（"3
+个 Bayesian linear layer + 一个 adapter head，运行期间只更新 head"）。而
+`cem_fir` 之前只有 conjugate counts（且默认关），**没有梯度 retrain**——
+第4-6节报的其实是 SFI。用户确认离散头用纯 NLL（不是 Gaussian 头那种 ELBO
+版本）。
+
+### 11.2 把 retrain 接进 `cem_fir`
+
+`BNNCEM` 新增：`do_forget`（默认 True）、`n_unfrozen`（0=关，1=只训 head=
+"我们的方法"，2/3=+trunk="retrain 全部" ablation）、`retrain_every`/
+`retrain_steps`/`retrain_lr`。机制：post-change 的 (obs,act,s2) 存 buffer
+（cap 64），每 `retrain_every` 步对 `unfrozen_params_dirichlet(bnn,
+n_unfrozen)` 返回的 `weight_mu`/`bias_mu` 跑 `retrain_dirichlet`（纯
+NLL，Adam）。**每个 trial 开头把这些权重还原到预训练值**（`__init__` 里
+snapshot，`reset()` 里 restore）——梯度 retrain 会永久改权重，而 bnn 对象
+跨 30 个 trial 共享，不还原的话 trial 间就不独立了。
+
+### 11.3 大规模 ablation matrix（config1, candidates=256/trials=20 降精度做
+相对比较；c=0.1 那一列位对位复现了 512/30 的已发表数字，精度可信）
+
+交叉了 {forget 开/关} × {retrain 关/head/全部} × {c=0.1, 1.0} × {p=0.3,
+0.4, 0.5}，外加一次 FrozenLake 抽查。**两个关键发现：**
+
+1. **c=1.0 时，forget 和 retrain 都是净负贡献**：一个"既不 forget 也不
+   retrain"（只保留原有的 plan_retain 置信度门控膨胀 + CVaR）的 ablation
+   在所有测过的点上都比 c=1.0 的 SFI 好（例如 p=0.4：Neither 0.85-0.95
+   vs SFI 0.90 vs SFIR 0.55-0.70）。**09-09 那次"大 c 赢"的结论，其实是
+   "大 c 让忘记后的信念几乎瞬间变均匀，forget/retrain 根本碰不到它，真正
+   在起作用的是规划器的谨慎（置信度门控 CVaR），不是模型真的在适应"**。
+   在一个已经被 forget 拍平的信念上做 retrain，梯度没有什么有意义的东西
+   可以纠正，纯粹添乱。
+2. **c 小（0.1）时，retrain 确实有正贡献**：SFIR（0.65/0.80，p=0.3/0.4）
+   比 SFI（0.55/0.70）好，幅度不大但方向一致——c 小意味着 forget 真的会
+   破坏信念，retrain 才有东西可修。这是诚实的适应，只是数字比大 c/不适应
+   的版本低。
+3. **调参没能补上小 c 和大 c 之间的差距**：试了 lr（1e-3 更差）、cadence
+   （every=1/更多步 → 更差或持平）、`n_unfrozen=2`（更差，p=0.4 掉到
+   0.55）、更小的 c=0.05（更差）。原来瞎猜的默认值（c=0.1, every=3,
+   steps=5, lr=1e-2, n_unfrozen=1）反而是试过的最优点，像是这条路径本身
+   的天花板，不是没调好。
+4. **FrozenLake 抽查**：SFI 和 SFIR 数字完全相同（retrain 完全"哑"）——
+   原因是 retrain 的 buffer 每个 trial 清空，FrozenLake episode 很短
+   （掉洞终止，不像 cliffwalking 传送回起点接着走），很多 trial 在攒够
+   `retrain_every=3` 步变化后数据之前就已经结束了。这是当前 retrain 实现
+   的一个局限（buffer 不跨 trial 持久化），不是"FrozenLake 不需要适应"
+   的结论。
+5. **"Neither"（S+I only）在测过的所有点上都比小 c 的 SFIR 还好**（例如
+   p=0.4：Neither-c=0.1 是 0.95，SFIR-c=0.1 是 0.80）——是这整轮调查里
+   目前找到的、在 cliffwalking 上表现最好的策略，但它本质上也不是"真正
+   适应"。
+
+### 11.4 决定（用户明确指示）
+
+**按用户要求，主表用诚实的小 c SFIR 数字，不用"Neither"或大 c 的更高
+数字**——即使后两者在这个任务上分数更高。具体改动：
+
+- `bnn/dirichlet_model.py`：`CONC_PRIOR` 从 `1.0` 改回 **`0.1`**。
+- `run_gridworld_experiments.py`：`--n-unfrozen` 默认值从 `0` 改为
+  **`1`**——`cem_fir` 现在默认就是 SFIR（forget + retrain head），不用
+  再显式加参数。
+- 只影响 `cem_fir`：`ada_mcts`/`rats`/`cem_ada`/`oracle_cem` 的 `retain`
+  恒为 1，两处改动对它们代数上无影响（多次验证过），**不需要重跑**。
+
+### 11.5 主表重跑（进行中）
+
+已启动 `cem_fir`（新默认：c=0.1 + SFIR）在三组、完整 8 个 p 点、
+candidates=512、trials=30 的重跑。实测单个 task（p=0.4, 3 trials,
+n_unfrozen=1, candidates=512）耗时 2216 秒 ≈ 12.3 分钟/trial——按并行
+（每组 9 个 task 用 9 个 worker 同时起，瓶颈是最慢的低 p task，不是全部
+task 时间加总），预计一天左右能拿到完整数字，比之前估的"1.5-2 天"乐观
+（之前的估计把并行度算错了，当成了近似串行）。跑完后第4节的 `sfir-cem-
+cvar` 行会用新数字替换。
+
+**线程超订踩过一次坑**：第一次跑 5 个 ablation 并发时，每个 worker 进程
+自己开了 ~5 个 MKL/OpenMP 线程，20 workers × 5 ≈ 100 线程抢 16 核，跑了
+11 小时 0 个任务完成。之后所有涉及 cem_fir 的批量实验都加了
+`OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+NUMEXPR_NUM_THREADS=1`，问题消失。

@@ -560,3 +560,105 @@ tree search, CPU-bound; GPU ~1% throughout — same for the CEM methods, whose
 6. **A formal English write-up / figures for `main_cl.tex`**: this report
    has a Chinese counterpart `experiment_report_2026-09-10.md`, but the
    paper figures are not done.
+
+---
+
+## 11. Our method is now formally SFIR (2026-09-11): retrain wired in, CONC_PRIOR reverted to 0.1
+
+### 11.1 Trigger: `main_cl_2.tex` clarified what "retrain" means
+
+`doc_tool/main_cl_2.tex` settles the method's name as **SFIR**
+(Surprise-Forget-Inflate-**Retrain**, not SFI), and defines retrain as a
+**gradient update to the adapter head** ("3 Bayesian linear layers + an
+adapter head; only the head is updated during a run"). `cem_fir` previously
+only had conjugate counts (off by default) -- **no gradient retrain at
+all** -- so §§4-6 above actually report SFI, not SFIR. The user confirmed
+the discrete head uses plain NLL for retrain (not the ELBO variant used for
+the Gaussian/continuous head).
+
+### 11.2 Wiring retrain into `cem_fir`
+
+New `BNNCEM` params: `do_forget` (default True), `n_unfrozen` (0=off,
+1=head only = "our method", 2/3=+trunk = "retrain-all" ablation),
+`retrain_every`/`retrain_steps`/`retrain_lr`. Mechanism: buffer post-change
+`(obs, act, s2)` tuples (cap 64), every `retrain_every` steps run
+`retrain_dirichlet` (plain NLL, Adam) on the `weight_mu`/`bias_mu` returned
+by `unfrozen_params_dirichlet(bnn, n_unfrozen)`. **Weights are snapshotted
+at construction and restored at the start of every trial** -- gradient
+retrain mutates weights in place, and the bnn object is shared across all 30
+trials, so without restoring, trials would not stay i.i.d.
+
+### 11.3 A large ablation matrix (config1, candidates=256/trials=20 for
+speed; the c=0.1 column exactly reproduces the published 512/30 numbers, so
+this fidelity is trustworthy for relative comparisons)
+
+Crossed {forget on/off} x {retrain off/head/full} x {c=0.1, 1.0} x
+{p=0.3, 0.4, 0.5}, plus a FrozenLake spot-check. **Two key findings:**
+
+1. **At c=1.0, both forget and retrain are net harmful**: an ablation with
+   NEITHER forget nor retrain (just the pre-existing plan_retain
+   confidence-gated inflate + CVaR) beats c=1.0 SFI at every tested point
+   (e.g. p=0.4: Neither 0.85-0.95 vs SFI 0.90 vs SFIR 0.55-0.70). **The
+   09-09 conclusion "large c wins" turns out to actually mean "large c
+   washes a forgotten belief to uniform almost instantly, so forget/retrain
+   barely touch it -- what's really winning is the planner's confidence-
+   gated caution alone, not genuine model adaptation."** Retraining on top
+   of a belief already flattened by forget has nothing useful left to
+   correct, and just adds noise.
+2. **At small c (0.1), retrain genuinely helps**: SFIR (0.65/0.80 at
+   p=0.3/0.4) beats SFI (0.55/0.70) by a real, if modest, margin -- small c
+   means forgetting actually damages the belief, giving retrain something
+   real to fix. This is honest adaptation, just weaker than the large-c/
+   no-adaptation numbers.
+3. **Tuning could not close the gap between small-c and large-c**: tried
+   lr (1e-3 worse than 1e-2), cadence (every-1-step / more steps -> worse or
+   flat), `n_unfrozen=2` (worse, p=0.4 drops to 0.55), smaller c=0.05
+   (worse). The originally-guessed defaults (c=0.1, every=3, steps=5,
+   lr=1e-2, n_unfrozen=1) remained the best configuration found -- this
+   looks like a real ceiling for this approach on this task, not an
+   undertuning artifact.
+4. **FrozenLake spot-check**: SFI and SFIR gave IDENTICAL numbers (retrain
+   completely inert) -- because the retrain buffer resets every trial, and
+   FrozenLake's episodes are short (a hole terminates the episode, unlike
+   cliffwalking's teleport-back-to-start), so many trials end before
+   `retrain_every=3` post-change steps even accumulate. This is a
+   limitation of the current retrain design (buffer doesn't persist across
+   trials), not a finding that "FrozenLake doesn't need adaptation."
+5. **"Neither" (S+I only) beats small-c SFIR at every point tested** (e.g.
+   p=0.4: Neither-c=0.1 is 0.95 vs SFIR-c=0.1's 0.80) -- the best-scoring
+   strategy found anywhere in this whole investigation on cliffwalking, but
+   it is not genuine adaptation either.
+
+### 11.4 Decision (explicit user instruction)
+
+**Per the user's explicit instruction, the main table reports the honest
+small-c SFIR numbers, not "Neither" or the higher large-c numbers** --
+even though the latter score higher on this task. Concretely:
+
+- `bnn/dirichlet_model.py`: `CONC_PRIOR` changed from `1.0` back to
+  **`0.1`**.
+- `run_gridworld_experiments.py`: `--n-unfrozen` default changed from `0`
+  to **`1`** -- `cem_fir` now defaults to SFIR (forget + head retrain), no
+  extra flags needed.
+- **Only `cem_fir` is affected**: `ada_mcts`/`rats`/`cem_ada`/`oracle_cem`
+  always have `retain == 1`, so both changes are algebraically inert for
+  them (verified repeatedly) -- **no rerun needed** for those four.
+
+### 11.5 Main-table rerun (in progress)
+
+Launched a rerun of `cem_fir` (new defaults: c=0.1 + SFIR) across all 3
+configs, the full 8-p sweep, candidates=512, trials=30. A directly-measured
+single task (p=0.4, 3 trials, n_unfrozen=1, candidates=512) took 2216
+seconds ≈ 12.3 min/trial -- since tasks run in parallel (9 workers per
+config, bottlenecked by the slowest low-p task, not the sum of all tasks),
+expect roughly a day, more optimistic than the earlier "1.5-2 days" guess
+(which mistakenly reasoned about near-serial rather than parallel
+execution). Once done, §4's `sfir-cem-cvar` row will be replaced with these
+numbers.
+
+**A thread-oversubscription pitfall along the way**: the first attempt at 5
+concurrent ablation runs had each worker process spinning up ~5 MKL/OpenMP
+threads on its own, so 20 workers x 5 ≈ 100 threads fought over 16 cores --
+11 hours, 0 tasks completed. Every cem_fir batch since pins
+`OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+NUMEXPR_NUM_THREADS=1`, which fixed it.
