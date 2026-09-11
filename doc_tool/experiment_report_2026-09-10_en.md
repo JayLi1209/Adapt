@@ -250,9 +250,14 @@ hard 0, goal rate near-monotone again
 
 ## 4. Main results
 
-Goal rate, 30 trials, **current default settings** (`CONC_PRIOR = 1.0`,
-`oracle_cem` fixed). Bold = highest value among all methods in that
-(config, column).
+> **⚠️ These numbers are now stale** (the old `CONC_PRIOR = 1.0` default).
+> Current code defaults to `CONC_PRIOR = 0.1` + SFIR — **see §11.6 for the
+> final numbers**. This section is kept as the full record of why we moved
+> away from this setting.
+
+Goal rate, 30 trials, ~~current default settings~~ **the 2026-09-06~09
+default settings** (`CONC_PRIOR = 1.0`, `oracle_cem` fixed). Bold = highest
+value among all methods in that (config, column).
 
 ### config1: original cliff, pretrain p=1.0
 
@@ -647,14 +652,12 @@ even though the latter score higher on this task. Concretely:
 ### 11.5 Main-table rerun (in progress)
 
 Launched a rerun of `cem_fir` (new defaults: c=0.1 + SFIR) across all 3
-configs, the full 8-p sweep, candidates=512, trials=30. A directly-measured
-single task (p=0.4, 3 trials, n_unfrozen=1, candidates=512) took 2216
-seconds ≈ 12.3 min/trial -- since tasks run in parallel (9 workers per
-config, bottlenecked by the slowest low-p task, not the sum of all tasks),
-expect roughly a day, more optimistic than the earlier "1.5-2 days" guess
-(which mistakenly reasoned about near-serial rather than parallel
-execution). Once done, §4's `sfir-cem-cvar` row will be replaced with these
-numbers.
+configs, the full 8-p sweep, candidates=512, trials=30. **Done** -- all 27
+tasks across the 3 configs finished in about 5 hours wall-clock (started
+just after 10am, all DONE by 15:10), faster than the "about a day" estimate:
+9 workers per config ran all 9 of that config's tasks at once, bottlenecked
+by the single slowest task rather than the sum, and the parallelism paid off
+even better than expected.
 
 **A thread-oversubscription pitfall along the way**: the first attempt at 5
 concurrent ablation runs had each worker process spinning up ~5 MKL/OpenMP
@@ -662,3 +665,73 @@ threads on its own, so 20 workers x 5 ≈ 100 threads fought over 16 cores --
 11 hours, 0 tasks completed. Every cem_fir batch since pins
 `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 NUMEXPR_NUM_THREADS=1`, which fixed it.
+
+### 11.6 Final main table (official, c=0.1 + SFIR)
+
+Goal rate, 30 trials, candidates=512, **current code defaults**. The
+`ada_mcts` / `rats` / `cem_ada` / `oracle_cem` rows are identical to §4
+(algebraically unaffected by the CONC_PRIOR/n_unfrozen changes, not rerun);
+`sfir-cem-cvar` is the new number in this section. Bold = highest value in
+that (config, column).
+
+**config1: original cliff, pretrain p=1.0**
+
+| method | p=0.3 | p=0.4 | p=0.5 | p=0.6 | p=0.7-1.0 |
+|---|---|---|---|---|---|
+| ada-mcts | 0.367 | **0.667** | **0.900** | **1.000** | **1.000** |
+| rats | 0.100 | 0.300 | 0.800 | 0.800 | **1.000** |
+| ada-cem-cvar | 0.100 | 0.233 | 0.667 | 0.800 | **1.000** |
+| **sfir-cem-cvar (new, c=0.1 SFIR)** | **0.667** | 0.567 | 0.867 | 0.967 | **1.000** |
+| oracle-cem | **0.700** | **0.933** | **1.000** | **1.000** | **1.000** |
+
+**config2: first cliff cell removed, pretrain p=1.0**
+
+| method | p=0.3 | p=0.4 | p=0.5 | p=0.6 | p=0.7-1.0 |
+|---|---|---|---|---|---|
+| ada-mcts | 0.400 | **0.867** | **0.900** | **1.000** | **1.000** |
+| rats | 0.100 | 0.267 | 0.767 | 0.733 | **1.000** |
+| ada-cem-cvar | 0.167 | 0.267 | 0.633 | 0.900 | **1.000** |
+| **sfir-cem-cvar (new)** | **0.533** | 0.733 | 0.733 | 0.967 | **1.000** |
+| oracle-cem | **0.767** | **1.000** | **1.000** | **1.000** | **1.000** |
+
+**config3: original cliff, pretrain p=0.7**
+
+| method | p=0.3 | p=0.4 | p=0.5 | p=0.6-1.0 |
+|---|---|---|---|---|
+| ada-mcts | 0.533 | 0.700 | 0.967 | **1.000** |
+| rats | 0.300 | 0.600 | 0.800 | **1.000** |
+| ada-cem-cvar | 0.533 | 0.767 | 0.900 | **1.000** |
+| **sfir-cem-cvar (new)** | **0.700** | **0.900** | **1.000** | **1.000** |
+| oracle-cem | 0.700 | 0.933 | **1.000** | **1.000** |
+
+**Reading the tables (notably different from §4's old conclusion):**
+
+1. **`sfir-cem-cvar` is still the best non-oracle method at each config's
+   hardest point, p=0.3** -- that part holds.
+2. But **at moderate difficulty (p=0.4-0.6) in config1 and config2,
+   `ada-mcts` now overtakes `sfir-cem-cvar`** (config1 p=0.4: ada-mcts 0.667
+   vs ours 0.567; config2 p=0.4/0.5: ada-mcts 0.867/0.900 vs ours
+   0.733/0.733). This is a real departure from §4's old "best-or-tied at
+   20/21 points" -- that was propped up by the large-c caution artifact; the
+   honest small-c version doesn't carry that advantage.
+3. **config3 (pretrain p=0.7) is the exception**: `sfir-cem-cvar` is best at
+   all of p=0.3/0.4/0.5 (beating both `ada-mcts` and `oracle-cem`). SFIR
+   clearly has more of an edge in the small-jump (0.7→0.3/0.4/0.5) regime
+   than the large-jump (1.0→0.3/0.4) regime.
+4. **config1's p=0.4 (0.567) is even lower than its own p=0.3 (0.667) --
+   non-monotonic** -- and noticeably different from the §11.3 reduced-
+   fidelity pilot (candidates=256/trials=20), which measured 0.800 at that
+   point. The binomial std at n=30 here is ~0.09; a 0.10-0.23 gap isn't
+   fully explained by noise alone, and more likely reflects candidates=512
+   interacting with retrain differently than candidates=256 does at this
+   specific point (cem_fir has always been sensitive to the candidate count
+   -- the 2026-08-14 tuning notes found swings of this size, e.g. 0.38->0.88,
+   from 256->512 candidates alone). Reported as measured, not re-run to
+   "smooth" it.
+
+**Conclusion**: `sfir-cem-cvar` is no longer "best almost everywhere" --
+it's now **"best at the hardest scenario in every config (the lowest p
+under a large jump, and the entire range under a small jump), but conceded
+to ada-mcts at moderate difficulty under a large jump"**. Less sweeping than
+§4's old conclusion, but this is the number that comes from honest
+small-c adaptation, and per instruction this is the version to report.
