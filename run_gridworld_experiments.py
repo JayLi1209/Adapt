@@ -307,7 +307,7 @@ class BNNCEM:
                  n_rollouts=None, n_cem_iters=None, warm_blend=0.0,
                  do_forget=True, n_unfrozen=0, retrain_every=3,
                  retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64,
-                 seed=0):
+                 seed=0, retrain_min_conf=0.0):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -328,6 +328,17 @@ class BNNCEM:
         self.retrain_every = int(retrain_every)
         self.retrain_steps = int(retrain_steps)
         self.retrain_lr = float(retrain_lr)
+        # Gate retrain on the SAME confidence signal that already drives
+        # plan_retain/the CVaR tail (self._agent._confidence(), computed from
+        # n_since_change + surprise_bar -- no new mechanism, just reusing an
+        # existing computed value as a second condition).  0.0 = always fire
+        # on cadence (old behaviour).  Motivation: retraining the head on a
+        # handful of samples while confidence is still near 0 (right after a
+        # SEVERE change, e.g. p=0.3) risks overfitting noise before there is
+        # enough data to trust; delaying retrain until confidence has partly
+        # recovered lets forget do the early work and retrain only sharpen
+        # an already-reasonable belief.
+        self.retrain_min_conf = float(retrain_min_conf)
         self.retrain_buf_cap = int(retrain_buf_cap)
         # Gradient retrain mutates weight_mu/bias_mu IN PLACE, and the bnn object
         # is shared across all trials in a _worker -- retain/counts are reset in
@@ -422,7 +433,8 @@ class BNNCEM:
                     self._retrain_buf.append((obs, act_v, ps2))
                     if len(self._retrain_buf) > self.retrain_buf_cap:
                         self._retrain_buf = self._retrain_buf[-self.retrain_buf_cap:]
-                    if self.post % self.retrain_every == 0:
+                    if (self.post % self.retrain_every == 0
+                            and self._agent._confidence() >= self.retrain_min_conf):
                         self._retrain()
             d = self.grid.direction_of(ps, pa, ps2)
             if d >= 0:
@@ -851,6 +863,7 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                retrain_every=args.retrain_every,
                                retrain_steps=args.retrain_steps,
                                retrain_lr=args.retrain_lr,
+                               retrain_min_conf=args.retrain_min_conf,
                                seed=getattr(args, "seed", 0))
         elif name == "cem_static":
             out[name] = BNNCEM(bnn, dyn, grid,
@@ -1041,6 +1054,13 @@ def main():
                     help="cem_fir: Adam steps per retrain call")
     ap.add_argument("--retrain-lr", type=float, default=1e-2,
                     help="cem_fir: Adam lr for the retrain (bare NLL, no KL)")
+    ap.add_argument("--retrain-min-conf", type=float, default=0.0,
+                    help="cem_fir: withhold retrain until the SAME confidence "
+                         "signal driving plan_retain/the CVaR tail reaches "
+                         "this level (0.0 = always fire on cadence, old "
+                         "behaviour).  Lets forget do the early work under a "
+                         "severe change instead of retraining on a few "
+                         "still-noisy post-change samples.")
     ap.add_argument("--seed", type=int, default=0,
                     help="cem_fir only: seeds torch (posterior draws) and the "
                          "CVaRCEMAgent's own rng (candidate sampling); also "
@@ -1156,7 +1176,7 @@ def main():
                do_forget=args.do_forget, n_unfrozen=args.n_unfrozen,
                retrain_every=args.retrain_every,
                retrain_steps=args.retrain_steps, retrain_lr=args.retrain_lr,
-               seed=args.seed)
+               retrain_min_conf=args.retrain_min_conf, seed=args.seed)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
