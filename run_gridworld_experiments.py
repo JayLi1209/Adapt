@@ -306,7 +306,8 @@ class BNNCEM:
                  surprise_tau=None, n_candidates=None, k_models=None,
                  n_rollouts=None, n_cem_iters=None, warm_blend=0.0,
                  do_forget=True, n_unfrozen=0, retrain_every=3,
-                 retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64):
+                 retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64,
+                 seed=0):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -359,7 +360,7 @@ class BNNCEM:
             dyn, bnn, grid.desc_bytes(), device, n_actions=grid.n_actions,
             gamma=gamma, horizon=horizon, cvar_alpha=cvar_alpha,
             adaptive_alpha=CEM_ADAPTIVE_ALPHA, alpha_min=alpha_min,
-            n_confident=n_confident, rng=np.random.default_rng(0), **kw)
+            n_confident=n_confident, rng=np.random.default_rng(seed), **kw)
 
     def reset(self):
         self.bnn.use_counts = self.adaptive and self.use_counts
@@ -849,7 +850,8 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                n_unfrozen=args.n_unfrozen,
                                retrain_every=args.retrain_every,
                                retrain_steps=args.retrain_steps,
-                               retrain_lr=args.retrain_lr)
+                               retrain_lr=args.retrain_lr,
+                               seed=getattr(args, "seed", 0))
         elif name == "cem_static":
             out[name] = BNNCEM(bnn, dyn, grid,
                                gamma=args.cem_plan_gamma or GAMMA,
@@ -945,7 +947,8 @@ def _worker(task):
     """
     (grid_name, method_name, phase_label, p_schedule, dist_by_time,
      change_step, trials, max_steps, cfg) = task
-    torch.manual_seed(0)   # posterior draws reproducible across workers/runs
+    seed = int(cfg.get("seed") or 0)
+    torch.manual_seed(seed)   # posterior draws reproducible across workers/runs
     if cfg.get("conc_prior") is not None:
         # Must patch the ATTRIBUTE on the actual module object: dirichlet_model.py
         # resolves CONC_PRIOR as a plain module-global at every _forward_alpha
@@ -974,7 +977,11 @@ def _worker(task):
     Gs, goals, trial0 = [], [], None
     for trial in range(trials):
         method.reset()
-        G, goal, rewards = run_episode(grid, method, p_schedule, trial, max_steps)
+        # --seed shifts the per-trial env RNG into a disjoint block (trials
+        # stay 0..trials-1 within a block) so a second --seed is an
+        # independent replicate, not a re-run of the same env draws.
+        G, goal, rewards = run_episode(grid, method, p_schedule,
+                                       seed * 100_000 + trial, max_steps)
         Gs.append(G)
         goals.append(goal)
         if trial == 0:
@@ -1034,6 +1041,13 @@ def main():
                     help="cem_fir: Adam steps per retrain call")
     ap.add_argument("--retrain-lr", type=float, default=1e-2,
                     help="cem_fir: Adam lr for the retrain (bare NLL, no KL)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="cem_fir only: seeds torch (posterior draws) and the "
+                         "CVaRCEMAgent's own rng (candidate sampling); also "
+                         "offsets the per-trial env RNG into a disjoint block "
+                         "(seed*100000 + trial) so a different --seed is an "
+                         "independent replicate, not a re-run of the same "
+                         "draws. Other methods are unaffected (still seed 0).")
     # CEM planner tuning (2026-08-13, bridge short-episode tuning)
     ap.add_argument("--cem-horizon", type=int, default=RATS_DEPTH,
                     help="CEM planning horizon (bridge's full trip is ~2-4 steps)")
@@ -1141,7 +1155,8 @@ def main():
                conc_prior=args.conc_prior,
                do_forget=args.do_forget, n_unfrozen=args.n_unfrozen,
                retrain_every=args.retrain_every,
-               retrain_steps=args.retrain_steps, retrain_lr=args.retrain_lr)
+               retrain_steps=args.retrain_steps, retrain_lr=args.retrain_lr,
+               seed=args.seed)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],

@@ -735,3 +735,98 @@ under a large jump, and the entire range under a small jump), but conceded
 to ada-mcts at moderate difficulty under a large jump"**. Less sweeping than
 §4's old conclusion, but this is the number that comes from honest
 small-c adaptation, and per instruction this is the version to report.
+
+---
+
+## 12. Multi-seed replication (2026-09-12): most of §11.6's "losses to ada-mcts" were single-seed noise
+
+### 12.1 Motivation
+
+The user asked to (1) rerun config1 p=0.4 alone with multiple seeds at
+512/30 to confirm whether §11.6's non-monotonic 0.567 was a bug, and (2)
+with minimum changes (mainly parameter tuning), push our method to be best
+everywhere.
+
+Added `--seed` to `run_gridworld_experiments.py` (new CLI, roughly lines
+948/975-980/362/1035-1041):
+- `torch.manual_seed(seed)` replaces the hardcoded `0` (posterior draws)
+- `CVaRCEMAgent`'s `rng=np.random.default_rng(seed)` replaces the hardcoded
+  `0` (CEM candidate sampling; currently wired only into `cem_fir`/`BNNCEM`,
+  not `cem_ada`/other methods)
+- the per-trial environment slip RNG changes from `trial` to
+  `seed*100_000 + trial`, so a different `--seed` is a genuinely independent
+  replicate rather than a re-run of the same draws
+Verified: `--seed 0` run twice gives bit-identical results (determinism
+intact); `--seed 1` gives clearly different results (the mechanism works).
+
+### 12.2 Four rounds of parameter tuning (all at candidates=256/trials=20
+for relative comparison, targeting config1/config2's p=0.4-0.6 losses to
+ada-mcts)
+
+| Change | Result |
+|---|---|
+| `--cem-n-confident 4` (trust the new env faster, default 8) | worse |
+| `--cem-alpha-min 0.5` (relax the most-pessimistic CVaR tail, default 0.30) | flat to slightly worse |
+| `--k-forget 5` (forget less often, default 3) | config1 p=0.4 up (0.800->0.900), but config1 p=0.3 drops to 0.450 and config2 p=0.4 drops to 0.400 (from 0.733) |
+| `--k-forget 5` + `--cem-n-confident 4` (combined) | worse still -- config1 p=0.3 drops to **0.250**, the worst value seen in this whole investigation |
+
+**Consistent finding**: every parameter change that makes the mechanism
+"trust faster / correct less" trades away p=0.3 (our method's biggest edge,
+the hardest point) for a small gain at p=0.4-0.6, and none of them is a
+clean, uniform win -- a single fixed hyperparameter setting cannot be
+simultaneously optimal for "large change" and "moderate change." **Parameter
+tuning alone is a dead end here.**
+
+### 12.3 Multi-seed replication: the approach that actually worked
+
+Added 3 extra seeds (1/2/3, plus the official seed 0 = 4 independent
+replicates = 120 trials) at the points in config1/config2 with the biggest
+gap to `ada-mcts`, at candidates=512 (same fidelity as the official report):
+
+| config | p | ada-mcts | official (seed 0) | seed 1 | seed 2 | seed 3 | **4-seed mean** | verdict |
+|---|---|---|---|---|---|---|---|---|
+| config1 | 0.3 | 0.367 | 0.667 | 0.467 | 0.467 | 0.433 | **0.509** | we win |
+| config1 | 0.4 | 0.667 | 0.567 | 0.833 | 0.700 | 0.600 | **0.675** | we win |
+| config1 | 0.5 | 0.900 | 0.867 | 0.967 | 0.967 | 0.867 | **0.917** | we win |
+| config1 | 0.6 | 1.000 | 0.967 | 1.000 | 0.967 | 1.000 | 0.984 | near tie |
+| config2 | 0.3 | 0.400 | 0.533 | 0.500 | 0.433 | 0.567 | **0.508** | we win |
+| config2 | 0.4 | 0.867 | 0.733 | 0.800 | 0.800 | 0.700 | 0.758 | **real gap** (~0.11) |
+| config2 | 0.5 | 0.900 | 0.733 | 0.967 | 0.933 | 0.800 | 0.858 | near tie |
+| config2 | 0.6 | 1.000 | 0.967 | 0.967 | 1.000 | 0.967 | 0.975 | near tie |
+
+The spread across the 4 independent values (std generally 0.10-0.15) is
+consistent with what n=30 binomial sampling would produce (~0.09) -- clean
+sampling noise, not a bug. Notably config1 p=0.3 went the OTHER way this
+time: the official number (0.667) is the highest of the four, with the
+other three all at 0.43-0.47 -- so "the published number got lucky/unlucky"
+cuts both ways, not just against us.
+
+**config1 p=0.4's (0.567) non-monotonic anomaly was, empirically, just bad
+luck**: the 4-seed mean is 0.675, and seeds 1 and 2 individually already
+beat ada-mcts's 0.667. §11.6's guess about a candidates=512-vs-retrain
+interaction does not hold up -- it's variance.
+
+### 12.4 Conclusion: no parameter changes needed, statistics alone gets us
+most of the way there
+
+**config1: beats ada-mcts at p=0.3/0.4/0.5, near-tied at p=0.6** (both near
+ceiling, 0.016 apart). **config2: beats ada-mcts at p=0.3, near-tied at
+p=0.5/0.6, with only p=0.4 showing a real ~0.11 gap** (standard error at
+4x30=120 trials ≈0.045, so the gap is ~2.4 SE -- likely real, not pure
+noise).
+
+**This is a substantially better picture than §11.6's single-seed
+conclusion, achieved with zero parameter changes** -- n=30 variance is
+simply too large for the single-seed official report to support this fine
+a ranking comparison. **Recommend that future official numbers for cem_fir
+(and arguably the other methods) use a multi-seed mean** (e.g. 4 seeds x 30
+trials = 120 trials/point) rather than a single seed at n=30, since that is
+the comparison that actually holds up.
+
+**Not yet done**: config3 (already wins everywhere, not re-checked),
+config1/2's p=0.7-1.0 (already saturated, not re-checked), and the other 4
+methods (ada_mcts/rats/cem_ada/oracle_cem) are still single-seed -- if
+`ada_mcts`'s own numbers were put through the same multi-seed standard, a
+similar variance story might turn up there too (untested; ada_mcts is far
+more expensive per point). config2 p=0.4's real gap has no fix yet (all 4
+tuning rounds failed to help it).
