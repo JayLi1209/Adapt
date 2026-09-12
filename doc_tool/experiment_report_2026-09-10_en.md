@@ -874,3 +874,41 @@ most likely require making the forget/retrain cadence adapt to the
 *observed* severity of the change (rather than fixed `k_forget`/
 `retrain_every` constants) -- which is no longer "minimum change / parameter
 tuning" but a genuine mechanism change.
+
+### 12.6 Last attempt: could "Neither" replace SFIR to fix this gap? (user decision: no)
+
+Following the "is forget/retrain net-negative" thread, measured the actual
+distribution of `delta_bar` (the surprise signal forget already uses) at
+both config1 p=0.3 and config2 p=0.4: mostly ≈1, occasional spikes into the
+thousands, with a similar shape at both points -- **delta_bar's magnitude
+does not cleanly separate "severe" from "moderate" change**, which is why
+`--retrain-min-conf`'s gate backfired at config1 p=0.3 and why an adaptive-
+cadence-on-delta_bar approach is essentially a dead end too.
+
+Followed up by testing "Neither" (c=0.1, no forget, no retrain, only
+Surprise+Inflate) at config2 p=0.4: a single seed gave a striking **0.950**,
+briefly looking like a clean answer. Two more seeds regressed it toward the
+mean: **3-seed average 0.850**, essentially tied with `ada-mcts`'s 0.867
+(0.017 apart, within noise) -- not a rout, but a real improvement over
+SFIR's confirmed 0.163 gap. (At config1 p=0.3, Neither's 3-seed mean of
+0.600 still beats `ada-mcts`'s 0.367, and is somewhat higher than SFIR's own
+0.509 mean, though not by a large margin.)
+
+**User's decision: keep honest SFIR (forget + retrain), do not switch to
+"Neither" for this one point** -- even though this means cem_fir's method
+genuinely and robustly loses to `ada-mcts` at config2 p=0.4 (8-seed mean
+0.704 vs 0.867, gap 0.163). Having seen more solid data than the earlier
+single-point comparison, the user reaffirmed that "retrain" is part of the
+method's definition (per `main_cl_2.tex`'s Surprise-Forget-Inflate-
+**Retrain**) and should not be quietly dropped just to tie the score at one
+point.
+
+**Final conclusion (closing this round of "make cem_fir best everywhere")**:
+of the 8 previously-contested (config,p) points, 7 flip to wins or ties via
+multi-seed statistics alone (zero changes); the remaining one (config2
+p=0.4), after 12 parameter/gating variants plus a "drop retrain entirely"
+alternative, is confirmed to be a real limitation of the current
+fixed-cadence SFI/SFIR design at this specific (grid geometry, change
+magnitude) combination that cannot be closed by minimum change -- and the
+user has explicitly accepted this outcome, choosing to preserve the
+method's definitional integrity over chasing the score at this one point.
