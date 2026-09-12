@@ -828,5 +828,49 @@ config1/2's p=0.7-1.0 (already saturated, not re-checked), and the other 4
 methods (ada_mcts/rats/cem_ada/oracle_cem) are still single-seed -- if
 `ada_mcts`'s own numbers were put through the same multi-seed standard, a
 similar variance story might turn up there too (untested; ada_mcts is far
-more expensive per point). config2 p=0.4's real gap has no fix yet (all 4
-tuning rounds failed to help it).
+more expensive per point).
+
+### 12.5 config2 p=0.4's real gap (added 2026-09-12): systematic parameter search + tightened statistics
+
+**Parameter search (12 variants, all paired-tested on config2 p=0.4 and
+config1 p=0.3 at candidates=256/trials=20)**: `cem-n-confident=4`,
+`cem-alpha-min=0.5`, `k-forget∈{1,2,5}`, `k-forget=5+n-confident=4`,
+`retrain-every=1`, `cem-horizon=8`, `retrain-steps=10`, `retrain-lr=2e-2`,
+plus a new `--retrain-min-conf` (gates the retrain trigger on the SAME
+confidence signal that already drives plan_retain -- `CVaRCEMAgent.
+_confidence()`, not a new mechanism, just an extra condition on an existing
+value; `run_gridworld_experiments.py` roughly lines 330-339/425-426/865/
+1054-1061/1170).
+
+Result: **only `retrain-every=1` had a positive effect** (config2 p=0.4
+0.750->0.850), at the cost of an equal drop at config1 p=0.3 (0.650->0.550)
+-- the same zero-sum tradeoff as every other lever. `retrain-steps=10` and
+`retrain-lr=2e-2` were worse on BOTH sides, not a tradeoff, confirming the
+current defaults (steps=5, lr=1e-2) are near a local optimum on that axis.
+`--retrain-min-conf` never actually bound at config2 p=0.4 (confidence
+there ramps fast enough that even a 0.7 threshold gave bit-identical
+results to 0.3/0.5/no-gate); at config1 p=0.3 it made things clearly worse
+(0.650->0.45-0.55) -- under a severe change, `delta_bar` apparently spikes
+and crashes confidence for a while, so any "wait for confidence before
+retraining" rule withholds exactly the correction p=0.3 needs fastest. The
+direction is backwards, not merely ineffective.
+
+**Tightened statistics**: extended config2 p=0.4 from 4 to 8 seeds (240
+trials, official candidates=512 fidelity):
+
+| seed | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | **8-seed mean** |
+|---|---|---|---|---|---|---|---|---|---|
+| goal rate | 0.733 | 0.800 | 0.800 | 0.700 | 0.600 | 0.733 | 0.600 | 0.667 | **0.704** |
+
+vs `ada-mcts`'s 0.867: gap **0.163**, SE ≈0.028 (8 independent 30-trial
+estimates), **~5.9 SE** -- the gap did not shrink with more data, it got
+larger and clearer than the earlier 4-seed estimate of ~0.11.
+
+**Conclusion**: this is not noise -- it's a **real shortfall of the current
+fixed-cadence SFI/SFIR mechanism specifically at config2 (first cliff cell
+removed) x p=0.4 (moderate change)**, and none of 12 parameter/gating
+variants can fix it without sacrificing p=0.3. Actually closing it would
+most likely require making the forget/retrain cadence adapt to the
+*observed* severity of the change (rather than fixed `k_forget`/
+`retrain_every` constants) -- which is no longer "minimum change / parameter
+tuning" but a genuine mechanism change.
