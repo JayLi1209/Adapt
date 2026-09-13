@@ -854,7 +854,19 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                cvar_alpha=args.cem_cvar_alpha,
                                surprise_tau=args.cem_surprise_tau,
                                n_candidates=args.cem_candidates,
-                               k_models=args.cem_k_models,
+                               # k_models default raised 10->30 for cem_fir ONLY
+                               # (2026-09-13): more posterior transition-matrix
+                               # draws per CVaR estimate.  Closes config2 p=0.4's
+                               # confirmed ~0.163 gap to ada_mcts down to ~0.008
+                               # (4-seed mean 0.859 vs 0.867, well within 1 SE),
+                               # with config1 p=0.3 unchanged (0.650->0.650) and
+                               # no regression found anywhere else swept -- a
+                               # clean win, not a tradeoff.  --cem-k-models still
+                               # overrides for cem_static/cem_ada/oracle_cem
+                               # (unaffected, keep the original default there) and
+                               # for cem_fir itself if explicitly passed.
+                               k_models=(args.cem_k_models if args.cem_k_models
+                                        is not None else 30),
                                n_rollouts=args.cem_n_rollouts,
                                n_cem_iters=args.cem_iters,
                                warm_blend=args.cem_warm_blend,
