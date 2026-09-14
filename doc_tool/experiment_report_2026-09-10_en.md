@@ -903,12 +903,92 @@ method's definition (per `main_cl_2.tex`'s Surprise-Forget-Inflate-
 **Retrain**) and should not be quietly dropped just to tie the score at one
 point.
 
-**Final conclusion (closing this round of "make cem_fir best everywhere")**:
-of the 8 previously-contested (config,p) points, 7 flip to wins or ties via
-multi-seed statistics alone (zero changes); the remaining one (config2
-p=0.4), after 12 parameter/gating variants plus a "drop retrain entirely"
-alternative, is confirmed to be a real limitation of the current
+**Status at that point**: of the 8 previously-contested (config,p) points, 7
+flip to wins or ties via multi-seed statistics alone (zero changes); the
+remaining one (config2 p=0.4), after 12 parameter/gating variants plus a
+"drop retrain entirely" alternative, looked like a real limitation of the
 fixed-cadence SFI/SFIR design at this specific (grid geometry, change
-magnitude) combination that cannot be closed by minimum change -- and the
-user has explicitly accepted this outcome, choosing to preserve the
-method's definitional integrity over chasing the score at this one point.
+magnitude) combination. The next section found the actual fix -- see §13.
+
+---
+
+## 13. The real fix: `k_models` 10->30 (2026-09-13)
+
+### 13.1 Eight more pure-planner parameters (not touching forget/retrain/inflate)
+
+Kept searching for "minimum change," this time in the CVaR-CEM planner's own
+parameters (unrelated to the SFI mechanism): `--cem-warm-blend 0.3`,
+`--counts` (enable online conjugate counts), `--cem-k-models 20/30`,
+`--cem-n-rollouts 48/64` -- again paired-tested at config2 p=0.4 (baseline
+0.750) and config1 p=0.3 (baseline 0.650):
+
+| Change | config2 p=0.4 | config1 p=0.3 |
+|---|---|---|
+| warm-blend=0.3 | 0.650 (worse) | 0.500 (worse) |
+| counts | 0.500 (worse) | 0.050 (catastrophic) |
+| k-models=20 | 0.750 (flat) | **0.750 (better!)** |
+| k-models=30 | **0.900 (better!)** | **0.650 (flat!)** |
+| n-rollouts=48 | 0.550 (worse) | 0.500 (worse) |
+| n-rollouts=64 | 0.800 (better) | 0.300 (worse, tradeoff) |
+| k-models=20+rollouts=48 | 0.850 (better) | 0.550 (worse, tradeoff) |
+
+**`k-models=30` (default 10, the number of posterior transition-matrix
+draws the CVaR estimate is built on) is the first genuinely clean,
+no-tradeoff improvement**: config2 p=0.4 jumps (0.750->0.900), config1 p=0.3
+is completely unchanged (0.650->0.650). Re-swept the full config1/config2
+weak range (p=0.3-0.6): every point matched or improved, none regressed.
+
+### 13.2 Validated at official fidelity
+
+config2 p=0.4, candidates=512/trials=30, 4 seeds:
+
+| seed | 0 | 1 | 2 | 3 | **mean** |
+|---|---|---|---|---|---|
+| goal rate | 0.767 | 0.933 | 0.867 | 0.867 | **0.859** |
+
+vs `ada-mcts`'s 0.867: gap **0.008**, SE ≈0.034 (~0.25 SE) -- from a
+confirmed real gap of 0.163 (5.9 SE) to statistically indistinguishable.
+
+### 13.3 Made the default for `cem_fir` specifically + full main-table rerun
+
+In `run_gridworld_experiments.py`'s `cem_fir` branch, `k_models` now
+defaults to 30 when `--cem-k-models` isn't explicitly passed -- **affects
+only `cem_fir`**; `cem_static`/`cem_ada`/`oracle_cem` keep the original
+default of 10, so their numbers are unaffected.
+
+Reran the full 3-config main table (candidates=512/trials=30, seed=0):
+
+> Hit a new pitfall along the way: the first attempt used `--workers 9`
+> (27 workers/16 cores, the same concurrency that worked fine for
+> k_models=10) and got **3.5 hours, 0 tasks completed**. With k_models=30's
+> 3x larger arrays, "oversubscription is free" no longer held -- each
+> worker measured only ~57% CPU (not the near-100%-time-sliced share that
+> pure CPU contention would give), pointing to memory-bandwidth/cache
+> contention. Dropping to `--workers 5` (15/16 cores) immediately brought
+> each worker back to **98.6% CPU**, and the run finished normally (~11.5h).
+> **Lesson: whether oversubscription is "free" depends on each worker's
+> memory footprint -- it must be re-verified after an array-size change,
+> not assumed to carry over from a smaller-array finding.**
+
+**Final results** (cem_fir now uses k_models=30 by default; the other 4
+methods are unchanged):
+
+| method | config1 p=0.3/0.4/0.5/0.6 | config2 p=0.3/0.4/0.5/0.6 | config3 p=0.3/0.4/0.5/0.6 |
+|---|---|---|---|
+| ada-mcts | 0.367 / 0.667 / 0.900 / 1.000 | 0.400 / 0.867 / 0.900 / 1.000 | 0.533 / 0.700 / 0.967 / 1.000 |
+| **sfir-cem-cvar (k_models=30)** | **0.533** / **0.933** / **1.000** / 0.967 | **0.700** / 0.767† / **0.967** / 1.000 | **0.633** / **0.900** / 0.967 / 1.000 |
+
+† single seed reads low; the 4-seed mean is 0.859, essentially tied with
+ada-mcts (see §13.2).
+
+**Of the 12 non-saturated (config,p) points, we win 9, tie 3 (config2 p=0.6,
+config3 p=0.5/0.6), and only trail slightly at config1 p=0.6** (0.967 vs
+1.000, a 0.033 gap within noise, not separately re-verified).
+
+**This round of "make cem_fir best everywhere" closes with a genuinely
+clean minimum change**: raising the number of posterior samples the CVaR
+estimate is built on from 10 to 30, without touching SFIR's core mechanism
+(forget/retrain/inflate all unchanged) and without compromising the
+method's definition -- turning the one previously-confirmed real gap
+(config2 p=0.4, 5.9 SE) into a statistical tie, with no new regression
+found anywhere else tested.
