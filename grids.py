@@ -231,8 +231,28 @@ CLIFFWALKING_4x12_NOFIRSTHOLE = GridSpec(
     step_penalty=0.0,
 )
 
+# CliffWalking as in Act As You Learn (Luo et al. 2024, arXiv 2401.01841) --
+# 2026-09-15 collaborator reproduction request (holes = -1, gamma = 0.9999,
+# pretrain p = 0.7).  Same 4x12 map as CLIFFWALKING_4x12: the paper's Fig. 2(b)
+# is the stock gym map with no extra hole (the "extra hole" in that caption is
+# the NS-Bridge's).  Rewards/termination follow the authors' RATS-lineage envs
+# (nsfrozenlake_v0.py / ns_gym nscliff_v0.py: G +1, H -1, else 0, done on G or
+# H) and upstream adamcts.py (reward +-1 => terminal): the cliff is a TERMINAL
+# hole paying -1, no teleport-to-start.
+CLIFFWALKING_4x12_AAYL = GridSpec(
+    name="cliffwalking_aayl",
+    nrow=4, ncol=12, n_actions=4, k_dir=3,
+    deltas=((-1, 0), (0, 1), (1, 0), (0, -1)),
+    dir_offsets=(0, 1, -1),
+    desc=CLIFFWALKING_4x12.desc,
+    cliff_to_start=False,
+    step_penalty=0.0,
+    hole_reward=-1.0,
+)
+
 REGISTRY = {g.name: g for g in (FROZENLAKE_4x4, CLIFFWALKING_4x12,
-                                CLIFFWALKING_4x12_NOFIRSTHOLE, BRIDGE_5x8,
+                                CLIFFWALKING_4x12_NOFIRSTHOLE,
+                                CLIFFWALKING_4x12_AAYL, BRIDGE_5x8,
                                 BRIDGE_HOLE_5x8)}
 
 

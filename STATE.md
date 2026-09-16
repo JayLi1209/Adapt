@@ -4,7 +4,7 @@
 > 应该回来更新这个文件（同一个文件，不新建）。最终对外报告见
 > `doc_tool/experiment_report_2026-09-14.md`（详细版）和
 > `doc_tool/experiment_summary_2026-09-14.md`（自包含、给外部演讲用）。
-> 最后更新：2026-09-15 13:23 EDT。
+> 最后更新：2026-09-15 20:55 EDT。
 
 **本文件即为 /clear 或 /compact 前的交接文档**（用户要求：如果 STATE.md
 能当交接文档用，就不用另写）。新 session 接手时，建议顺序：
@@ -231,24 +231,39 @@ config3（预训练p=0.7）：
 
 ---
 
-## 正在跑什么（截至 2026-09-15 13:23）
+## 正在跑什么（截至 2026-09-15 20:55，两条线并行）
 
-**公平性修正实验**：把 `ada-cem-cvar`、`oracle-cem` 也换成
+### 线1：公平性修正（06:45 启动，已跑约 14 小时）
+
+把 `ada-cem-cvar`、`oracle-cem` 也换成
 `k_models=30`，重跑 3 组场景 × p=0.3/0.4/0.5/0.6。
-- 命令：3 个后台进程，`--workers 5` 各一个，共 15 workers/16核。
-- 进度：3 组场景的 stationary 阶段都已完成（goal rate 1.000，正常），
-  真正有信息量的 p=0.3-0.6 还在跑。
-- Load average ~17-18（15个worker共享16核，健康，非过度订阅）。
+- 命令：3 个后台进程（PID 1793674/1793675/1793676），`--workers 5` 各一
+  个，共 15 workers/16核。
+- 进度（20:49）：3 组的 stationary 都完成（goal rate 1.000）；config3 出
+  了第一个非平稳点（p=0.4 cem_ada：return +0.762 / goal rate 0.767）；
+  **config1/config2 的日志从 09:25 起 11 小时没有新行**。已核实：15 个
+  worker 瞬时 CPU 仍在 70-94%，进程都活着，判断是低 p（0.3/0.4）任务本
+  身慢（失败 episode 会跑满 100 步），不是卡死；但仍需继续盯。
 - 日志：`$SCRATCH/fair_km30_config{1,2,3}.log`
   （`$SCRATCH=/tmp/claude-1001/-home-guo-Adapt/61e1a280-f090-4695-8c22-6aa922fa1b9d/scratchpad`，
   重启会丢，只是运行时日志，结果要搬进 doc_tool 才算持久化）。
-- ETA：参照同规模的 cem_fir 单方法 k=30 重跑经验（15 workers跑
-  3配置×8p点用了约11.5小时），这次是2方法×3配置×4p点，量级相近，
-  原估计从 06:45 重启算起 17:00-18:00 左右（2026-09-15）跑完。**但截至
-  13:23（已过6.5小时）三个日志都还只有 stationary 阶段的结果**，比
-  预期慢——不确定是这批（oracle_cem/cem_ada）单任务比 cem_fir 更慢，
-  还是任务调度顺序问题，需要接手时重新查看日志判断是否卡住/需要干预
-  （对照"关键文件与命令"里的资源检查命令，看 load/CPU 是否正常）。
+- **修正后的 ETA**：实测单任务约 7-14 小时，30 个任务 /15 worker ≈ 2 轮，
+  预计 2026-09-16 凌晨到上午跑完（原估计的 17:00-18:00 已证明过于乐观）。
+
+### 线2：Act as You Learn（ADA-MCTS）复现（20:50 启动）
+
+- PID 2265972，`--workers 7`（stationary + 6 个 p 点，每个 phase 一个
+  worker）。完整命令见"关键文件与命令"。
+- 论文参数：30000 模拟/动作、N_threshold=50、eps_E=0.02、eps_A=0、
+  γ=0.9999、预训练 p=0.7、p∈{0.4,0.5,0.6,0.8,0.9,1.0}、30 trials。
+- 日志：`$SCRATCH/aayl_repro_ada_mcts.log`；逐行实时结果在
+  `gridworld_cliffwalking_aayl_results.log`（runner 每行 flush，stdout 反
+  而会被缓冲，查进度要看这个文件）。
+- ETA：30000 模拟下每个动作约 7 秒，episode 上限 100 步 → 单 trial 最坏约
+  12 分钟，30 trials ≈ 6 小时/任务；7 任务并行且与线1 抢 CPU，预计
+  **8-12 小时，2026-09-16 上午**出全部结果。
+- **并行代价**：两条线合计 22 进程抢 16 核，线1 会因此慢约 30%。用户明确
+  要求并行（线2 被 collaborator 标为"目前最重要"），已接受这个代价。
 
 ---
 
@@ -258,8 +273,14 @@ config3（预训练p=0.7）：
    `experiment_report_2026-09-14.md` §3 和
    `experiment_summary_2026-09-14.md` §4 里 ada-cem-cvar/oracle-cem
    两行，重新核实本文方法相对它们的领先幅度是否还成立、缩小了多少。
-2. 来自collaborator的请求：“你可以复现act as you learn 这篇paper的结果嘛？https://arxiv.org/abs/2401.01841
-   setting是所有的hole = -1, discount factor = 0.9999 pretrained prob = 0.7. 我复现不出来paper 的结果...你如果有时间可以试试！这个是目前最重要的...“
+   collaborator说，“把retain factor提高（把lambda hat提高，或是clip rho）能解决p = 0.9很差的问题”。这个也可以试一下，特别是如果k_models=30后，我们的方法很差的话。
+2. 来自collaborator的请求：“你可以复现（reproduce）act as you learn 这篇paper的结果嘛？https://arxiv.org/abs/2401.01841
+   setting是所有的hole = -1, discount factor = 0.9999 pretrained prob = 0.7. 我复现（reproduce）不出来paper 的结果...你如果有时间可以试试！这个是目前最重要的...“只跑cliff_walking环境，他们提出的ada_mcts方法就行了。他们的环境应该是（相比原版cliff_walking）中间加了一个hole（你确认一下）。
+   **状态：2026-09-15 20:50 已启动，见"正在跑什么"线2。**
+   **"中间加了一个hole"已核实：不成立**——论文 Fig.2(b) 的 cliff walking
+   就是标准 4×12 gym 地图（起点左下、目标右下、底行第1-10列是悬崖），没有
+   额外的洞；图注里"We add an extra hole"说的是 Fig.2(c) 的 NS-Bridge。
+   详见下面"Act as You Learn 复现：设置与已核实事实"。
 3. `k_models=30` 是否也
    该顺手用到 stationary/p=0.7-1.0 那些饱和点上重新验证——大概率无
    影响（已饱和），优先级低。（用户：可能只验证0.7即可？因为如果0.7结果是1，那么0.8/0.9/1.0也都是1，没必要跑。）
@@ -273,6 +294,50 @@ config3（预训练p=0.7）：
 
 ---
 
+## Act as You Learn 复现：设置与已核实事实（2026-09-15 新增）
+
+**已核实的事实（有证据，可直接引用）**
+1. **cliff walking 没有额外的洞**：论文 PDF 第 9 页 Fig.2(b) 就是标准
+   4×12 gym CliffWalking。"We add an extra hole" 是图注里讲 (c) NS-Bridge
+   的，那个洞在中间行第 2 列（`G F H F S F F G`）。
+   *顺带发现*：我们的 `BRIDGE_HOLE_5x8`（`grids.py`）把额外的洞放在
+   (1,4)（起点正上方的肩部），**与论文图 (c) 的 (2,2) 不一致**。本轮用户
+   只要 cliff，没有改；将来要用 bridge 结果时必须先修这一条。
+2. **官方代码里根本没有 cliff 环境**：`ADA-MCTS/`（用户 fork）以及
+   upstream `scope-lab-vu/ADA-MCTS` 的全部分支/PR ref 都只有 frozenlake
+   和 nsbridge，没有任何 cliff 文件——论文说"环境随代码提供"，但实际没有。
+   所以 cliff 的精确复现只能靠推断作者的约定。
+3. **作者的奖励/终止约定**（据其代码血缘：`nsfrozenlake_v0.py`、ns_gym 的
+   `nscliff_v0.py`，以及 `adamcts.py` 的 `is_terminal: reward==1 or -1`）：
+   **G=+1，H=−1 且立即终止，其余 0**，`discount_factor = 0.9999`
+   （`adamcts.py:34`）。与 collaborator 给的设置完全一致。
+4. **主表（holes=0）下 ADA-MCTS 的悲观采样从未触发**：
+   `_worst_case_sample` 只有"可达格子里存在负奖励"时才一次性 one-hot 到最
+   差格子，holes=0 时所有奖励 ≥0 → 直接退化成普通采样。也就是说我们主表里
+   的 ADA-MCTS 基线**没有启用它的风险规避阶段**。换成 holes=−1 才会生效。
+   这是奖励约定造成的，不是移植 bug，但汇报主表时应当说明。
+
+**我们的移植 vs 论文，已知的 4 处差异**（复现时前两处已按论文对齐）
+| 项 | 论文 | 我们 `planning/ada_mcts.py` |
+|---|---|---|
+| N_threshold | 50 | 原硬编码 3 → 已加 `--ada-n-threshold`，复现用 50 |
+| 每个 run 的独立性 | 每个 seed 独立重跑 | 原来 M_k 状态按 phase 共享 → 已加 `--ada-iid-trials`，复现用逐 trial 重置 |
+| M_k 更新 | 每 5 步（N_interval）重训 BNN | 每步共轭计数更新（未改） |
+| rollout | 随机 rollout 直到终止 | 6 步 rollout + γ^dist 启发式（未改） |
+
+**对论文 Table 1 内部一致性的怀疑（推断，未验证，供 collaborator 参考）**
+- 在"γ=0.9999 + ±1 终止奖励"下，回报几乎等于"到达率 − 坠崖率"，取值高度
+  双峰；但论文 ADA-MCTS 的误差条只有 ±0.02（cliff 全部 6 个点），这要求回
+  报集中在 0.78 附近，**只有当回报随路径长度明显衰减时才可能**（即 γ 远小
+  于 0.9999，或存在每步惩罚）。
+- 但同表里 RATS 在 p=1.0 恰好是 `0.000 ± 0.00`，**又排除了每步惩罚**（否
+  则不到达目标会是负数）。
+- 两者合起来意味着：论文 cliff 那一列很可能不是用 γ=0.9999 算的。如果
+  collaborator 是按 γ=0.9999 复现，数值对不上是可以预期的。这条要等我们的
+  复现结果出来再下结论。
+
+---
+
 ## 我提过、还没完整回答的问题
 
 - **"公平对比之后，本文方法是不是真的最好？"**——这是用户最新、最
@@ -280,6 +345,14 @@ config3（预训练p=0.7）：
   修正实验出结果才能回答，不能提前猜。
 - ablation 里 SFIR 不是全面最优这件事，"是真实差距还是噪声"——需要
   多种子复核才能回答，目前只有单种子数据。
+- **"能不能复现 Act as You Learn 的 cliff walking 结果？"**——线2 已启动，
+  预计 2026-09-16 上午出结果，现在还不能回答。注意一个早期信号：冒烟测试
+  （仅 300 模拟）里 stationary 阶段 goal rate = 0.000，原因是 γ=0.9999 使
+  叶子启发式 γ^dist≈1.0 处处相同、没有指向目标的梯度，只能靠树搜到 13 步
+  外的目标——模拟次数不够时会完全找不到目标。正式跑用的是论文的 30000，
+  但如果正式结果也接近 0，要优先怀疑这条路径而不是直接下"复现失败"的结论。
+- collaborator 的另一条建议"把 retain factor 提高（提高 lambda hat 或 clip
+  rho）能解决 p=0.9 很差的问题"——还没试，等线1 结果出来后决定。
 
 ---
 
@@ -309,6 +382,25 @@ python run_gridworld_experiments.py --grid cliffwalking --trials 30 --workers 5 
 python run_gridworld_experiments.py --grid cliffwalking_nofirsthole --trials 30 --workers 5 --methods $METHODS --change-p $PS $CEM
 python run_gridworld_experiments.py --grid cliffwalking --trials 30 --workers 5 --methods $METHODS --change-p $PS $CEM --orig-p 0.7
 ```
+
+**Act as You Learn 复现（线2）**：
+```bash
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+# 新 grid 的 p=0.7 预训练（只需做一次，已完成，VERDICT GOOD）
+python pretrain_gridworld.py --grid cliffwalking_aayl --p 0.7 --epochs 400
+# 正式复现
+python run_gridworld_experiments.py --grid cliffwalking_aayl --orig-p 0.7 \
+  --methods ada_mcts --change-p 0.4 0.5 0.6 0.8 0.9 1.0 \
+  --trials 30 --workers 7 --ada-n-threshold 50 --ada-iid-trials
+```
+- 新 grid `cliffwalking_aayl`（`grids.py`）：地图与 `cliffwalking` 相同，
+  但 `cliff_to_start=False` + `hole_reward=-1.0`（悬崖=终止洞，付 −1）。
+- 新 checkpoint：`data/cliffwalking_aayl/bnn_dirichlet_cliffwalking_aayl_k3_p0p7.pth`。
+- 新 CLI：`--ada-n-threshold`（默认 3，不变；论文值 50）、`--ada-iid-trials`
+  （默认关，不变）。
+- `planning/base.py`：不传 `hole_reward` 时改为从 `bnn.grid` 读（旧 grid 全
+  是 0.0，行为逐位不变，已验证），且洞的终止价值 `cell_value[H]` 也改成
+  `hole_reward`（否则树内把坠崖记 0、rollout 里记 −1，自相矛盾）。
 
 **检查资源的标准命令（每次跑实验前必做）**：
 ```bash

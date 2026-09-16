@@ -721,17 +721,20 @@ class ADAMCTS:
     name = "ada_mcts"
 
     def __init__(self, bnn, dyn, grid, gamma=GAMMA, m_simulations=M_SIMULATIONS,
-                 change_step=0, rng=None, dpas_gamma=DPAS_GAMMA, counts=True):
+                 change_step=0, rng=None, dpas_gamma=DPAS_GAMMA, counts=True,
+                 n_threshold=3, iid_trials=False):
         self.bnn = bnn
         self.grid = grid
         self.change_step = change_step
         self.counts = counts
+        self.iid_trials = iid_trials
         self.rng = rng or np.random.default_rng(0)
         self._agent = ADAMCTSAgent(dyn, bnn, grid.desc_bytes(), device,
                                    n_actions=grid.n_actions, gamma=gamma,
                                    rng=self.rng,
                                    m_simulations=m_simulations,
-                                   dpas_gamma=dpas_gamma)
+                                   dpas_gamma=dpas_gamma,
+                                   n_threshold=n_threshold)
         self._notified = False
 
     def reset(self):
@@ -739,11 +742,17 @@ class ADAMCTS:
         self.bnn.retain.fill_(1.0)
         self.bnn.reset_counts()
         self._agent.reset()
-        # NOTE: do NOT reset _notified here.  The env changes once per phase
-        # (ts 0), so notify_change must fire once per phase -- per-trial
-        # re-notify re-snapshots M_{k-1} every episode and keeps DPAS stuck in
-        # worst-case mode (on bridge this one-hots holes near the goal and
-        # collapses the goal rate to ~0.1-0.5).
+        # NOTE: do NOT reset _notified here by default.  The env changes once
+        # per phase (ts 0), so notify_change must fire once per phase -- per-
+        # trial re-notify keeps DPAS in its worst-case warm-up every episode
+        # (on bridge this one-hots holes near the goal and collapses the goal
+        # rate to ~0.1-0.5).  iid_trials=True opts into exactly that: each trial
+        # is an independent run with its own N_threshold warm-up, the paper's
+        # per-seed protocol (Act As You Learn reproduction, 2026-09-15).
+        # notify_change() keeps an existing bnn_prev, so M_{k-1} stays the
+        # pretrained snapshot either way.
+        if self.iid_trials:
+            self._notified = False
         self._last = None
 
     def observe(self, s, a, s2):
@@ -837,7 +846,9 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
             out[name] = ADAMCTS(bnn, dyn, grid, gamma=GAMMA,
                                 m_simulations=args.m_simulations,
                                 change_step=change_step,
-                                dpas_gamma=args.dpas_gamma)
+                                dpas_gamma=args.dpas_gamma,
+                                n_threshold=getattr(args, "ada_n_threshold", 3),
+                                iid_trials=getattr(args, "ada_iid_trials", False))
         elif name == "cem_fir":
             out[name] = BNNCEM(bnn, dyn, grid,
                                gamma=args.cem_plan_gamma or GAMMA,
@@ -1037,6 +1048,13 @@ def main():
     ap.add_argument("--max-steps", type=int, default=None)
     ap.add_argument("--m-simulations", type=int, default=M_SIMULATIONS)
     ap.add_argument("--dpas-gamma", type=float, default=DPAS_GAMMA)
+    ap.add_argument("--ada-n-threshold", type=int, default=3,
+                    help="ada_mcts: post-change samples before DPAS leaves its "
+                         "forced worst-case phase (paper N_threshold = 50)")
+    ap.add_argument("--ada-iid-trials", action="store_true",
+                    help="ada_mcts: restart the post-change state every trial "
+                         "(paper's independent-run protocol) instead of once "
+                         "per phase")
     ap.add_argument("--k-forget", type=int, default=K_FORGET)
     ap.add_argument("--count-w", type=float, default=1.0)
     ap.add_argument("--persist-counts", action="store_true")
@@ -1158,7 +1176,11 @@ def main():
     log(f"  gamma={GAMMA} | rats_depth={args.rats_depth} dp_depth={args.dp_depth} "
         f"| max_steps={max_steps} | trials={args.trials} | workers={args.workers}")
     log(f"  methods: {methods}")
-    log(f"  ADA-MCTS: {args.m_simulations} simulations/action (paper value)")
+    log(f"  rewards: goal +1 | hole {grid.hole_reward:+g} "
+        f"({'teleport-to-start' if grid.cliff_to_start else 'terminal'}) | "
+        f"step {grid.step_penalty:+g}")
+    log(f"  ADA-MCTS: {args.m_simulations} simulations/action (paper value) | "
+        f"n_threshold={args.ada_n_threshold} iid_trials={args.ada_iid_trials}")
     if args.conc_prior is not None:
         log(f"  CONC_PRIOR override: {args.conc_prior} (module default 0.1)")
     if not args.do_forget or args.n_unfrozen > 0:
@@ -1173,6 +1195,8 @@ def main():
                persist_counts=args.persist_counts, count_w=args.count_w,
                drift_reset=args.drift_reset,
                m_simulations=args.m_simulations, dpas_gamma=args.dpas_gamma,
+               ada_n_threshold=args.ada_n_threshold,
+               ada_iid_trials=args.ada_iid_trials,
                cem_horizon=args.cem_horizon, cem_alpha_min=args.cem_alpha_min,
                cem_n_confident=args.cem_n_confident,
                cem_cvar_alpha=args.cem_cvar_alpha,
@@ -1237,8 +1261,9 @@ def main():
             if phase != "stationary":
                 p_val = float(phase.split("=")[1])
                 summary.setdefault(name, {})[p_val] = (np.mean(Gs), np.mean(goals))
-            log(f"  [{phase:<8s}] {name:<18s}: return {np.mean(Gs):+.3f} | "
-                f"goal rate {np.mean(goals):.3f}")
+            se = np.std(Gs, ddof=1) / np.sqrt(len(Gs)) if len(Gs) > 1 else 0.0
+            log(f"  [{phase:<8s}] {name:<18s}: return {np.mean(Gs):+.3f} "
+                f"(se {se:.3f}) | goal rate {np.mean(goals):.3f}")
             if res["trial0"] is not None:
                 log(f"      per-step rewards (trial 0): "
                     f"{[round(r, 1) for r in res['trial0']]}")

@@ -64,6 +64,7 @@ class ADAMCTSAgent(BNNModelPlanner):
                  eps_a=EPS_A,
                  dpas_gamma=DPAS_GAMMA,
                  h_rollout=H_ROLLOUT,
+                 n_threshold=3,
                  **kwargs):
         super().__init__(dynamics_model, bnn, desc, device,
                          n_actions=n_actions, gamma=gamma, rng=rng, **kwargs)
@@ -90,7 +91,9 @@ class ADAMCTSAgent(BNNModelPlanner):
         # Post-change tracking
         self._post_change_steps = 0
         self._training_started = True   # starts True (pre-change, trust model)
-        self._n_threshold = 3  # min post-change samples before switching mode
+        # min post-change samples before leaving the forced worst-case phase
+        # (paper's N_threshold = 50; 3 is this port's historical default)
+        self._n_threshold = int(n_threshold)
         self._last_dpas_mode = "reg"  # track DPAS decisions for logging
         self._wc_count = 0            # worst-case samples drawn this act()
         self._reg_count = 0           # regular samples drawn this act()
