@@ -307,7 +307,8 @@ class BNNCEM:
                  n_rollouts=None, n_cem_iters=None, warm_blend=0.0,
                  do_forget=True, n_unfrozen=0, retrain_every=3,
                  retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64,
-                 seed=0, retrain_min_conf=0.0):
+                 seed=0, retrain_min_conf=0.0, rho_floor=1e-3,
+                 retain_floor=0.0):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -339,6 +340,10 @@ class BNNCEM:
         # recovered lets forget do the early work and retrain only sharpen
         # an already-reasonable belief.
         self.retrain_min_conf = float(retrain_min_conf)
+        # Gentler-forgetting knobs (2026-09-16).  Defaults = original behaviour;
+        # see bnn/dirichlet_workflow.forget_dirichlet for what each bounds.
+        self.rho_floor = float(rho_floor)
+        self.retain_floor = float(retain_floor)
         self.retrain_buf_cap = int(retrain_buf_cap)
         # Gradient retrain mutates weight_mu/bias_mu IN PLACE, and the bnn object
         # is shared across all trials in a _worker -- retain/counts are reset in
@@ -454,7 +459,8 @@ class BNNCEM:
 
     def _forget(self):
         from bnn.dirichlet_workflow import forget_dirichlet
-        forget_dirichlet(self.bnn, self.drift)
+        forget_dirichlet(self.bnn, self.drift, rho_floor=self.rho_floor,
+                         retain_floor=self.retain_floor)
         # FIR-CEM specific: after forgetting, the model no longer matches the OLD
         # env by construction, so the stale-env surprise is no longer informative.
         # Reset the drift accumulator so conf_surprise recovers on the NEW-env
@@ -861,6 +867,8 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                gamma=args.cem_plan_gamma or GAMMA,
                                change_step=change_step,
                                k_forget=args.k_forget,
+                               rho_floor=getattr(args, "rho_floor", 1e-3),
+                               retain_floor=getattr(args, "retain_floor", 0.0),
                                use_counts=args.use_counts,
                                persist_counts=args.persist_counts,
                                count_w=args.count_w,
@@ -1071,6 +1079,19 @@ def main():
                          "risk of a -1 hole makes hovering optimal (measured: "
                          "goal rate 0.000 on cliffwalking_aayl)")
     ap.add_argument("--k-forget", type=int, default=K_FORGET)
+    ap.add_argument("--rho-floor", type=float, default=1e-3,
+                    help="cem_fir: lower bound on ONE forget tick's shrink "
+                         "factor rho = 1/max(delta_bar,1).  Default 1e-3 lets a "
+                         "single huge surprise crush retain 1000x; raise it "
+                         "(e.g. 0.5) to forget gradually.  Only affects methods "
+                         "whose retain actually decays (cem_fir)")
+    ap.add_argument("--retain-floor", type=float, default=0.0,
+                    help="cem_fir: hard lower bound on retain itself -- a "
+                         "guaranteed residual trust in the pretrained belief no "
+                         "matter how much surprise accumulates.  Targets the "
+                         "known failure mode where MILD changes (p=0.9, prior "
+                         "still ~90%% right) end up worse than severe ones "
+                         "because retain collapses to ~0 regardless")
     ap.add_argument("--count-w", type=float, default=1.0)
     ap.add_argument("--persist-counts", action="store_true")
     # Fixed 2026-08-06: drift_reset on by default (forget actually fires) and
@@ -1203,6 +1224,9 @@ def main():
         log(f"  cem_fir SFIR ablation: do_forget={args.do_forget} "
             f"n_unfrozen={args.n_unfrozen} retrain_every={args.retrain_every} "
             f"retrain_steps={args.retrain_steps} retrain_lr={args.retrain_lr}")
+    if args.rho_floor != 1e-3 or args.retain_floor != 0.0:
+        log(f"  cem_fir gentler forgetting: rho_floor={args.rho_floor} "
+            f"retain_floor={args.retain_floor}")
     log("=" * 90)
 
     # ── build (phase, method) tasks ─────────────────────────────────────────
@@ -1230,7 +1254,8 @@ def main():
                do_forget=args.do_forget, n_unfrozen=args.n_unfrozen,
                retrain_every=args.retrain_every,
                retrain_steps=args.retrain_steps, retrain_lr=args.retrain_lr,
-               retrain_min_conf=args.retrain_min_conf, seed=args.seed)
+               retrain_min_conf=args.retrain_min_conf, seed=args.seed,
+               rho_floor=args.rho_floor, retain_floor=args.retain_floor)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
