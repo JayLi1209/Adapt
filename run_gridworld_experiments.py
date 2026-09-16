@@ -722,7 +722,8 @@ class ADAMCTS:
 
     def __init__(self, bnn, dyn, grid, gamma=GAMMA, m_simulations=M_SIMULATIONS,
                  change_step=0, rng=None, dpas_gamma=DPAS_GAMMA, counts=True,
-                 n_threshold=3, iid_trials=False):
+                 n_threshold=3, iid_trials=False, rollout_to_terminal=False,
+                 max_rollout_steps=100):
         self.bnn = bnn
         self.grid = grid
         self.change_step = change_step
@@ -734,7 +735,9 @@ class ADAMCTS:
                                    rng=self.rng,
                                    m_simulations=m_simulations,
                                    dpas_gamma=dpas_gamma,
-                                   n_threshold=n_threshold)
+                                   n_threshold=n_threshold,
+                                   rollout_to_terminal=rollout_to_terminal,
+                                   max_rollout_steps=max_rollout_steps)
         self._notified = False
 
     def reset(self):
@@ -848,7 +851,11 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                 change_step=change_step,
                                 dpas_gamma=args.dpas_gamma,
                                 n_threshold=getattr(args, "ada_n_threshold", 3),
-                                iid_trials=getattr(args, "ada_iid_trials", False))
+                                iid_trials=getattr(args, "ada_iid_trials", False),
+                                rollout_to_terminal=getattr(
+                                    args, "ada_rollout_to_terminal", False),
+                                max_rollout_steps=getattr(
+                                    args, "max_steps", None) or 100)
         elif name == "cem_fir":
             out[name] = BNNCEM(bnn, dyn, grid,
                                gamma=args.cem_plan_gamma or GAMMA,
@@ -1055,6 +1062,14 @@ def main():
                     help="ada_mcts: restart the post-change state every trial "
                          "(paper's independent-run protocol) instead of once "
                          "per phase")
+    ap.add_argument("--ada-rollout-to-terminal", action="store_true",
+                    help="ada_mcts: roll out until a terminal cell with NO "
+                         "gamma^dist leaf bootstrap (upstream adamcts.py's "
+                         "behaviour).  Required whenever holes pay a negative "
+                         "reward: with the bootstrap, 'wander forever' is "
+                         "worth ~0.9987 vs 1.0 for reaching the goal, so any "
+                         "risk of a -1 hole makes hovering optimal (measured: "
+                         "goal rate 0.000 on cliffwalking_aayl)")
     ap.add_argument("--k-forget", type=int, default=K_FORGET)
     ap.add_argument("--count-w", type=float, default=1.0)
     ap.add_argument("--persist-counts", action="store_true")
@@ -1180,7 +1195,8 @@ def main():
         f"({'teleport-to-start' if grid.cliff_to_start else 'terminal'}) | "
         f"step {grid.step_penalty:+g}")
     log(f"  ADA-MCTS: {args.m_simulations} simulations/action (paper value) | "
-        f"n_threshold={args.ada_n_threshold} iid_trials={args.ada_iid_trials}")
+        f"n_threshold={args.ada_n_threshold} iid_trials={args.ada_iid_trials} "
+        f"rollout_to_terminal={args.ada_rollout_to_terminal}")
     if args.conc_prior is not None:
         log(f"  CONC_PRIOR override: {args.conc_prior} (module default 0.1)")
     if not args.do_forget or args.n_unfrozen > 0:
@@ -1197,6 +1213,8 @@ def main():
                m_simulations=args.m_simulations, dpas_gamma=args.dpas_gamma,
                ada_n_threshold=args.ada_n_threshold,
                ada_iid_trials=args.ada_iid_trials,
+               ada_rollout_to_terminal=args.ada_rollout_to_terminal,
+               max_steps=max_steps,
                cem_horizon=args.cem_horizon, cem_alpha_min=args.cem_alpha_min,
                cem_n_confident=args.cem_n_confident,
                cem_cvar_alpha=args.cem_cvar_alpha,

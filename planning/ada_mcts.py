@@ -65,6 +65,8 @@ class ADAMCTSAgent(BNNModelPlanner):
                  dpas_gamma=DPAS_GAMMA,
                  h_rollout=H_ROLLOUT,
                  n_threshold=3,
+                 rollout_to_terminal=False,
+                 max_rollout_steps=100,
                  **kwargs):
         super().__init__(dynamics_model, bnn, desc, device,
                          n_actions=n_actions, gamma=gamma, rng=rng, **kwargs)
@@ -76,6 +78,8 @@ class ADAMCTSAgent(BNNModelPlanner):
         self.eps_a = eps_a
         self.dpas_gamma = dpas_gamma
         self.h_rollout = h_rollout
+        self.rollout_to_terminal = rollout_to_terminal
+        self.max_rollout_steps = max_rollout_steps
 
         # M_{k-1} frozen snapshot (created at change notification)
         self.bnn_prev = None
@@ -274,11 +278,33 @@ class ADAMCTSAgent(BNNModelPlanner):
 
     # ── rollout ──────────────────────────────────────────────────────────────
     def _rollout(self, s0):
-        """Uniform random rollout from s0 using M_k model, for H_ROLLOUT steps."""
+        """Uniform random rollout from s0 using the M_k model.
+
+        Default (`rollout_to_terminal=False`): h_rollout steps, then bootstrap
+        the leaf with the gamma^dist heuristic.
+
+        `rollout_to_terminal=True` instead runs until a terminal cell (capped
+        at max_rollout_steps) and gives an unterminated rollout the value 0 --
+        upstream adamcts.py's behaviour (its rollout loops `while not done`
+        with no bootstrap at all).
+
+        The difference is decisive whenever a hole carries a NEGATIVE reward.
+        At gamma=0.9999 the gamma^dist bootstrap makes "wander forever" worth
+        ~0.9987 against "reach the goal" worth 1.0 -- a margin of 0.0013 that
+        any real risk of a -1 hole swamps, so hovering becomes the optimal
+        policy and the agent never finishes (measured on cliffwalking_aayl:
+        goal rate 0.000 even in the unchanged stationary environment, where it
+        should be ~1.0).  With holes at 0 and cliff_to_start=True the holes are
+        unreachable in the model, nothing is negative, and the same 0.0013
+        margin is enough to steer -- which is why the main table never hit
+        this.
+        """
         total = 0.0
         disc = 1.0
         s = s0
-        for _ in range(self.h_rollout):
+        limit = (self.max_rollout_steps if self.rollout_to_terminal
+                 else self.h_rollout)
+        for _ in range(limit):
             if self.terminal[s]:
                 break
             a = self.rng.integers(0, self.n_actions)
@@ -287,7 +313,7 @@ class ADAMCTSAgent(BNNModelPlanner):
             total += disc * float(self.cell_reward[s2])
             s = s2
             disc *= self.gamma
-        if not self.terminal[s]:
+        if not self.terminal[s] and not self.rollout_to_terminal:
             total += disc * float(self.heuristic[s])
         return total
 
