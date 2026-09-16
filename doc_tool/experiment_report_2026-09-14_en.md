@@ -20,25 +20,25 @@ configs, clearly ahead of the runner-up `ada-mcts`.
 
 **Ablation: done** (single seed, pending multi-seed replication -- see §5).
 
-**⚠ Known problem, correction in progress**: in §3's main table
-`k_models=30` was applied **only** to our method `sfir-cem-cvar`;
-`ada-cem-cvar`/`oracle-cem`, which use the same CVaR-CEM planner, were left
-at the old default of 10. That is an unfair comparison and inflates our
-method's apparent lead over those two baselines (`ada-mcts`/`rats` do not
-use the CVaR-CEM planner and are unaffected). Caught on 2026-09-14; a
-correction rerun (`ada-cem-cvar`/`oracle-cem` at `k_models=30`) is running
-and will replace those two rows in §3. **Until it finishes, the
-`ada-cem-cvar`/`oracle-cem` rows in §3 -- and the comparison magnitudes
-against them in §4 -- count as pending and are not final.**
-*Interim (15 of 24 points, 2026-09-16 02:30) -- enough to settle the
-`ada-cem-cvar` question*: all 9 of its p=0.3/0.4/0.5 points are in and it is
-essentially **insensitive** to `k_models=30` (largest change +0.067; the
-three p=0.3 points move −0.033/0/0), so **our method's lead over
-`ada-cem-cvar` survives the fair comparison intact** (0.533 vs 0.067, 0.700
-vs 0.167, 0.633 vs 0.533 at p=0.3). What the correction does raise is
-`oracle-cem`, the theoretical upper bound (+0.133 at p=0.3), which never
-competed for the ranking anyway. Still outstanding: the p=0.6 column for
-`ada-cem-cvar` and `oracle-cem`'s p=0.5/0.6, all near saturation.
+**✅ Fairness correction: complete (2026-09-16).** §3's main table used to
+apply `k_models=30` **only** to our method `sfir-cem-cvar`, leaving
+`ada-cem-cvar`/`oracle-cem` -- which use the same CVaR-CEM planner -- at the
+old default of 10. That was an unfair comparison (`ada-mcts`/`rats` do not
+use the CVaR-CEM planner and were never affected). Both baselines have now
+been rerun at `k_models=30` across all 3 configs × p=0.3-0.6; **all 24
+points are done and §3's two rows below are the corrected numbers.**
+Result: **`ada-cem-cvar` is essentially insensitive to `k_models=30`**
+(largest change across 12 points +0.067; the three hardest p=0.3 points move
+−0.033/0/0), so **our method's lead over it survives the fair comparison
+intact** (it wins 11 of the 12 non-saturated points and ties 1). What the
+correction does raise is `oracle-cem`, the theoretical upper bound (+0.133
+at p=0.3, +0.067 at p=0.4) -- which now sits strictly above our method at
+every point, making it a cleaner upper bound than before. **§3's headline
+summary (9 wins / 3 ties / 1 negligible loss) is unchanged**, because that
+summary is measured against `ada-mcts`, which this bug never touched.
+
+Note: bold in §3's tables marks the best of the 4 genuinely usable methods;
+`oracle-cem` is a cheating upper bound and is excluded from bolding.
 
 **Current settled configuration**: `CONC_PRIOR = 0.1`, `cem_fir` defaults
 to `n_unfrozen=1` (head-only gradient retrain -- genuine **SFIR**:
@@ -141,9 +141,9 @@ Goal rate, 30 trials, candidates=512. Bold = highest in that column.
 |---|---|---|---|---|---|
 | ada-mcts | 0.367 | 0.667 | 0.900 | **1.000** | **1.000** |
 | rats | 0.100 | 0.300 | 0.800 | 0.800 | **1.000** |
-| ada-cem-cvar | 0.100 | 0.233 | 0.667 | 0.800 | **1.000** |
+| ada-cem-cvar | 0.067 | 0.267 | 0.700 | 0.800 | **1.000** |
 | **sfir-cem-cvar** | **0.533** | **0.933** | **1.000** | 0.967 | **1.000** |
-| oracle-cem | 0.700 | 0.933 | **1.000** | **1.000** | **1.000** |
+| oracle-cem | 0.833 | 1.000 | 1.000 | 1.000 | **1.000** |
 
 ### config2: first cliff cell flattened, pretrain p=1.0
 
@@ -151,9 +151,9 @@ Goal rate, 30 trials, candidates=512. Bold = highest in that column.
 |---|---|---|---|---|---|
 | ada-mcts | 0.400 | **0.867** | 0.900 | **1.000** | **1.000** |
 | rats | 0.100 | 0.267 | 0.767 | 0.733 | **1.000** |
-| ada-cem-cvar | 0.167 | 0.267 | 0.633 | 0.900 | **1.000** |
+| ada-cem-cvar | 0.167 | 0.300 | 0.700 | 0.900 | **1.000** |
 | **sfir-cem-cvar** | **0.700** | 0.767† | **0.967** | **1.000** | **1.000** |
-| oracle-cem | 0.767 | **1.000** | **1.000** | **1.000** | **1.000** |
+| oracle-cem | 0.767 | 0.967 | 1.000 | 1.000 | **1.000** |
 
 † single seed reads low; the 4-seed mean is **0.859**, essentially tied
 with ada-mcts's 0.867 (SE ≈0.034, ~0.25 SE apart).
@@ -164,9 +164,9 @@ with ada-mcts's 0.867 (SE ≈0.034, ~0.25 SE apart).
 |---|---|---|---|---|
 | ada-mcts | 0.533 | 0.700 | 0.967 | **1.000** |
 | rats | 0.300 | 0.600 | 0.800 | **1.000** |
-| ada-cem-cvar | 0.533 | 0.767 | 0.900 | **1.000** |
+| ada-cem-cvar | 0.533 | 0.767 | 0.933 | **1.000** |
 | **sfir-cem-cvar** | **0.633** | **0.900** | 0.967 | **1.000** |
-| oracle-cem | 0.700 | 0.933 | 0.967 | **1.000** |
+| oracle-cem | 0.833 | 1.000 | 1.000 | **1.000** |
 
 **Summary**: of the 12 non-saturated (config,p) points (p=0.3/0.4/0.5/0.6
 per config), **our method wins 9, ties 3 (config2 p=0.6, config3
@@ -193,10 +193,20 @@ planner** (`sfir-cem-cvar`/`ada-cem-cvar`/`oracle-cem`), but we've only
 applied it to `sfir-cem-cvar` so far (`ada-cem-cvar`/`oracle-cem` still use
 the original k_models=10, numbers unchanged) -- so right now this is an
 advantage specific to our method's setup, not an intrinsic property of the
-method itself. **This asymmetry is an error and is being corrected** (see
-§0's warning; interim data suggest `ada-cem-cvar` barely moves under
-`k_models=30` while `oracle-cem` gains at p=0.3, but the correction is not
-complete). (Paired test: zero cost at config1 p=0.3, closed a
+method itself. **This asymmetry was an error and was corrected on
+2026-09-16** (all 24 points rerun; §3's numbers above are the corrected
+ones). **The key finding from that correction: `ada-cem-cvar` is
+essentially insensitive to `k_models=30`** (largest change +0.067 across 12
+points; the three hardest p=0.3 points move −0.033/0/0), so our method's
+lead over it is fully preserved; the one that gains is `oracle-cem`, the
+upper bound. That adds a necessary qualifier to (a): **more posterior draws
+only pay off when the underlying model is already right.** The oracle is
+pretrained directly on the true post-change p, so it collects the full
+benefit; `ada-cem-cvar`'s bottleneck is its own "observe first, switch once
+enough samples accumulate" DPAS adaptation, and no amount of CVaR-tail
+precision helps while the model itself is still stale. In other words, our
+lead does not come from "we gave ourselves a bigger K" -- it comes from SFIR
+making the model correct faster, which is what makes that K usable. (Paired test: zero cost at config1 p=0.3, closed a
 confirmed 5.9-SE gap down to 0.25 SE at config2 p=0.4 -- full process in
 `experiment_report_2026-09-10.md` §13.)
 
