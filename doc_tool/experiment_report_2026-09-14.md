@@ -68,6 +68,15 @@ CliffWalking 4×12，K=3 方向 `[intended, perp+, perp−]`，4 动作。起点
 penalty）。`cliff_to_start=True`：踏入 cliff 传送回起点，**不终止**——
 唯一终止状态是目标，episode 只能靠"到达目标"或"第100步截断"结束。
 
+**"holes=0"约定对 ADA-MCTS 基线的影响（2026-09-15 发现）**：ADA-MCTS 的
+风险规避步骤（`pessimistic_sample`：把可达格子里最差的那个 one-hot 掉）
+只在"可达格子中存在**负**奖励"时才触发。holes=0 时全图没有任何负奖励，
+所以这一步在本表中**从未触发**——这里的 `ada-mcts` 和 `ada-cem-cvar` 数字
+反映的是它们 DPAS 模型切换的行为，**不含**最坏情况采样阶段。这是奖励约定
+导致的，不是移植 bug（已在 `planning/ada_mcts.py::_worst_case_sample`
+核对）。按原作者自己的约定（holes=−1 且终止）该步骤会触发，那个设定正在
+`cliffwalking_aayl` 网格上由 Act as You Learn 复现实验单独测量。
+
 ### 2.3 架构与超参数
 
 **BNN 世界模型**：3 层 Bayesian trunk（52→256→256），方向头 256→3（K=3
@@ -157,7 +166,13 @@ SFIR 机制无关。** CVaR 是"K 个后验转移矩阵 × N 个 rollout 里最�
 （`sfir-cem-cvar`/`ada-cem-cvar`/`oracle-cem`）原则上都适用**，我们目前
 只给 `sfir-cem-cvar` 用了（`ada-cem-cvar`/`oracle-cem` 保持原来的
 k_models=10，数字未变），所以这一项改进目前是我们方法独有的优势，不是
-方法本质的差异。（配对实测：在 config1 p=0.3 上完全零代价，在 config2
+方法本质的差异。**这个不对称是错误，正在修正**（见第0节警告）。
+**修正的中间结果（15/24 点，2026-09-16 02:30）已能对 `ada-cem-cvar` 下
+结论**：它在 p=0.3/0.4/0.5 的全部 9 个点上对 `k_models=30` 几乎无感
+（最大变化 +0.067；三个 p=0.3 点为 −0.033/0/0），**本文方法相对它的领先
+完全保持**；真正被抬高的是 `oracle-cem` 这个理论上限（p=0.3 上 +0.133）。
+即：本节 (a) 所说的"这项改进目前是我们独有的优势"在数值上并没有夸大对
+`ada-cem-cvar` 的领先——把 K 给它，它也用不上。p=0.6 一档尚未跑完。（配对实测：在 config1 p=0.3 上完全零代价，在 config2
 p=0.4 上把一个 5.9 个标准误的真实差距抹平到 0.25 个标准误——过程见
 `experiment_report_2026-09-10.md` §13。）
 

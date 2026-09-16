@@ -18,9 +18,27 @@ or ties at **9 of 12 win/tie/1 negligible loss (off by 0.033, within
 noise)** non-saturated (config, p) points across the 3 NS-CliffWalking
 configs, clearly ahead of the runner-up `ada-mcts`.
 
-**Ablation: running, ~10-20 more hours expected.** This document fills in
-what's available now; once the ablation finishes I will update this same
-file (not create a new one).
+**Ablation: done** (single seed, pending multi-seed replication -- see §5).
+
+**⚠ Known problem, correction in progress**: in §3's main table
+`k_models=30` was applied **only** to our method `sfir-cem-cvar`;
+`ada-cem-cvar`/`oracle-cem`, which use the same CVaR-CEM planner, were left
+at the old default of 10. That is an unfair comparison and inflates our
+method's apparent lead over those two baselines (`ada-mcts`/`rats` do not
+use the CVaR-CEM planner and are unaffected). Caught on 2026-09-14; a
+correction rerun (`ada-cem-cvar`/`oracle-cem` at `k_models=30`) is running
+and will replace those two rows in §3. **Until it finishes, the
+`ada-cem-cvar`/`oracle-cem` rows in §3 -- and the comparison magnitudes
+against them in §4 -- count as pending and are not final.**
+*Interim (15 of 24 points, 2026-09-16 02:30) -- enough to settle the
+`ada-cem-cvar` question*: all 9 of its p=0.3/0.4/0.5 points are in and it is
+essentially **insensitive** to `k_models=30` (largest change +0.067; the
+three p=0.3 points move −0.033/0/0), so **our method's lead over
+`ada-cem-cvar` survives the fair comparison intact** (0.533 vs 0.067, 0.700
+vs 0.167, 0.633 vs 0.533 at p=0.3). What the correction does raise is
+`oracle-cem`, the theoretical upper bound (+0.133 at p=0.3), which never
+competed for the ranking anyway. Still outstanding: the p=0.6 column for
+`ada-cem-cvar` and `oracle-cem`'s p=0.5/0.6, all near saturation.
 
 **Current settled configuration**: `CONC_PRIOR = 0.1`, `cem_fir` defaults
 to `n_unfrozen=1` (head-only gradient retrain -- genuine **SFIR**:
@@ -66,6 +84,18 @@ bottom-right, cliff along the bottom row. Reward: goal `+1.0`; cliff `0.0`
 every other step `0.0`. `cliff_to_start=True`: stepping into the cliff
 teleports to Start, does **not** terminate -- the goal is the only terminal
 state; an episode ends only by reaching the goal or truncating at step 100.
+
+**What the "holes=0" convention implies for the ADA-MCTS baseline (noted
+2026-09-15)**: ADA-MCTS's risk-averse step (`pessimistic_sample`: one-hot
+the worst reachable cell) only fires when some reachable cell carries a
+*negative* reward. Under holes=0 no reward anywhere is negative, so that
+step **never fires** in this table: the `ada-mcts` and `ada-cem-cvar`
+numbers here reflect their DPAS model-switching behaviour *without* the
+worst-case sampling phase. This follows from the reward convention, not
+from a porting bug (verified in `planning/ada_mcts.py::_worst_case_sample`).
+Under the authors' own convention (holes = -1, terminal) the step does fire
+-- that setting is being measured separately in the Act-as-You-Learn
+reproduction run, on the `cliffwalking_aayl` grid.
 
 ### 2.3 Architecture and hyperparameters
 
@@ -163,7 +193,10 @@ planner** (`sfir-cem-cvar`/`ada-cem-cvar`/`oracle-cem`), but we've only
 applied it to `sfir-cem-cvar` so far (`ada-cem-cvar`/`oracle-cem` still use
 the original k_models=10, numbers unchanged) -- so right now this is an
 advantage specific to our method's setup, not an intrinsic property of the
-method itself. (Paired test: zero cost at config1 p=0.3, closed a
+method itself. **This asymmetry is an error and is being corrected** (see
+§0's warning; interim data suggest `ada-cem-cvar` barely moves under
+`k_models=30` while `oracle-cem` gains at p=0.3, but the correction is not
+complete). (Paired test: zero cost at config1 p=0.3, closed a
 confirmed 5.9-SE gap down to 0.25 SE at config2 p=0.4 -- full process in
 `experiment_report_2026-09-10.md` §13.)
 
@@ -207,40 +240,49 @@ on top.
 
 ---
 
-## 5. Ablation (running, launched 2026-09-14, ~10-20 more hours expected)
+## 5. Ablation: results (launched 2026-09-14, finished 2026-09-15, single seed)
 
 Following `main_cl_2.tex`'s "How effective is SFIR?" section, 6 variants,
-all on config1, p=0.3/0.4/0.5/0.6, candidates=512/trials=30 (same fidelity
-as §3's main table):
+all on config1, p=0.3/0.4/0.5/0.6, candidates=512/trials=30, k_models=30
+(same fidelity as §3's main table):
 
-| # | Variant | forget | retrain | Status |
-|---|---|---|---|---|
-| A | **SFIR (our method)** | ✓ | head only | running |
-| B | Retrain full (+forget) | ✓ | head+whole trunk | running |
-| C | No retrain (=SFI) | ✓ | ✗ | running |
-| D | No forget | ✗ | head only | running |
-| E | No forget + no retrain (Neither, Inflate only) | ✗ | ✗ | running |
-| F | No adapt (`cem_static`, no SFI) | — | — | running |
+| # | Variant | forget | retrain | p=0.3 | p=0.4 | p=0.5 | p=0.6 |
+|---|---|---|---|---|---|---|---|
+| A | **SFIR (our method)** | ✓ | head only | 0.533 | 0.933 | **1.000** | 0.967 |
+| B | Retrain full (+forget) | ✓ | head+whole trunk | 0.567 | 0.733 | 0.933 | 1.000 |
+| C | No retrain (=SFI, forget only) | ✓ | ✗ | **0.633** | 0.867 | 0.967 | 1.000 |
+| D | No forget (retrain only) | ✗ | head only | 0.600 | **0.967** | 0.933 | 1.000 |
+| E | Neither (no forget, no retrain; Inflate only) | ✗ | ✗ | **0.633** | 0.867 | 0.933 | 0.967 |
+| F | No adapt (`cem_static`) | — | — | 0.067 | 0.367 | 0.767 | 0.933 |
 
-**Progress (as of publishing this document)**: all 6 variants' stationary
-phase (p=1.0, no change) is done, goal rate 1.000 across the board, normal.
-The 4 informative points (p=0.3-0.6) are still computing. 18 workers
-sharing 16 cores, ~86% CPU/worker (healthy, not stuck).
+Bold = highest in that column.
 
-**Why this is slow**: `k_models=30` triples the CVaR estimate's compute
-cost; a similarly-sized full 8-point config1 main table (15 workers) took
-~11.5h earlier. This ablation only covers 4 p-points but runs 6 variants at
-once (some, like Retrain-full, do more gradient steps per call; No-forget
-variants may run longer episodes), so expect **another 10-20 hours**,
-possibly spanning overnight.
+**Honest conclusions (including the parts that do not favour us)**:
 
-**How this document will be updated once done**: fill in the full 6x4
-table directly in this section, plus a mechanism read-through matching §4
-(e.g. whether "Neither" still dominates the way it did under the old
-CONC_PRIOR=1.0/k_models=10 settings -- earlier exploration found that
-ranking flips with CONC_PRIOR, worth reconfirming under the final settings).
-No new file will be created -- this same
-`experiment_report_2026-09-14.md` gets edited in place.
+1. **"Adapt at all vs. don't" matters enormously, and the evidence is
+   clean**: F (no adaptation) is far behind at all 4 points (just 0.067 at
+   p=0.3); every one of A-E beats it by a wide margin. This conclusion is
+   solid.
+2. **But on "which adaptation mechanism," SFIR (A) is not uniformly best**:
+   at p=0.3, C (forget only) and E (Neither) both reach 0.633 vs A's 0.533,
+   about 0.1 higher; at p=0.4, D (retrain only) reaches 0.967 vs A's 0.933;
+   A is strictly best only at p=0.5; at p=0.6 three variants (B/C/D) reach
+   1.000 while A's 0.967 is within noise of them. **This is the same
+   pattern found earlier in this investigation (under `CONC_PRIOR=1.0`, see
+   `experiment_report_2026-09-10.md` §11-12) where "Neither" beat SFIR --
+   smaller under the final settings (`CONC_PRIOR=0.1` + `k_models=30`), but
+   not gone.**
+3. **This is single-seed data (seed=0).** This investigation has already
+   shown that gaps of exactly this size (0.03-0.1) are frequently noise: of
+   8 previously "lost" points, 7 flipped to a win/tie after multi-seed
+   averaging (§12). The ordering in this table -- especially C/E's 0.1 lead
+   over A at p=0.3 -- **has not been multi-seed replicated and must not be
+   treated as a final conclusion**; it is a preliminary signal needing
+   confirmation.
+
+**Next step**: once the §3 `k_models` fairness correction (see §0's
+warning) finishes and frees up compute, replicate all 6 variants across 4
+seeds and revisit this section's ranking.
 
 ---
 
