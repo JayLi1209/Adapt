@@ -298,20 +298,41 @@ config3（预训练p=0.7）：
 后真实 p 的 checkpoint，与预训练 p 无关），p=0.3 两边都得 0.833、p=0.4 两
 边都得 1.000，可作确定性自检。
 
-### 线2：Act as You Learn（ADA-MCTS）复现（20:50 启动）
+### 线2：Act as You Learn（ADA-MCTS）复现
 
-- PID 2265972，`--workers 7`（stationary + 6 个 p 点，每个 phase 一个
-  worker）。完整命令见"关键文件与命令"。
+**第一次跑（2026-09-15 20:50 启动）已作废并终止，原因见下。第二次跑
+2026-09-16 08:53 启动，PID 2689143，`--workers 7`，机器此时已全空。**
+
 - 论文参数：30000 模拟/动作、N_threshold=50、eps_E=0.02、eps_A=0、
-  γ=0.9999、预训练 p=0.7、p∈{0.4,0.5,0.6,0.8,0.9,1.0}、30 trials。
-- 日志：`$SCRATCH/aayl_repro_ada_mcts.log`；逐行实时结果在
+  γ=0.9999、预训练 p=0.7、p∈{0.4,0.5,0.6,0.8,0.9,1.0}、30 trials，
+  **外加 `--ada-rollout-to-terminal`**（见下）。完整命令见"关键文件与命令"。
+- 日志：`$SCRATCH/aayl_repro_v2.log`；逐行实时结果在
   `gridworld_cliffwalking_aayl_results.log`（runner 每行 flush，stdout 反
   而会被缓冲，查进度要看这个文件）。
-- ETA：30000 模拟下每个动作约 7 秒，episode 上限 100 步 → 单 trial 最坏约
-  12 分钟，30 trials ≈ 6 小时/任务；7 任务并行且与线1 抢 CPU，预计
-  **8-12 小时，2026-09-16 上午**出全部结果。
-- **并行代价**：两条线合计 22 进程抢 16 核，线1 会因此慢约 30%。用户明确
-  要求并行（线2 被 collaborator 标为"目前最重要"），已接受这个代价。
+- ETA：实测约 4-5 分钟/trial（到达目标后 episode 只有十几到几十步），
+  30 trials ≈ 2.5 小时/任务，7 任务并行 → 预计 **2026-09-16 11:30-12:30**。
+
+**第一次跑为什么作废（重要，别再犯）**
+
+它的 **stationary 阶段（p=0.7，环境根本没变，是预训练模型自己的环境）
+goal rate = 0.000**，trial 0 的 100 步全是 0 奖励——纯徘徊。这是 sanity
+check，失败就说明设置有问题，不是"ADA-MCTS 不行"。跑了 8.5 小时才发现，
+因为 runner 只在整个任务的 30 个 trial 全部跑完后才打印结果。
+
+根因在**我们移植版的叶子兜底**，不在 ADA-MCTS：`_rollout` 只走 6 步就用
+`heuristic = γ^dist` 兜底，而 γ=0.9999 时它对所有非终止格都 ≈0.9987。于是
+"永远晃"值 0.9987、"走到目标"值 1.0，**差距只有 0.0013**；而碰到 −1 的洞
+要损失约 2.0。在这个价值函数下徘徊**确实是最优策略**——智能体没错，是我们
+给的价值函数错了。主表（holes=0）从没暴露这个问题，因为 `cliff_to_start=
+True` 时 `grid.move` 把落入悬崖映射回起点，**规划器模型里悬崖格根本不可
+达**，全图没有负值，那 0.0013 的微弱梯度就够用了。
+
+官方 `adamcts.py` 的 rollout 是 `while not done` 一直跑到终止、**完全没有
+兜底**，所以"没走完"的 rollout 值 ≈0。新增可选开关
+`--ada-rollout-to-terminal` 复现这一行为（默认关闭，主表逐位不变）。
+
+**修复已验证**：同样设置、同样 30000 模拟，stationary 从 0.000 →
+**goal rate 1.000（return +0.997，se 0.000）**。提交 `b15bdcb`。
 
 ---
 
@@ -443,10 +464,11 @@ python run_gridworld_experiments.py --grid cliffwalking --trials 30 --workers 5 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 # 新 grid 的 p=0.7 预训练（只需做一次，已完成，VERDICT GOOD）
 python pretrain_gridworld.py --grid cliffwalking_aayl --p 0.7 --epochs 400
-# 正式复现
+# 正式复现（v2：必须带 --ada-rollout-to-terminal，否则 stationary 就是 0.000）
 python run_gridworld_experiments.py --grid cliffwalking_aayl --orig-p 0.7 \
   --methods ada_mcts --change-p 0.4 0.5 0.6 0.8 0.9 1.0 \
-  --trials 30 --workers 7 --ada-n-threshold 50 --ada-iid-trials
+  --trials 30 --workers 7 --ada-n-threshold 50 --ada-iid-trials \
+  --ada-rollout-to-terminal
 ```
 - 新 grid `cliffwalking_aayl`（`grids.py`）：地图与 `cliffwalking` 相同，
   但 `cliff_to_start=False` + `hole_reward=-1.0`（悬崖=终止洞，付 −1）。
@@ -533,3 +555,22 @@ pgrep -af "run_gridworld_experiments.py" | grep -v grep
 11. **每次跑实验前按CLAUDE.md检查资源**：
     `nvidia-smi --query-gpu=... ; pgrep -f sweep_dirichlet_layers.py | wc -l`，
     选空闲的资源再跑。
+12. **stationary（不变环境）那一档是 sanity check，必须第一时间看**：
+    它应该接近 1.000，一旦是 0.000 就说明设置坏了，整个 run 作废，
+    继续等其余 p 点纯属浪费。本轮为此白跑 8.5 小时。**新设定的第一次跑，
+    先用极少 trial 把 stationary 跑出来当闸门，通过了再铺开全量。**
+13. **γ=0.9999 会让 `γ^dist` 形式的叶子启发式彻底失效**：所有非终止格都
+    ≈0.9987，"永远晃"和"走到目标"（1.0）只差 0.0013。只要环境里出现任何
+    负奖励（量级 ~1.0），徘徊就成了最优解。**判断规则**：改奖励结构
+    （尤其引入负奖励）时，必须同时检查规划器的叶子价值/启发式是否还能
+    区分"完成任务"和"什么都不做"，这两者的差必须远大于风险项才有意义。
+14. **`cliff_to_start=True` 会让悬崖格在规划器模型里完全不可达**
+    （`grid.move` 把落点映射回起点，`build_dir_cells` 因此不含悬崖），
+    所以 holes=0 的主表里任何"踩坑惩罚/悲观采样"机制都是空转。换成
+    终止型洞（`cliff_to_start=False`）后这些机制才会真正生效——两套设定
+    下的结论不能互相套用。
+15. **kill 进程时绝不能用 `pgrep -f "<含命令文本的字符串>"`**：运行该命令
+    的 bash 自己的命令行里就含这个字符串，会被匹配到并自杀（本轮踩过，
+    表现为命令无输出、退出码 1）。用
+    `ps -eo pid,comm,args --no-headers | awk '$2=="python" && /关键字/ {print $1}'`
+    按 `comm` 过滤，再对每个父进程 `pkill -P` + `kill -9`。
