@@ -1288,7 +1288,7 @@ def main():
 
     # ── summary table ──────────────────────────────────────────────────────
     log("\n" + "=" * 90)
-    log("SUMMARY: goal rate by p (paper's return convention, holes = 0)")
+    log(f"SUMMARY: goal rate by p (holes = {grid.hole_reward:g})")
     log("-" * 90)
     header = f"{'method':<18s}"
     for p in change_ps:
