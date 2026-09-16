@@ -188,6 +188,29 @@ python run_gridworld_experiments.py --grid cliffwalking_aayl --orig-p 0.7 \
 
 ---
 
+## 6b. 具体 setting 在代码里的位置（供查证）
+
+代码仓库：`JayLi1209/Adapt`，分支 `steven202_20260713_v2`。相关文件：
+
+| 内容 | 位置 |
+|---|---|
+| 环境定义（4×12 地图、悬崖终止、hole=−1） | `grids.py` → `CLIFFWALKING_4x12_AAYL`（`name="cliffwalking_aayl"`） |
+| ADA-MCTS 算法本体（DPAS、悲观采样、rollout） | `planning/ada_mcts.py` → `ADAMCTSAgent` |
+| DPAS 判据（对齐 upstream `adamcts.py` 的 `Node.expand`） | `planning/ada_mcts.py` → `_dpas()` |
+| 悲观采样（只在可达格有负奖励时触发） | `planning/ada_mcts.py` → `_worst_case_sample()` |
+| rollout（本次修复的地方） | `planning/ada_mcts.py` → `_rollout()`，开关 `rollout_to_terminal` |
+| 奖励/终止/叶子价值表的构建 | `planning/base.py` → `BNNModelPlanner.__init__`（`cell_reward` / `cell_value` / `terminal` / `heuristic`） |
+| 实验驱动、每个 trial 的 episode 循环 | `run_gridworld_experiments.py` → `ADAMCTS`、`run_episode()`、`_worker()` |
+| 预训练 | `pretrain_gridworld.py` |
+| 原作者代码（未改动，供对照） | submodule `ADA-MCTS/`（`adamcts.py` 的 `rollout` / `pessimistic_sample` / `discount_factor`） |
+
+关键常量（`planning/ada_mcts.py` 顶部）：`M_SIMULATIONS=30000`、`EPS_E=0.02`、
+`EPS_A=0.0`、`DPAS_GAMMA=10000.0`、`N_POSTERIOR=10`、`CP=sqrt(2)`。
+本次复现额外用到的三个开关：`--ada-n-threshold 50`、`--ada-iid-trials`、
+`--ada-rollout-to-terminal`（三者默认值都保持旧行为，主表数字逐位不变）。
+
+---
+
 ## 7. 保留的限定（不要过度解读本报告）
 
 1. **单种子、每点 30 次试验**；低 p 点（0.4、0.7）的标准误约 0.15。
