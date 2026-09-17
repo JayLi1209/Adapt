@@ -73,18 +73,37 @@ def surprise_dirichlet(dyn, bnn, obs, action, next_obs, reward, n_draws=20):
                 p_reached=float(p_bar[s2].item()))
 
 
-def forget_dirichlet(bnn, drift_filter):
+def forget_dirichlet(bnn, drift_filter, rho_floor=1e-3, retain_floor=0.0):
     """Dirichlet-native re-inflation: retain the head's alpha toward the SYMMETRIC
     prior, which pulls the predictive mean toward uniform (so surprise drops).
 
-        retain <- retain * rho,    rho = 1 / max(delta_bar, 1)  in (0, 1].
+        retain <- max(retain * rho, retain_floor),
+        rho = clip(1 / max(delta_bar, 1), rho_floor, 1]
 
     rho == 1 (delta_bar <= 1, "nothing changed") is a no-op.  Returns
     (rho, retain_before, retain_after).
+
+    `rho_floor` / `retain_floor` make forgetting GENTLER (2026-09-16,
+    collaborator's "raise the retain factor / clip rho" suggestion).  Defaults
+    reproduce the original behaviour exactly.
+
+      rho_floor    : lower bound on a single tick's shrink factor.  The original
+                     1e-3 lets one huge delta_bar crush retain by 1000x in a
+                     single application; raising it (e.g. 0.5) caps how much any
+                     one forget tick can forget, so retain decays gradually
+                     instead of collapsing.
+      retain_floor : hard lower bound on retain itself, i.e. a guaranteed
+                     residual trust in the pretrained belief no matter how much
+                     surprise accumulates.  Targets the known failure mode where
+                     mild changes (p=0.9, the old prior still ~90% right) end up
+                     WORSE than severe ones because retain is driven to ~0
+                     regardless of how large the real change was.
     """
-    rho = float(np.clip(1.0 / max(drift_filter.delta_bar, 1.0), 1e-3, 1.0))
+    rho = float(np.clip(1.0 / max(drift_filter.delta_bar, 1.0),
+                        float(rho_floor), 1.0))
     before = float(bnn.retain.item())
     after = before * rho if rho < 1.0 else before
+    after = max(after, float(retain_floor))
     bnn.retain.fill_(after)
     return rho, before, after
 

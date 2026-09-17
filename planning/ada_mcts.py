@@ -19,10 +19,10 @@ import mbrl.models as models
 
 from planning.base import BNNModelPlanner
 from bnn.dirichlet_workflow import epistemic_dirichlet
-from bnn.dirichlet_model import ALPHA_FLOOR, SURPRISE_EPS, N_STATES, direction_of
+from bnn.dirichlet_model import ALPHA_FLOOR, SURPRISE_EPS
 
 # ── ADA-MCTS hyperparameters ──────────────────────────────────────────────────
-M_SIMULATIONS = 3000      # MCTS iterations per action (paper: 30000)
+M_SIMULATIONS = 3000      # MCTS simulations (rollouts) per action (paper: 30000)
 CP = math.sqrt(2.0)       # UCT exploration constant
 EPS_E = 0.02              # epistemic uncertainty threshold (paper line 236)
 EPS_A = 0.0               # aleatoric uncertainty threshold
@@ -64,15 +64,22 @@ class ADAMCTSAgent(BNNModelPlanner):
                  eps_a=EPS_A,
                  dpas_gamma=DPAS_GAMMA,
                  h_rollout=H_ROLLOUT,
+                 n_threshold=3,
+                 rollout_to_terminal=False,
+                 max_rollout_steps=100,
                  **kwargs):
         super().__init__(dynamics_model, bnn, desc, device,
                          n_actions=n_actions, gamma=gamma, rng=rng, **kwargs)
+        # Grid geometry (generalises the FrozenLake 4x4 assumptions).
+        self.nrow, self.ncol = int(desc.shape[0]), int(desc.shape[1])
         self.m_simulations = m_simulations
         self.cp = cp
         self.eps_e = eps_e
         self.eps_a = eps_a
         self.dpas_gamma = dpas_gamma
         self.h_rollout = h_rollout
+        self.rollout_to_terminal = rollout_to_terminal
+        self.max_rollout_steps = max_rollout_steps
 
         # M_{k-1} frozen snapshot (created at change notification)
         self.bnn_prev = None
@@ -88,7 +95,9 @@ class ADAMCTSAgent(BNNModelPlanner):
         # Post-change tracking
         self._post_change_steps = 0
         self._training_started = True   # starts True (pre-change, trust model)
-        self._n_threshold = 3  # min post-change samples before switching mode
+        # min post-change samples before leaving the forced worst-case phase
+        # (paper's N_threshold = 50; 3 is this port's historical default)
+        self._n_threshold = int(n_threshold)
         self._last_dpas_mode = "reg"  # track DPAS decisions for logging
         self._wc_count = 0            # worst-case samples drawn this act()
         self._reg_count = 0           # regular samples drawn this act()
@@ -96,7 +105,10 @@ class ADAMCTSAgent(BNNModelPlanner):
     # ── snapshot management ──────────────────────────────────────────────────
     def notify_change(self):
         """Freeze current BNN as M_{k-1}, reset M_k exploration state."""
-        self.bnn_prev = copy.deepcopy(self.bnn)
+        if self.bnn_prev is None:
+            # first notification in this phase: snapshot the OLD model (M_{k-1}
+            # = the pretrained model before any post-change evidence arrives)
+            self.bnn_prev = copy.deepcopy(self.bnn)
         self.dyn_prev = models.OneDTransitionRewardModel(
             self.bnn_prev,
             target_is_delta=False,
@@ -114,7 +126,7 @@ class ADAMCTSAgent(BNNModelPlanner):
 
     def learn(self, s, a, s2):
         """Update online counts after observing (s,a) → s2."""
-        d = direction_of(s, a, s2)
+        d = self.bnn.grid.direction_of(s, a, s2)
         self.bnn.add_count(s, a, d)
         self._post_change_steps += 1
         if (not self._training_started and
@@ -128,7 +140,7 @@ class ADAMCTSAgent(BNNModelPlanner):
         if key in self._cache:
             return self._cache[key]
 
-        obs = np.zeros(N_STATES, dtype=np.float32)
+        obs = np.zeros(self.n, dtype=np.float32)
         obs[s] = 1.0
         act = np.zeros(self.n_actions, dtype=np.float32)
         act[a] = 1.0
@@ -241,16 +253,19 @@ class ADAMCTSAgent(BNNModelPlanner):
         1. Compute direct reward for each reachable state
         2. If all >= 0 → return p_cells (no pessimism, safe)
         3. Else → one-hot at argmin reward
+
+        Reachable cells come from the grid's K directions (grid-agnostic; the
+        cliff is read as a hole -- no teleport-to-start, the env's terminal_cliff
+        already ended the episode).
         """
-        row, col = divmod(int(s), 4)
+        grid = self.bnn.grid
+        r, c = divmod(int(s), self.ncol)
         reachable = set()
-        for d in [a, (a - 1) % 4, (a + 1) % 4]:
-            nr, nc = row, col
-            if d == 0:    nc = max(col - 1, 0)
-            elif d == 1:  nr = min(row + 1, 3)
-            elif d == 2:  nc = min(col + 1, 3)
-            elif d == 3:  nr = max(row - 1, 0)
-            reachable.add(nr * 4 + nc)
+        for d in grid.dir_actions(int(a)):
+            dr, dc = grid.deltas[int(d)]
+            nr = min(max(r + dr, 0), self.nrow - 1)
+            nc = min(max(c + dc, 0), self.ncol - 1)
+            reachable.add(nr * self.ncol + nc)
 
         # Immediate reward for each reachable state
         rewards = {s2: float(self.cell_reward[s2]) for s2 in reachable}
@@ -263,11 +278,33 @@ class ADAMCTSAgent(BNNModelPlanner):
 
     # ── rollout ──────────────────────────────────────────────────────────────
     def _rollout(self, s0):
-        """Uniform random rollout from s0 using M_k model, for H_ROLLOUT steps."""
+        """Uniform random rollout from s0 using the M_k model.
+
+        Default (`rollout_to_terminal=False`): h_rollout steps, then bootstrap
+        the leaf with the gamma^dist heuristic.
+
+        `rollout_to_terminal=True` instead runs until a terminal cell (capped
+        at max_rollout_steps) and gives an unterminated rollout the value 0 --
+        upstream adamcts.py's behaviour (its rollout loops `while not done`
+        with no bootstrap at all).
+
+        The difference is decisive whenever a hole carries a NEGATIVE reward.
+        At gamma=0.9999 the gamma^dist bootstrap makes "wander forever" worth
+        ~0.9987 against "reach the goal" worth 1.0 -- a margin of 0.0013 that
+        any real risk of a -1 hole swamps, so hovering becomes the optimal
+        policy and the agent never finishes (measured on cliffwalking_aayl:
+        goal rate 0.000 even in the unchanged stationary environment, where it
+        should be ~1.0).  With holes at 0 and cliff_to_start=True the holes are
+        unreachable in the model, nothing is negative, and the same 0.0013
+        margin is enough to steer -- which is why the main table never hit
+        this.
+        """
         total = 0.0
         disc = 1.0
         s = s0
-        for _ in range(self.h_rollout):
+        limit = (self.max_rollout_steps if self.rollout_to_terminal
+                 else self.h_rollout)
+        for _ in range(limit):
             if self.terminal[s]:
                 break
             a = self.rng.integers(0, self.n_actions)
@@ -276,7 +313,7 @@ class ADAMCTSAgent(BNNModelPlanner):
             total += disc * float(self.cell_reward[s2])
             s = s2
             disc *= self.gamma
-        if not self.terminal[s]:
+        if not self.terminal[s] and not self.rollout_to_terminal:
             total += disc * float(self.heuristic[s])
         return total
 

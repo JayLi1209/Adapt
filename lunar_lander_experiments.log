@@ -1,0 +1,51 @@
+Loaded pretrained BNN from /home/guo/Adapt/data/lunar_lander
+======================================================================
+Lunar Lander: MCTS+BNN+forget | sims=200 rollout=10
+  wind=[0.0, 10.0, 15.0, 20.0] | trials=10x1000
+======================================================================
+  trial 1/10: return=-106.0 steps=54 forget=6
+  trial 2/10: return=-202.8 steps=56 forget=6
+  trial 3/10: return=-103.7 steps=65 forget=9
+  trial 4/10: return=-125.6 steps=69 forget=9
+  trial 5/10: return=-328.2 steps=87 forget=7
+  trial 6/10: return=-172.0 steps=78 forget=3
+  trial 7/10: return=-193.6 steps=85 forget=3
+  trial 8/10: return=-105.6 steps=81 forget=3
+  trial 9/10: return=-117.7 steps=75 forget=5
+  trial 10/10: return=-118.3 steps=65 forget=5
+wind=    0:   -157.4 ± 67.2  (365s)
+  trial 1/10: return=-88.9 steps=87 forget=13
+  trial 2/10: return=-81.1 steps=56 forget=7
+  trial 3/10: return=-88.9 steps=56 forget=7
+  trial 4/10: return=-246.7 steps=61 forget=7
+  trial 5/10: return=-124.8 steps=62 forget=8
+  trial 6/10: return=-318.1 steps=93 forget=4
+  trial 7/10: return=-95.6 steps=73 forget=5
+  trial 8/10: return=-94.9 steps=89 forget=5
+  trial 9/10: return=-96.4 steps=65 forget=9
+  trial 10/10: return=-124.0 steps=65 forget=9
+wind=   10:   -135.9 ± 76.2  (362s)
+  trial 1/10: return=-138.0 steps=84 forget=12
+  trial 2/10: return=-198.1 steps=73 forget=3
+  trial 3/10: return=-117.9 steps=82 forget=3
+  trial 4/10: return=-93.4 steps=85 forget=13
+  trial 5/10: return=-98.7 steps=73 forget=10
+  trial 6/10: return=-117.3 steps=67 forget=9
+  trial 7/10: return=-95.6 steps=62 forget=8
+  trial 8/10: return=-137.3 steps=64 forget=8
+  trial 9/10: return=-90.4 steps=65 forget=9
+  trial 10/10: return=-101.0 steps=81 forget=4
+wind=   15:   -118.8 ± 31.2  (377s)
+  trial 1/10: return=49.6 steps=79 forget=11
+  trial 2/10: return=-152.5 steps=56 forget=5
+  trial 3/10: return=-85.3 steps=54 forget=5
+  trial 4/10: return=-173.1 steps=85 forget=13
+  trial 5/10: return=-76.3 steps=92 forget=14
+  trial 6/10: return=-235.5 steps=86 forget=3
+  trial 7/10: return=-87.0 steps=64 forget=4
+  trial 8/10: return=-6.0 steps=118 forget=10
+  trial 9/10: return=-103.7 steps=74 forget=10
+  trial 10/10: return=-107.5 steps=68 forget=3
+wind=   20:    -97.7 ± 76.6  (397s)
+
+DONE.

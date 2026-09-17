@@ -143,3 +143,57 @@ class DriftFilterV2:
         # SIGNED point estimate (no max(...,0)); the value reflects ALL evidence,
         # and forget() handles the non-negativity of the actual inflation.
         return self.lambda_hat + kappa * self.lambda_sd
+
+
+class DualDriftFilter:
+    """Dual-channel drift filter: mean shift (raw MSE nu2) + variance shift (delta_n).
+
+    Tracks both the raw prediction residual (captures mean shifts) and the
+    variance-normalised delta_n (captures variance/scale shifts).  The max of the
+    two drift estimates drives forgetting, so either type of non-stationarity
+    triggers re-inflation.
+
+    Both channels calibrate their baselines during a warmup period (pre-change or
+    early post-change).  Call calibrate() BEFORE reset() — the filter starts in
+    calibration mode, reset() freezes the baselines and switches to detection.
+    """
+
+    def __init__(self, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY):
+        self.mean_channel = DriftFilterV2(eta=eta, gamma_uncertainty=gamma_uncertainty)
+        self.var_channel = DriftFilterV2(eta=eta, gamma_uncertainty=gamma_uncertainty)
+        # Start in calibration mode (DriftFilterV2 default)
+
+    def reset(self):
+        """Freeze calibrated baselines and switch to detection mode."""
+        self.mean_channel.reset()
+        self.var_channel.reset()
+
+    def update(self, nu2, delta_n):
+        """Feed both the raw squared error (nu2) and the variance-scaled delta_n."""
+        self.mean_channel.update(nu2)
+        self.var_channel.update(delta_n)
+        return self.lambda_hat
+
+    @property
+    def is_calibrating(self):
+        return self.mean_channel._calibrating and self.var_channel._calibrating
+
+    @property
+    def lambda_hat(self):
+        return max(self.mean_channel.lambda_hat, self.var_channel.lambda_hat)
+
+    @property
+    def delta_bar(self):
+        return 1.0 + self.lambda_hat
+
+    @property
+    def lambda_sd(self):
+        return max(self.mean_channel.lambda_sd, self.var_channel.lambda_sd)
+
+    def drift_estimate(self, kappa=KAPPA):
+        m = self.mean_channel.drift_estimate(kappa)
+        v = self.var_channel.drift_estimate(kappa)
+        trigger = "mean" if m >= v else "var"
+        return max(m, v), {"mean_ch": m, "var_ch": v, "trigger": trigger,
+                           "mean_baseline": self.mean_channel.baseline,
+                           "var_baseline": self.var_channel.baseline}

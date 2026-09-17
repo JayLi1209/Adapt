@@ -39,14 +39,24 @@ class GridSpec:
     dir_offsets: Tuple[int, ...]
     # How the (1-p) slip mass is distributed among the non-intended directions:
     #   "perp"     -> split equally over the PERPENDICULAR dirs; opposite gets 0
-    #                 (FrozenLake & CliffWalking, per Luo et al.: (1-p)/2 each)
+    #                 (FrozenLake & CliffWalking & Bridge, per Luo et al. and the
+    #                 official nsbridge_v0.py: slip mass goes to the up/down cells
+    #                 of the current cell, (1-p)/2 each)
     #   "opposite" -> all of (1-p) goes to the OPPOSITE direction
-    #                 (Bridge, per Lecarpentier & Rachelson 2019)
+    #                 (deprecated; was Bridge before the 2026-08-07 fix)
     slip_mode: str = "perp"
     # char map, row strings (S start, G goal, H hole/cliff, F free)
     desc: Tuple[str, ...] = ()
     # CliffWalking-style teleport: cliff cells send the agent back to start
     cliff_to_start: bool = False
+    # per-step penalty paid on every non-goal landing (CliffWalking, per Luo
+    # et al.: "the agent concedes a penalty for each step it takes except the
+    # goal").  0.0 for the other grids.
+    step_penalty: float = 0.0
+    # reward on arriving at a hole.  0.0 per the paper's "holes = 0" convention
+    # (a hole just ends the episode); -1.0 would make a fall strictly worse than
+    # never arriving, which the goal-rate report does not intend.
+    hole_reward: float = 0.0
 
     @property
     def n_states(self) -> int:
@@ -160,17 +170,24 @@ CLIFFWALKING_4x12 = GridSpec(
     # ns_gym sets next_state = start_state for every cliff landing, regardless of
     # terminal_cliff (terminal_cliff only controls the `terminated` flag).
     cliff_to_start=True,
+    # No per-step penalty (2026-08-12, user request): reward = +1 goal / -1 hole /
+    # 0 elsewhere, so the return is positive and reads as a discounted goal rate.
+    step_penalty=0.0,
 )
 
-# Bridge (Lecarpentier & Rachelson 2019): intended prob p, OPPOSITE prob 1-p.
+# Bridge (Lecarpentier & Rachelson 2019 / Luo et al. 2024): intended prob p,
+# slip (1-p)/2 each to the PERPENDICULAR (up/down) cells of the current cell --
+# on the bridge row those are the shoulders, on the shoulders they are the
+# holes above/below (the official nsbridge_v0.py geometry).  K=3 support
+# [intended, perp-up, perp-down] in the LEFT/DOWN/RIGHT/UP action order.
 # 5x8 map, goals on both ends of the middle row, holes above/below the bridge.
 BRIDGE_5x8 = GridSpec(
     name="bridge",
-    nrow=5, ncol=8, n_actions=4, k_dir=2,
+    nrow=5, ncol=8, n_actions=4, k_dir=3,
     # LEFT, DOWN, RIGHT, UP  (same action order as FrozenLake)
     deltas=((0, -1), (1, 0), (0, 1), (-1, 0)),
-    dir_offsets=(0, 2),                 # intended, opposite
-    slip_mode="opposite",
+    dir_offsets=(0, 3, 1),              # intended, perp-up(3), perp-down(1)
+    slip_mode="perp",
     desc=("HHHHHHHH",
           "FFFFFHHH",
           "GFFFSFFG",
@@ -178,7 +195,65 @@ BRIDGE_5x8 = GridSpec(
           "HHHHHHHH"),
 )
 
-REGISTRY = {g.name: g for g in (FROZENLAKE_4x4, CLIFFWALKING_4x12, BRIDGE_5x8)}
+# Bridge with one extra hole (Act As You Learn, Luo et al. 2024: "We add an extra
+# hole to make the environment more challenging").  The hole sits on the upper
+# shoulder directly above the start (1,4): crossing the bridge now risks slipping
+# up into it, so even the safest route is not entirely safe -- the paper's point
+# about the bridge ("no policy is entirely safe").  A path S->G still exists
+# (dist 3), so there is an optimal route; oracle goal rate at p=0.6 drops 0.59->0.30.
+BRIDGE_HOLE_5x8 = GridSpec(
+    name="bridge_hole",
+    nrow=5, ncol=8, n_actions=4, k_dir=3,
+    deltas=((0, -1), (1, 0), (0, 1), (-1, 0)),
+    dir_offsets=(0, 3, 1),
+    slip_mode="perp",
+    desc=("HHHHHHHH",
+          "FFFFHHHH",
+          "GFFFSFFG",
+          "FFFFFHHH",
+          "HHHHHHHH"),
+)
+
+# CliffWalking with the FIRST cliff cell (the one immediately right of S, bottom
+# row) flattened to safe ground -- 2026-09-03 user request, to see how much of
+# the low-p goal-rate gap is driven specifically by the step-0 cliff-adjacent
+# cell (the state every trial starts next to) vs. the cliff in general.
+CLIFFWALKING_4x12_NOFIRSTHOLE = GridSpec(
+    name="cliffwalking_nofirsthole",
+    nrow=4, ncol=12, n_actions=4, k_dir=3,
+    deltas=((-1, 0), (0, 1), (1, 0), (0, -1)),
+    dir_offsets=(0, 1, -1),
+    desc=("FFFFFFFFFFFF",
+          "FFFFFFFFFFFF",
+          "FFFFFFFFFFFF",
+          "SFHHHHHHHHHG"),        # col1 ('H' in the original) -> 'F'
+    cliff_to_start=True,
+    step_penalty=0.0,
+)
+
+# CliffWalking as in Act As You Learn (Luo et al. 2024, arXiv 2401.01841) --
+# 2026-09-15 collaborator reproduction request (holes = -1, gamma = 0.9999,
+# pretrain p = 0.7).  Same 4x12 map as CLIFFWALKING_4x12: the paper's Fig. 2(b)
+# is the stock gym map with no extra hole (the "extra hole" in that caption is
+# the NS-Bridge's).  Rewards/termination follow the authors' RATS-lineage envs
+# (nsfrozenlake_v0.py / ns_gym nscliff_v0.py: G +1, H -1, else 0, done on G or
+# H) and upstream adamcts.py (reward +-1 => terminal): the cliff is a TERMINAL
+# hole paying -1, no teleport-to-start.
+CLIFFWALKING_4x12_AAYL = GridSpec(
+    name="cliffwalking_aayl",
+    nrow=4, ncol=12, n_actions=4, k_dir=3,
+    deltas=((-1, 0), (0, 1), (1, 0), (0, -1)),
+    dir_offsets=(0, 1, -1),
+    desc=CLIFFWALKING_4x12.desc,
+    cliff_to_start=False,
+    step_penalty=0.0,
+    hole_reward=-1.0,
+)
+
+REGISTRY = {g.name: g for g in (FROZENLAKE_4x4, CLIFFWALKING_4x12,
+                                CLIFFWALKING_4x12_NOFIRSTHOLE,
+                                CLIFFWALKING_4x12_AAYL, BRIDGE_5x8,
+                                BRIDGE_HOLE_5x8)}
 
 
 def get_grid(name: str) -> GridSpec:

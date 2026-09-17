@@ -24,26 +24,34 @@ class BNNModelPlanner(planning.Agent):
 
     __init__ also builds, from the map `desc`:
       terminal[s]    : absorbing (goal/hole) mask
-      cell_value[s]  : value AT an absorbing cell (goal 1, hole 0)
-      cell_reward[s] : reward on arrival (goal +1, hole -1, frozen 0)
+      cell_value[s]  : value AT an absorbing cell (goal 1, hole hole_reward)
+      cell_reward[s] : reward on arrival (goal +1, hole hole_reward, frozen 0)
       heuristic[s]   : gamma^dist(s, goal) leaf value V(s_H), terminals overridden
     """
 
     def __init__(self, dynamics_model, bnn, desc, device, n_actions=4,
-                 gamma=0.97, hole_reward=-1.0, rng=None, **kwargs):
+                 gamma=0.97, hole_reward=None, rng=None, **kwargs):
         self.dyn = dynamics_model
         self.bnn = bnn
         self.device = device
         self.n_actions = n_actions
         self.gamma = gamma
         self.rng = rng if rng is not None else np.random.default_rng(0)
+        # hole_reward=None -> the grid's own convention (bnn.grid.hole_reward:
+        # 0.0 everywhere except cliffwalking_aayl's -1), so every planner sees
+        # the reward the env actually pays -- planning/rats.py reads
+        # grid.hole_reward the same way.
+        if hole_reward is None:
+            hole_reward = float(getattr(getattr(bnn, "grid", None),
+                                        "hole_reward", 0.0))
 
         flat = [c.decode() for c in desc.flatten()]
         self.n = len(flat)
-        # Absorbing cell values: goal = 1, hole = 0 (both terminal).
+        # Absorbing cell values: goal = 1, hole = hole_reward (both terminal).
         self.terminal = np.zeros(self.n, dtype=bool)
         self.cell_value = np.zeros(self.n, dtype=np.float32)
-        # Reward-on-arrival map: hole = hole_reward (<0), goal = +1, frozen = 0.
+        # Reward-on-arrival map: hole = hole_reward (default 0.0 -- a hole ends
+        # the episode with no further reward), goal = +1, frozen = 0.
         self.cell_reward = np.zeros(self.n, dtype=np.float64)
         for i, ch in enumerate(flat):
             if ch in "GH":
@@ -52,6 +60,7 @@ class BNNModelPlanner(planning.Agent):
                 self.cell_value[i] = 1.0
                 self.cell_reward[i] = 1.0
             if ch == "H":
+                self.cell_value[i] = hole_reward
                 self.cell_reward[i] = hole_reward
         self._eye_s = np.eye(self.n, dtype=np.float32)
         self._eye_a = torch.eye(n_actions, dtype=torch.float32, device=device)

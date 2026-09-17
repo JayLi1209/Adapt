@@ -54,10 +54,15 @@ def bfs_dist_to_goal(grid):
     return np.array([dist.get(i, far) for i in range(grid.n_states)], dtype=np.float64)
 
 
-def build_dataset(grid, goal_weight, n_rows, p):
+def build_dataset(grid, goal_weight, n_rows, p, balance_terminal=False):
     """Sample (s,a) rows weighted toward the goal; realized direction ~ slip_dist(p).
 
     p=1.0 reduces to the deterministic dataset (always the intended direction).
+    balance_terminal=True (2026-08-22): subsample so that transitions INTO a
+    terminal cell (G or H) are as frequent as transitions within F -- under the
+    goal-weighted sampling the near-goal states dominate and terminal landings
+    are over-represented, so the Dirichlet head sees mostly "goal/hole" rows and
+    undertrains the "safe step" rows that dominate an episode.
     """
     flat = grid.flat_desc
     usable = [s for s in range(grid.n_states) if flat[s] not in "HG"]
@@ -71,18 +76,49 @@ def build_dataset(grid, goal_weight, n_rows, p):
     acts = rng.integers(0, grid.n_actions, size=n_rows)
     dirs = rng.choice(grid.k_dir, size=n_rows, p=slip)     # realized slip direction
 
-    X = np.zeros((n_rows, grid.n_states + grid.n_actions), dtype=np.float32)
-    Y = np.zeros((n_rows, grid.n_states + 1), dtype=np.float32)
+    X, Y = [], []
+    term = 0
+    # Aggregated per-(s,a) direction counts for the Dirichlet-multinomial loss
+    # (the only term that identifies the concentration alpha0; see loss_dm).
+    counts = np.zeros((grid.n_states, grid.n_actions, grid.k_dir), dtype=np.float64)
+    rew_sum = np.zeros((grid.n_states, grid.n_actions), dtype=np.float64)
     for i, (u, a, k) in enumerate(zip(idx, acts, dirs)):
         s = usable[u]
         d_action = grid.dir_actions(a)[k]    # which of the K directions realized
         s2 = grid.move(s, d_action)
-        X[i, s] = 1.0
-        X[i, grid.n_states + a] = 1.0
-        Y[i, s2] = 1.0
-        Y[i, grid.n_states] = 1.0 if flat[s2] == "G" else (
-            -1.0 if flat[s2] == "H" else 0.0)
-    return torch.from_numpy(X), torch.from_numpy(Y), d, usable, w
+        is_term = flat[s2] in "GH"
+        if balance_terminal and is_term and term * 2 >= n_rows:
+            continue                        # keep terminal rows at ~ n_rows/2
+        term += int(is_term)
+        r = 1.0 if flat[s2] == "G" else (
+            grid.hole_reward if flat[s2] == "H" else 0.0)
+        counts[s, a, k] += 1.0
+        rew_sum[s, a] += r
+        xi = np.zeros(grid.n_states + grid.n_actions, dtype=np.float32)
+        yi = np.zeros(grid.n_states + 1, dtype=np.float32)
+        xi[s] = 1.0
+        xi[grid.n_states + a] = 1.0
+        yi[s2] = 1.0
+        yi[grid.n_states] = r
+        X.append(xi); Y.append(yi)
+    X = torch.from_numpy(np.stack(X)); Y = torch.from_numpy(np.stack(Y))
+
+    # Aggregated rows: one per (usable s, a), with direction counts and the
+    # count-weighted mean reward.
+    Xa, Ca, Ra = [], [], []
+    for s in usable:
+        for a in range(grid.n_actions):
+            xi = np.zeros(grid.n_states + grid.n_actions, dtype=np.float32)
+            xi[s] = 1.0
+            xi[grid.n_states + a] = 1.0
+            Xa.append(xi)
+            Ca.append(counts[s, a])
+            n_sa = counts[s, a].sum()
+            Ra.append(rew_sum[s, a] / n_sa if n_sa > 0 else 0.0)
+    Xa = torch.from_numpy(np.stack(Xa))
+    Ca = torch.from_numpy(np.stack(Ca)).float()
+    Ra = torch.from_numpy(np.array(Ra, dtype=np.float32))
+    return X, Y, d, usable, w, (Xa, Ca, Ra), counts
 
 
 def main():
@@ -97,6 +133,27 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--goal-weight", type=float, default=1.35,
                     help="w(s) = goal_weight^(-dist(s,goal)); >1 upweights goal-near")
+    ap.add_argument("--balance-terminal", action="store_true",
+                    help="subsample so transitions into terminal cells (G/H) are "
+                         "as frequent as transitions within F -- fixes the "
+                         "goal-weighted over-representation of terminal landings")
+    ap.add_argument("--no-table", dest="table", action="store_false",
+                    help="do NOT install the pretraining-concentration table "
+                         "(alpha0[s,a] = counts + K*CONC_PRIOR, the conjugate "
+                         "posterior scale).  Without it the concentration is "
+                         "head-learned and sits at the KL-prior scale ~7 "
+                         "regardless of data count (old behaviour).")
+    ap.add_argument("--dm-only", action="store_true",
+                    help="use ONLY the Dirichlet-multinomial loss on aggregated "
+                         "counts (kept for comparison; on near-deterministic "
+                         "data its alpha0 gradient vanishes once empty "
+                         "categories hit the floor, so alpha0 stays small)")
+    ap.add_argument("--conf-weight", type=float, default=0.0,
+                    help="weight of the alpha0-calibration term: log-space "
+                         "regression of the predicted concentration onto the "
+                         "conjugate-posterior target n_sa + K*CONC_PRIOR.  "
+                         "Only relevant with --no-table / --dm-only (the "
+                         "default table mode sets alpha0 analytically).")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out-dir", default=None)
     args = ap.parse_args()
@@ -106,8 +163,11 @@ def main():
     out_dir = pathlib.Path(args.out_dir) if args.out_dir else SAVE_DIR.parent / grid.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    X, Y, dist, usable, w = build_dataset(grid, args.goal_weight, args.rows, args.p)
+    X, Y, dist, usable, w, agg, counts = build_dataset(
+        grid, args.goal_weight, args.rows, args.p,
+        balance_terminal=args.balance_terminal)
     X, Y = X.to(device), Y.to(device)
+    Xa, Ca, Ra = (t.to(device) for t in agg)
     target = grid.slip_dist(args.p)
     print(f"[{grid.name}] grid {grid.nrow}x{grid.ncol} n_states={grid.n_states} "
           f"K={grid.k_dir} | ORIGINAL p={args.p} -> target dist {[round(x,3) for x in target]} "
@@ -119,25 +179,61 @@ def main():
             f"s={usable[i]}(d={dist[usable[i]]:.0f},w={w[i]:.4f})" for i in sel))
 
     bnn, dyn = make_dirichlet_bnn(grid.n_states, grid.n_actions, grid=grid)
-    bnn.num_train_points = args.rows
+    bnn.num_train_points = int(Ca.sum().item())
     bnn.learn_reward = True
     opt = torch.optim.Adam(bnn.parameters(), lr=args.lr)
 
-    n = X.shape[0]
-    for ep in range(args.epochs):
-        perm = torch.randperm(n, device=device)
-        tot = 0.0
-        for i in range(0, n, args.batch):
-            b = perm[i:i + args.batch]
+    # alpha0-calibration term (log-space regression onto the conjugate-posterior
+    # concentration n_sa + K*CONC_PRIOR).  The row-wise categorical NLL depends
+    # only on the mean p = alpha/alpha0 and is scale-invariant, so without this
+    # term alpha0 gets no learning signal (KL pulls it to ~7 even with 20k
+    # samples); pure DM cannot grow it either (gradient vanishes on
+    # single-category data).  Computed on the aggregated per-(s,a) rows and
+    # added to the last mini-batch of each epoch.
+    from bnn.dirichlet_model import CONC_PRIOR as _CP
+    conf_target = (Ca.sum(-1) + grid.k_dir * _CP).clamp_min(1.0).log()
+
+    def conf_penalty():
+        alpha, _, _, _ = bnn._forward_alpha(Xa, sample=True)
+        a0 = alpha.sum(-1).clamp_min(1e-6)
+        return ((a0.log() - conf_target) ** 2).mean()
+
+    if args.dm_only:
+        # Pure Dirichlet-multinomial loss on the aggregated counts
+        # (comparison path; see --dm-only help).
+        for ep in range(args.epochs):
             opt.zero_grad()
-            loss, meta = bnn.loss(X[b], Y[b])
+            loss, meta = bnn.loss_dm(Xa, Ca, Ra)
+            if args.conf_weight > 0:
+                loss = loss + args.conf_weight * conf_penalty()
             loss.backward()
             opt.step()
-            tot += float(loss.item())
-        if ep % 50 == 0 or ep == args.epochs - 1:
-            print(f"  epoch {ep:4d}: loss={tot / max(1, n // args.batch):.4f} "
-                  f"nll={meta['nll']:.4f} kl={meta['kl']:.1f}")
+            if ep % 50 == 0 or ep == args.epochs - 1:
+                print(f"  epoch {ep:4d}: loss={float(loss.item()):.4f} "
+                      f"dm_nll={meta['nll']:.4f} kl={meta['kl']:.1f}")
+    else:
+        n = X.shape[0]
+        for ep in range(args.epochs):
+            perm = torch.randperm(n, device=device)
+            tot = 0.0
+            for i in range(0, n, args.batch):
+                b = perm[i:i + args.batch]
+                opt.zero_grad()
+                loss, meta = bnn.loss(X[b], Y[b])
+                if args.conf_weight > 0 and i + args.batch >= n:
+                    loss = loss + args.conf_weight * conf_penalty()
+                loss.backward()
+                opt.step()
+                tot += float(loss.item())
+            if ep % 50 == 0 or ep == args.epochs - 1:
+                print(f"  epoch {ep:4d}: loss={tot / max(1, n // args.batch):.4f} "
+                      f"nll={meta['nll']:.4f} kl={meta['kl']:.1f}")
 
+    if args.table:
+        bnn.set_pretrain_counts(counts)
+        nnz = (counts.sum(-1) > 0).sum()
+        print(f"alpha0 table installed on {nnz}/{counts.shape[0]*counts.shape[1]} "
+              f"(s,a) rows: alpha0 = counts + {grid.k_dir * _CP:.1f}")
     fn = ckpt_name(grid, args.p)
     bnn.save(out_dir, filename=fn)
     print(f"saved {out_dir / fn}")
@@ -158,6 +254,24 @@ def main():
     print(f"VERIFY p_dir: mean={[round(x,3) for x in mean_pdir]} target={[round(x,3) for x in tgt]} "
           f"| mean|abs err|={mae:.4f} max|abs err|={float(np.abs(pdirs-tgt[None,:]).max()):.4f}")
     print("VERDICT:", "GOOD" if mae < 0.05 else "SUSPECT")
+
+    # alpha0 (concentration) check: with the table installed this should equal
+    # counts + K*CONC_PRIOR per (s,a) (the conjugate posterior scale); without
+    # it the KL-prior scale (~7).
+    with torch.no_grad():
+        a0s = []
+        for s in usable:
+            for a in range(grid.n_actions):
+                xi = torch.zeros(1, grid.n_states + grid.n_actions, device=device)
+                xi[0, s] = 1.0
+                xi[0, grid.n_states + a] = 1.0
+                alpha, _, _, _ = bnn._forward_alpha(xi, sample=False)
+                a0s.append(alpha.sum().item())
+        a0s = np.array(a0s)
+        print(f"VERIFY alpha0: mean={a0s.mean():.1f} median={np.median(a0s):.1f} "
+              f"min={a0s.min():.1f} max={a0s.max():.1f} "
+              f"(per-(s,a) data counts: mean={Ca.sum(-1).mean():.0f} "
+              f"max={Ca.sum(-1).max():.0f})")
 
 
 if __name__ == "__main__":
