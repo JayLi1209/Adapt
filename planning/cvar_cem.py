@@ -87,6 +87,18 @@ class CVaRCEMAgent(BNNModelPlanner):
         self.reward_vec = self.cell_reward.astype(np.float64)        # goal +1, hole -1
         self.is_terminal = self.terminal.copy()                     # bool (S,)
         self.terminal_value = self.heuristic.astype(np.float64)     # gamma^dist(s,goal)
+        # leaf_mode (2026-09-23): "heuristic" (default, original) bootstraps
+        # V(s_H) = gamma^dist(s,goal), which assumes the goal is reached WITH
+        # CERTAINTY from any cell.  At gamma=0.9999 that is ~0.999 everywhere,
+        # so a 6-step window sees only the RISK of moving and none of the
+        # benefit of progress -> once the model believes in any hole risk,
+        # hovering in place is optimal until truncation.  "model" bootstraps
+        # with the value-iteration V of the SAME (planning-view) model that
+        # _pretrained_policy already computes each act(), so staying and
+        # moving are scored consistently.  Shared planner -> must be switched
+        # for every CEM method together (runner --cem-leaf).
+        self.leaf_mode = "heuristic"
+        self._V_model = None
         self._uniform = np.full((self.horizon, self.n_actions),
                                 1.0 / self.n_actions, dtype=np.float64)
         self.pi = self._uniform.copy()      # per-timestep categorical (H, A)
@@ -179,7 +191,10 @@ class CVaRCEMAgent(BNNModelPlanner):
             state = s2
             disc *= self.gamma
         # terminal bootstrap V(s_H) only for trajectories still running
-        returns += disc * np.where(done, 0.0, self.terminal_value[state])
+        leaf = (self._V_model if (self.leaf_mode == "model"
+                                  and self._V_model is not None)
+                else self.terminal_value)
+        returns += disc * np.where(done, 0.0, leaf[state])
         return returns.reshape(J, K * N)
 
     @staticmethod
@@ -216,6 +231,7 @@ class CVaRCEMAgent(BNNModelPlanner):
             if np.max(np.abs(Vn - V)) < 1e-10:
                 V = Vn; break
             V = Vn
+        self._V_model = V
         return Q.argmax(1), T
 
     def _policy_init_pi(self, s0):

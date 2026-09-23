@@ -4,7 +4,7 @@
 > 应该回来更新这个文件（同一个文件，不新建）。最终对外报告见
 > `doc_tool/experiment_report_2026-09-14.md`（详细版）和
 > `doc_tool/experiment_summary_2026-09-14.md`（自包含、给外部演讲用）。
-> 最后更新：2026-09-15 20:55 EDT。
+> 最后更新：2026-09-23 07:10 EDT（线4：p=0.9 调查）。
 
 **本文件即为 /clear 或 /compact 前的交接文档**（用户要求：如果 STATE.md
 能当交接文档用，就不用另写）。新 session 接手时，建议顺序：
@@ -231,11 +231,72 @@ config3（预训练p=0.7）：
 
 ---
 
-## 正在跑什么（截至 2026-09-16 17:47：**没有任何实验在跑**）
+## 正在跑什么（截至 2026-09-23 07:10）
+
+### 线4（2026-09-23 新开）：p=0.9 为什么比别人差 —— 调查中
+
+用户原话："现在cliff_walking（without hole，原版），nsbridge，frozen lake
+（三个环境都是non-stationary版本），都表现出在0.9的上面效果很差，0.3, 0.4
+等等效果都还好。这里的很差是指，比其他方法差，在k_models=10的时候。你可以
+调查一下原因，和可能的改进方案吗？之前我说错了，那个就是retain factor，
+不是retrain factor。"
+
+**复现（K=10，现行代码，30 trials）**：
+| 环境 | p | cem_fir | cem_ada | ada_mcts | bnn_rats_static |
+|---|---|---|---|---|---|
+| frozenlake | 0.9 | **0.567** | 0.900 | 0.900 | 0.000 |
+| frozenlake | 0.4 | 0.267 | 0.167 | 0.133 | 0.400 |
+| bridge | 0.9 | 1.000 | 1.000 | 0.867 | 1.000 |
+| bridge | 0.4 | 0.200 | 0.167 | 0.067 | 0.200 |
+| cliffwalking | 0.4 | 0.567 | 待 | 待 | 0.300 |
+| cliffwalking | 0.9 | 诊断 8/8 到达 | 待 | 待 | 1.000 |
+
+→ **现行代码只在 frozenlake 复现出 p=0.9 的差距**；bridge/cliffwalking 不差。
+合作者推到 `origin/main` 的版本（最后提交 08-04，`run_discrete.py`）有两处
+与现行代码不同：`K_FORGET=1`（每步 forget）+ forget 后**不重置** δ̄（09-04
+修过的 bug）→ 一次 slip 的 δ̄≈1e3 会每步继续把 retain 乘 1e-3。这可能是他在
+bridge/cliff 上也看到差距的原因（**推测，未证实**——他的实际 runner 未推送）。
+诊断开关 `--k-forget 1 --no-forget-reset` 可模拟该行为。
+
+**机制（逐步 trace 已证实，脚本在 scratchpad `diag_retain.py`）**：
+1. **遗忘量与变化幅度无关**：模型在 p=1.0 上预训练，熵≈0，任何一次 slip 的
+   δ_n = nll/H ≈ 1e3（bridge/cliff）或 30~50（frozenlake）→ rho 截到下限 →
+   retain 一步掉到 1e-3~0.05。p=0.9 和 p=0.3 遗忘得一样多。
+2. **γ^dist 叶子值陷阱**（与 ADA-MCTS 复现中发现的同一个坑）：CEM 叶子
+   V(s_H)=γ^dist≈0.999（γ=0.9999），6 步窗口只看得到"走"的风险、看不到"前进"
+   的收益 → 模型一旦认为有 >0.1% 的掉洞风险，**原地撞墙等到截断**就是最优。
+   frozenlake 失败 trial 全是 s=0/4 按 LEFT 撞墙 100 步。
+3. cem_ada 从不 forget（retain≡1，counts 叠在预训练上）→ 认为风险≈0 →
+   一直前进，p=0.9 时恰好对；p=0.4 时错，所以我们在 p=0.4 赢。
+
+**三个候选改进（全部 opt-in，默认逐位不变，已验证 trace 一致）**：
+- `--forget-mode ml`：每个 forget tick 用"最能解释所有 post-change 转移"的
+  retain（极大似然，网格搜索）替代 1/δ̄。`bnn/dirichlet_workflow.py::ml_retain_dirichlet`
+- `--plan-gate surprise`：plan_retain 的规划时膨胀推迟到第一次真正 surprise
+  之后（原为从宣布变化起就膨胀）。
+- `--cem-leaf model`：叶子值改为规划模型上 value iteration 的 V（共享规划器
+  → **所有 CEM 方法一起开**，公平性铁律）。
+
+**frozenlake 变体结果（K=10，60 trials）**：
+| 变体 | p=0.9 | p=0.4 |
+|---|---|---|
+| 对照 | 0.417 | 0.300 |
+| gate | 0.633 | 0.317 |
+| ml | 0.717 | 0.267 |
+| **ml+gate** | **0.783** | 0.200 |
+| leaf（cem_fir / cem_ada 同开） | 0.517 / 0.867 | 0.300 / 0.083 |
+
+**在跑（2026-09-23 06:55 启动，预计 2~3 小时）**，输出在 scratchpad `p09w/`：
+fl_all3（三者叠加，cem_fir+cem_ada）、fl_mid_ctrl / fl_mid_mlgate（p=0.6/0.8）、
+cliff_mlgate（cliffwalking p=0.3/0.4/0.5/0.9，查是否伤到主表已赢的点；
+对照用下方 K=10 表 c1 行：0.433/0.833/0.833/1.000）。另 `p09/cliff.log`
+（5 方法 p=0.4/0.9 对比）仍在跑。
+
+## 正在跑什么（截至 2026-09-16 17:47：**没有任何实验在跑**）——旧记录
 
 > 三条线都已结束：线1 公平性修正 24/24 完成；线2 ADA-MCTS 复现 7/7 完成；
 > 线3 retain factor 试点完成（结论：不采纳，见"下一步"第 1 项）。
-> 机器目前全空。下面保留各线的过程记录。
+> 下面保留各线的过程记录。
 
 ### 线1：公平性修正 —— ✅ 已完成（2026-09-15 06:45 → 2026-09-16 05:20，约 22.5 小时）
 

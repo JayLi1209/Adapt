@@ -108,6 +108,58 @@ def forget_dirichlet(bnn, drift_filter, rho_floor=1e-3, retain_floor=0.0):
     return rho, before, after
 
 
+ML_RETAIN_GRID = np.concatenate([[0.0], np.logspace(-3, 0, 31)])
+
+
+@torch.no_grad()
+def ml_retain_dirichlet(bnn, dyn, buf, retain_grid=ML_RETAIN_GRID):
+    """Evidence-calibrated retain (2026-09-23, "forget-mode ml").
+
+    The rho = 1/delta_bar rule measures how SURPRISING the data is, not how
+    much the env CHANGED: a model pretrained at p=1.0 has ~zero entropy, so ONE
+    slip gives delta_bar ~ 1e3 whether the new p is 0.9 or 0.3, and retain is
+    crushed to the 1e-3 floor either way.  At p=0.9 that throws away a belief
+    that is still 90% right.
+
+    Instead pick the retain that best EXPLAINS the post-change transitions:
+        retain* = argmax_r  sum_{(s,a,s2) in buf} log pbar_r(s2 | s,a),
+        pbar_r  = mean of Dir(CONC_PRIOR + r * (alpha_head - CONC_PRIOR))
+    i.e. the same retain-blend the model already uses, without the online
+    counts (they are the separate, local evidence channel).  Mild changes
+    keep most of the prior (r* large), severe ones still go to ~0.
+
+    buf : list of (obs_onehot, act_onehot, s2_idx).  Returns retain*.
+    """
+    from bnn.dirichlet_model import CONC_PRIOR, ALPHA_FLOOR
+    if not buf:
+        return float(bnn.retain.item())
+    obs = torch.as_tensor(np.stack([b[0] for b in buf]), dtype=torch.float32,
+                          device=device)
+    act = torch.as_tensor(np.stack([b[1] for b in buf]), dtype=torch.float32,
+                          device=device)
+    s2 = torch.as_tensor([int(b[2]) for b in buf], dtype=torch.long,
+                         device=device)
+    model_in = dyn._get_model_input(obs, act)
+    saved_r, saved_c = float(bnn.retain.item()), bnn.use_counts
+    bnn.retain.fill_(1.0)
+    bnn.use_counts = False
+    try:
+        alpha_head, _, _, cells = bnn._forward_alpha(model_in, sample=False)
+    finally:
+        bnn.retain.fill_(saved_r)
+        bnn.use_counts = saved_c
+    best_r, best_ll = saved_r, -np.inf
+    for r in retain_grid:
+        alpha = (CONC_PRIOR + float(r) * (alpha_head - CONC_PRIOR)).clamp_min(
+            ALPHA_FLOOR)
+        p_dir = alpha / alpha.sum(-1, keepdim=True)
+        p_cells = bnn._cells_from_dir(p_dir, cells).clamp_min(SURPRISE_EPS)
+        ll = float(torch.log(p_cells.gather(1, s2.unsqueeze(1))).sum().item())
+        if ll > best_ll + 1e-9:
+            best_r, best_ll = float(r), ll
+    return best_r
+
+
 def unfrozen_params_dirichlet(bnn, n_unfrozen):
     """Mean weights of the top `n_unfrozen` layers of the DIRECTION path, counted
     from the Dirichlet head downward into the PRETRAINED trunk.

@@ -308,7 +308,8 @@ class BNNCEM:
                  do_forget=True, n_unfrozen=0, retrain_every=3,
                  retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64,
                  seed=0, retrain_min_conf=0.0, rho_floor=1e-3,
-                 retain_floor=0.0):
+                 retain_floor=0.0, forget_mode="rho", plan_gate="announce",
+                 forget_reset=True):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -344,6 +345,30 @@ class BNNCEM:
         # see bnn/dirichlet_workflow.forget_dirichlet for what each bounds.
         self.rho_floor = float(rho_floor)
         self.retain_floor = float(retain_floor)
+        # forget_mode (2026-09-23): "rho" = original retain *= 1/delta_bar;
+        # "ml" = retain re-estimated each forget tick as the value that best
+        # explains ALL post-change transitions so far (ml_retain_dirichlet) --
+        # calibrated to how much the env changed, not to how surprising one
+        # slip was.  Default "rho" is bit-identical to the old behaviour.
+        if forget_mode not in ("rho", "ml"):
+            raise ValueError(f"forget_mode must be rho|ml, got {forget_mode!r}")
+        self.forget_mode = forget_mode
+        # plan_gate (2026-09-23): "announce" (default, original) inflates the
+        # planner's model (plan_retain = conf) from the ANNOUNCED change on,
+        # so for the first ~n_confident steps it plans on a near-uniform model
+        # even if nothing surprising has happened yet.  "surprise" withholds
+        # that inflation until the first surprising transition (delta_n >
+        # PLAN_GATE_TRIGGER); the CVaR tail alpha still follows conf as before.
+        if plan_gate not in ("announce", "surprise"):
+            raise ValueError(f"plan_gate must be announce|surprise, got {plan_gate!r}")
+        self.plan_gate = plan_gate
+        # forget_reset=False reproduces the pre-09-04 behaviour (still in the
+        # collaborator's origin/main): delta_bar is NOT reset after a forget,
+        # so one slip's ~1e3 surprise keeps crushing retain every tick.
+        # Diagnostic only.
+        self.forget_reset = bool(forget_reset)
+        self._surprised = False
+        self._post_buf = []
         self.retrain_buf_cap = int(retrain_buf_cap)
         # Gradient retrain mutates weight_mu/bias_mu IN PLACE, and the bnn object
         # is shared across all trials in a _worker -- retain/counts are reset in
@@ -400,6 +425,8 @@ class BNNCEM:
         for p, c in self._retrain_pristine:
             p.data.copy_(c)
         self._retrain_buf = []
+        self._post_buf = []
+        self._surprised = False
         self._opt = None
 
     def observe(self, s, a, s2):
@@ -424,11 +451,15 @@ class BNNCEM:
                 self.drift.reset()
                 self._drift_done = True
             self.drift.update(vs["delta_n"])
+            if vs["delta_n"] > PLAN_GATE_TRIGGER:
+                self._surprised = True
             # confidence-gated alpha: same surprise signal gates the CVaR tail
             self._agent.surprise_bar = self.drift.delta_bar
             self._agent.n_since_change = self.post
             if t >= self.change_step + 1:
                 self.post += 1
+                if self.forget_mode == "ml":
+                    self._post_buf.append((obs, act_v, ps2))
                 if self.do_forget and self.post % self.k_forget == 0:
                     self._forget()
                 # SFIR "R": buffer this post-change transition, gradient-retrain
@@ -452,20 +483,28 @@ class BNNCEM:
         # large; as counts accumulate conf -> 1 and the true model is trusted.
         # Static / stationary phases keep plan_retain = None (full trust).
         if self.adaptive and self.change_step is not None:
-            self._agent.plan_retain = self._agent._confidence()
+            if self.plan_gate == "surprise" and not self._surprised:
+                self._agent.plan_retain = None
+            else:
+                self._agent.plan_retain = self._agent._confidence()
         obs = np.zeros(self.grid.n_states, dtype=np.float32)
         obs[int(s)] = 1.0
         return int(np.argmax(self._agent.act(obs)))
 
     def _forget(self):
-        from bnn.dirichlet_workflow import forget_dirichlet
-        forget_dirichlet(self.bnn, self.drift, rho_floor=self.rho_floor,
-                         retain_floor=self.retain_floor)
+        from bnn.dirichlet_workflow import forget_dirichlet, ml_retain_dirichlet
+        if self.forget_mode == "ml":
+            r = ml_retain_dirichlet(self.bnn, self.dyn, self._post_buf)
+            self.bnn.retain.fill_(max(r, self.retain_floor))
+        else:
+            forget_dirichlet(self.bnn, self.drift, rho_floor=self.rho_floor,
+                             retain_floor=self.retain_floor)
         # FIR-CEM specific: after forgetting, the model no longer matches the OLD
         # env by construction, so the stale-env surprise is no longer informative.
         # Reset the drift accumulator so conf_surprise recovers on the NEW-env
         # evidence instead of staying pinned to 0 for the whole episode.
-        self.drift._reset_detection()
+        if self.forget_reset:
+            self.drift._reset_detection()
 
     def _retrain(self):
         """SFIR "R": gradient-retrain the top n_unfrozen layers of the direction
@@ -491,6 +530,10 @@ class BNNCEM:
         with torch.enable_grad():
             retrain_dirichlet(self.bnn, self._opt, model_in, s2_idx,
                               n_steps=self.retrain_steps)
+
+PLAN_GATE_TRIGGER = 2.0  # --plan-gate surprise: delta_n above this (E=1 under a
+                         # calibrated model) counts as "the model was surprised"
+
 
 ADA_CEM_N_THRESHOLD = 3   # post-change samples before switching phases -- matches
                           # ADA-MCTS's DPAS _n_threshold (planning/ada_mcts.py)
@@ -869,6 +912,9 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                k_forget=args.k_forget,
                                rho_floor=getattr(args, "rho_floor", 1e-3),
                                retain_floor=getattr(args, "retain_floor", 0.0),
+                               forget_mode=getattr(args, "forget_mode", "rho"),
+                               plan_gate=getattr(args, "plan_gate", "announce"),
+                               forget_reset=getattr(args, "forget_reset", True),
                                use_counts=args.use_counts,
                                persist_counts=args.persist_counts,
                                count_w=args.count_w,
@@ -981,6 +1027,13 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                    dpas_gamma=args.dpas_gamma)
         else:
             raise ValueError(f"unknown method {name}")
+    # --cem-leaf applies to EVERY method built on the shared CVaR-CEM planner
+    # (cem_fir / cem_static / cem_ada / oracle_cem) -- fairness rule.
+    leaf = getattr(args, "cem_leaf", "heuristic")
+    for m in out.values():
+        agent = getattr(m, "_agent", None)
+        if isinstance(agent, CVaRCEMAgent):
+            agent.leaf_mode = leaf
     return out
 
 
@@ -1085,6 +1138,23 @@ def main():
                          "single huge surprise crush retain 1000x; raise it "
                          "(e.g. 0.5) to forget gradually.  Only affects methods "
                          "whose retain actually decays (cem_fir)")
+    ap.add_argument("--forget-mode", choices=["rho", "ml"], default="rho",
+                    help="cem_fir: how a forget tick sets retain.  rho "
+                         "(default, original): retain *= clip(1/delta_bar).  "
+                         "ml: retain = the value that maximises the likelihood "
+                         "of all post-change transitions under the retain-"
+                         "blended pretrained model (calibrated to the size of "
+                         "the change, not to one slip's surprise)")
+    ap.add_argument("--no-forget-reset", dest="forget_reset",
+                    action="store_false",
+                    help="cem_fir DIAGNOSTIC: do not reset delta_bar after a "
+                         "forget (pre-09-04 behaviour, still in origin/main)")
+    ap.add_argument("--plan-gate", choices=["announce", "surprise"],
+                    default="announce",
+                    help="cem_fir: when plan-time inflation (plan_retain) "
+                         "starts.  announce (default, original): from the "
+                         "announced change.  surprise: only after the first "
+                         "surprising transition")
     ap.add_argument("--retain-floor", type=float, default=0.0,
                     help="cem_fir: hard lower bound on retain itself -- a "
                          "guaranteed residual trust in the pretrained belief no "
@@ -1149,6 +1219,11 @@ def main():
     # p=0.4 from 0.38 -> 0.88 by giving the CVaR estimate more samples)
     ap.add_argument("--cem-candidates", type=int, default=None)
     ap.add_argument("--cem-k-models", type=int, default=None)
+    ap.add_argument("--cem-leaf", choices=["heuristic", "model"],
+                    default="heuristic",
+                    help="leaf value V(s_H) for ALL CVaR-CEM methods: "
+                         "heuristic (default, original) = gamma^dist(s,goal); "
+                         "model = value iteration on the planning-time model")
     ap.add_argument("--cem-n-rollouts", type=int, default=None)
     ap.add_argument("--cem-iters", type=int, default=None)
     ap.add_argument("--cem-plan-gamma", type=float, default=None,
@@ -1224,6 +1299,12 @@ def main():
         log(f"  cem_fir SFIR ablation: do_forget={args.do_forget} "
             f"n_unfrozen={args.n_unfrozen} retrain_every={args.retrain_every} "
             f"retrain_steps={args.retrain_steps} retrain_lr={args.retrain_lr}")
+    if args.cem_leaf != "heuristic":
+        log(f"  CVaR-CEM leaf value (all CEM methods): {args.cem_leaf}")
+    if (args.forget_mode != "rho" or args.plan_gate != "announce"
+            or not args.forget_reset):
+        log(f"  cem_fir forget_mode={args.forget_mode} plan_gate={args.plan_gate}"
+            f" forget_reset={args.forget_reset}")
     if args.rho_floor != 1e-3 or args.retain_floor != 0.0:
         log(f"  cem_fir gentler forgetting: rho_floor={args.rho_floor} "
             f"retain_floor={args.retain_floor}")
@@ -1255,7 +1336,9 @@ def main():
                retrain_every=args.retrain_every,
                retrain_steps=args.retrain_steps, retrain_lr=args.retrain_lr,
                retrain_min_conf=args.retrain_min_conf, seed=args.seed,
-               rho_floor=args.rho_floor, retain_floor=args.retain_floor)
+               rho_floor=args.rho_floor, retain_floor=args.retain_floor,
+               forget_mode=args.forget_mode, plan_gate=args.plan_gate,
+               forget_reset=args.forget_reset, cem_leaf=args.cem_leaf)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
