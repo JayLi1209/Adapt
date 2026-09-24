@@ -309,7 +309,7 @@ class BNNCEM:
                  retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64,
                  seed=0, retrain_min_conf=0.0, rho_floor=1e-3,
                  retain_floor=0.0, forget_mode="rho", plan_gate="announce",
-                 forget_reset=True):
+                 forget_reset=True, surprise_cap=None):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -367,6 +367,16 @@ class BNNCEM:
         # so one slip's ~1e3 surprise keeps crushing retain every tick.
         # Diagnostic only.
         self.forget_reset = bool(forget_reset)
+        # surprise_cap (2026-09-24): soft cap delta_n -> tau*tanh(delta_n/tau)
+        # before it enters the drift filter.  delta_n = nll/H explodes when
+        # the model is near-deterministic (H -> 0), so ONE slip at p=0.9
+        # scores higher than a slip at p=0.5 and forgets as much.  Capping a
+        # single step's score keeps the FREQUENCY of slips (what actually
+        # separates p=0.9 from p=0.5) as the driver of forgetting.  Unlike
+        # rho_floor (a per-tick cap regardless of how many slips), repeated
+        # slips still accumulate.  None = off (original behaviour).
+        self.surprise_cap = (None if surprise_cap is None
+                             else float(surprise_cap))
         self._surprised = False
         self._post_buf = []
         self.retrain_buf_cap = int(retrain_buf_cap)
@@ -450,7 +460,10 @@ class BNNCEM:
             if self.drift_reset and not self._drift_done:
                 self.drift.reset()
                 self._drift_done = True
-            self.drift.update(vs["delta_n"])
+            dn = vs["delta_n"]
+            if self.surprise_cap is not None:
+                dn = self.surprise_cap * float(np.tanh(dn / self.surprise_cap))
+            self.drift.update(dn)
             if vs["delta_n"] > PLAN_GATE_TRIGGER:
                 self._surprised = True
             # confidence-gated alpha: same surprise signal gates the CVaR tail
@@ -915,6 +928,7 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                forget_mode=getattr(args, "forget_mode", "rho"),
                                plan_gate=getattr(args, "plan_gate", "announce"),
                                forget_reset=getattr(args, "forget_reset", True),
+                               surprise_cap=getattr(args, "surprise_cap", None),
                                use_counts=args.use_counts,
                                persist_counts=args.persist_counts,
                                count_w=args.count_w,
@@ -1145,6 +1159,10 @@ def main():
                          "of all post-change transitions under the retain-"
                          "blended pretrained model (calibrated to the size of "
                          "the change, not to one slip's surprise)")
+    ap.add_argument("--surprise-cap", type=float, default=None,
+                    help="cem_fir: soft-cap each step's surprise delta_n at "
+                         "tau via tau*tanh(delta_n/tau) before the drift "
+                         "filter (default off = original)")
     ap.add_argument("--no-forget-reset", dest="forget_reset",
                     action="store_false",
                     help="cem_fir DIAGNOSTIC: do not reset delta_bar after a "
@@ -1302,9 +1320,10 @@ def main():
     if args.cem_leaf != "heuristic":
         log(f"  CVaR-CEM leaf value (all CEM methods): {args.cem_leaf}")
     if (args.forget_mode != "rho" or args.plan_gate != "announce"
-            or not args.forget_reset):
+            or not args.forget_reset or args.surprise_cap is not None):
         log(f"  cem_fir forget_mode={args.forget_mode} plan_gate={args.plan_gate}"
-            f" forget_reset={args.forget_reset}")
+            f" forget_reset={args.forget_reset}"
+            f" surprise_cap={args.surprise_cap}")
     if args.rho_floor != 1e-3 or args.retain_floor != 0.0:
         log(f"  cem_fir gentler forgetting: rho_floor={args.rho_floor} "
             f"retain_floor={args.retain_floor}")
@@ -1338,7 +1357,8 @@ def main():
                retrain_min_conf=args.retrain_min_conf, seed=args.seed,
                rho_floor=args.rho_floor, retain_floor=args.retain_floor,
                forget_mode=args.forget_mode, plan_gate=args.plan_gate,
-               forget_reset=args.forget_reset, cem_leaf=args.cem_leaf)
+               forget_reset=args.forget_reset, cem_leaf=args.cem_leaf,
+               surprise_cap=args.surprise_cap)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
