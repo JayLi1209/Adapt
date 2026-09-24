@@ -309,7 +309,7 @@ class BNNCEM:
                  retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64,
                  seed=0, retrain_min_conf=0.0, rho_floor=1e-3,
                  retain_floor=0.0, forget_mode="rho", plan_gate="announce",
-                 forget_reset=True, surprise_cap=None):
+                 forget_reset=True, surprise_cap=None, surprise_score="ratio"):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -377,6 +377,14 @@ class BNNCEM:
         # slips still accumulate.  None = off (original behaviour).
         self.surprise_cap = (None if surprise_cap is None
                              else float(surprise_cap))
+        # surprise_score (2026-09-24): "ratio" (default, original) delta_n =
+        # nll/H.  "z" = 1 + (nll - H)/std(nll): same mean (1) under a
+        # calibrated model, so the drift filter / rho = 1/delta_bar need no
+        # change, but a near-deterministic model's rare slip scores ~1/sqrt(eps)
+        # instead of ~1/eps.
+        if surprise_score not in ("ratio", "z"):
+            raise ValueError(f"surprise_score must be ratio|z, got {surprise_score!r}")
+        self.surprise_score = surprise_score
         self._surprised = False
         self._post_buf = []
         self.retrain_buf_cap = int(retrain_buf_cap)
@@ -461,6 +469,9 @@ class BNNCEM:
                 self.drift.reset()
                 self._drift_done = True
             dn = vs["delta_n"]
+            if self.surprise_score == "z":
+                dn = 1.0 + (vs["nll"] - vs["entropy"]) / max(vs["nll_std"],
+                                                             SURPRISE_Z_EPS)
             if self.surprise_cap is not None:
                 dn = self.surprise_cap * float(np.tanh(dn / self.surprise_cap))
             self.drift.update(dn)
@@ -544,6 +555,7 @@ class BNNCEM:
             retrain_dirichlet(self.bnn, self._opt, model_in, s2_idx,
                               n_steps=self.retrain_steps)
 
+SURPRISE_Z_EPS = 1e-6    # --surprise-score z: floor on std(nll)
 PLAN_GATE_TRIGGER = 2.0  # --plan-gate surprise: delta_n above this (E=1 under a
                          # calibrated model) counts as "the model was surprised"
 
@@ -929,6 +941,7 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                plan_gate=getattr(args, "plan_gate", "announce"),
                                forget_reset=getattr(args, "forget_reset", True),
                                surprise_cap=getattr(args, "surprise_cap", None),
+                               surprise_score=getattr(args, "surprise_score", "ratio"),
                                use_counts=args.use_counts,
                                persist_counts=args.persist_counts,
                                count_w=args.count_w,
@@ -1159,6 +1172,10 @@ def main():
                          "of all post-change transitions under the retain-"
                          "blended pretrained model (calibrated to the size of "
                          "the change, not to one slip's surprise)")
+    ap.add_argument("--surprise-score", choices=["ratio", "z"], default="ratio",
+                    help="cem_fir: per-step surprise fed to the drift filter.  "
+                         "ratio (default, original) = nll/H; z = 1 + (nll-H)/"
+                         "std(nll), standardized")
     ap.add_argument("--surprise-cap", type=float, default=None,
                     help="cem_fir: soft-cap each step's surprise delta_n at "
                          "tau via tau*tanh(delta_n/tau) before the drift "
@@ -1320,10 +1337,12 @@ def main():
     if args.cem_leaf != "heuristic":
         log(f"  CVaR-CEM leaf value (all CEM methods): {args.cem_leaf}")
     if (args.forget_mode != "rho" or args.plan_gate != "announce"
-            or not args.forget_reset or args.surprise_cap is not None):
+            or not args.forget_reset or args.surprise_cap is not None
+            or args.surprise_score != "ratio"):
         log(f"  cem_fir forget_mode={args.forget_mode} plan_gate={args.plan_gate}"
             f" forget_reset={args.forget_reset}"
-            f" surprise_cap={args.surprise_cap}")
+            f" surprise_cap={args.surprise_cap}"
+            f" surprise_score={args.surprise_score}")
     if args.rho_floor != 1e-3 or args.retain_floor != 0.0:
         log(f"  cem_fir gentler forgetting: rho_floor={args.rho_floor} "
             f"retain_floor={args.retain_floor}")
@@ -1358,7 +1377,8 @@ def main():
                rho_floor=args.rho_floor, retain_floor=args.retain_floor,
                forget_mode=args.forget_mode, plan_gate=args.plan_gate,
                forget_reset=args.forget_reset, cem_leaf=args.cem_leaf,
-               surprise_cap=args.surprise_cap)
+               surprise_cap=args.surprise_cap,
+               surprise_score=args.surprise_score)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],

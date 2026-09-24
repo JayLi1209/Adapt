@@ -66,8 +66,12 @@ def surprise_dirichlet(dyn, bnn, obs, action, next_obs, reward, n_draws=20):
     nll = float(-torch.log(p_bar[s2]).item())
     entropy = float((-(p_bar * torch.log(p_bar)).sum()).item())
     delta_n = nll / (entropy + SURPRISE_EPS)
+    # std of -log p(s2') under s2' ~ p (for the standardized score
+    # (nll - H) / nll_std, 2026-09-24); informational, does not change delta_n.
+    nll_std = float(torch.sqrt((p_bar * (-torch.log(p_bar) - entropy) ** 2)
+                               .sum()).item())
     d = bnn.grid.direction_of(s, a, s2)
-    return dict(delta_n=delta_n, nll=nll, entropy=entropy,
+    return dict(delta_n=delta_n, nll=nll, entropy=entropy, nll_std=nll_std,
                 alpha0=float(alphas.sum(-1).mean().item()),
                 p_dir=p_dirs.mean(0).cpu().numpy(), direction=d,
                 p_reached=float(p_bar[s2].item()))
