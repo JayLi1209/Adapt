@@ -36,6 +36,30 @@ RETAIN_INIT = 1.0          # initial retention (1 = trust the head fully)
 # pulled toward uniform (max entropy) -- which is what makes a slip stop being
 # surprising.  A *multiplicative* scale would leave the mean p=alpha/alpha0 fixed
 # (scale cancels) and could never lower delta_n; a symmetric affine retention can.
+#
+# 2026-09-06: swept c in {0.01..10} on cem_fir WITHOUT gradient retrain (SFI):
+# c=1.0 (Dirichlet(1,1,1), the actual uniform distribution over the simplex,
+# vs 0.1's near-one-hot corners) was a clean win everywhere.
+#
+# 2026-09-10/11: that result turned out to be a "not really adapting" artifact.
+# At c=1.0, a forgotten belief is already so tightly uniform that forget/retrain
+# barely move it -- an ablation with NEITHER forget NOR retrain (just the
+# planning-time plan_retain inflate + confidence-gated CVaR) beats c=1.0 SFI at
+# every tested point, and c=1.0 SFIR (+ gradient retrain, see
+# bnn/dirichlet_workflow.retrain_dirichlet) is WORSE than c=1.0 SFI -- retrain
+# has nothing useful to correct when forget already washed the belief to ~uniform.
+# Reverted to c=0.1 (small -> forgetting genuinely damages the belief, so there
+# is something real for retrain to fix) specifically to make SFIR ("our method"
+# per main_cl_2.tex: Surprise-Forget-Inflate-RETRAIN, gradient-retrains the
+# adapter head -- see run_gridworld_experiments.py's --n-unfrozen, default 1)
+# demonstrate genuine adaptation rather than the confidence-gate's cautious
+# planning alone.  At c=0.1, SFIR does beat SFI on cliffwalking config1
+# (0.65/0.80 vs 0.55/0.70 at p=0.3/0.4, candidates=256/trials=20) though by a
+# modest margin, and still below the c=1.0/no-adapt numbers -- an accepted
+# tradeoff for reporting genuine adaptation rather than a caution artifact.
+# Only affects methods whose retain actually leaves 1.0 (cem_fir,
+# bnn_rats_adaptive).  Full sweep + the "Neither"/oracle_cem findings:
+# doc_tool/experiment_report_2026-09-04.md SS4-6, session notes 2026-09-11.
 CONC_PRIOR = 0.1
 SURPRISE_EPS = 1e-6
 LOGVAR_MIN, LOGVAR_MAX = -10.0, 0.5
@@ -138,6 +162,18 @@ class DirichletDynamicsModel(models.Model):
         # Direction -> cell geometry (fixed grid).
         self.register_buffer("dir_cells", grid.build_dir_cells())
 
+        # Pretraining-concentration table: alpha0 per (s,a) = pretraining
+        # directional counts + K*CONC_PRIOR (the exact conjugate posterior
+        # concentration).  The categorical NLL only sees the mean p=alpha/alpha0
+        # and cannot identify alpha0 (KL pins it near the prior scale ~7 even
+        # with 20k samples), so the head supplies the DIRECTION (p mean) while
+        # this table supplies the SCALE.  Zeros = unset -> fall back to the
+        # head's softplus magnitude (old checkpoints keep their behaviour).
+        # Because the table feeds alpha_head BEFORE the retention transform,
+        # `forget` attenuates pretraining confidence exactly like the head.
+        self.register_buffer("pretrain_alpha0",
+                             torch.zeros(self.n_states, self.n_actions))
+
         # Conjugate Dirichlet-Multinomial online counts: when `use_counts` is on,
         # per-(s,a) directional counts are ADDED to the head's alpha, so the
         # predictive mean migrates toward the empirical post-change frequencies and
@@ -156,6 +192,20 @@ class DirichletDynamicsModel(models.Model):
         """Accumulate one realized directional outcome (d in 0/1/2) for (s,a)."""
         if d >= 0:
             self.counts[int(s), int(a), int(d)] += w
+
+    def set_pretrain_counts(self, counts):
+        """Fill the pretraining-concentration table from directional counts.
+
+        counts: (n_states, n_actions, K) array/tensor of pretraining
+        directional outcomes; alpha0[s,a] = counts.sum(-1) + K*CONC_PRIOR
+        (the conjugate Dirichlet posterior concentration).  Rows with zero
+        counts are left unset (0 -> head magnitude fallback).
+        """
+        if not torch.is_tensor(counts):
+            counts = torch.from_numpy(np.asarray(counts, dtype=np.float32))
+        a0 = counts.sum(-1).float() + self.k_dir * CONC_PRIOR
+        a0 = torch.where(counts.sum(-1) > 0, a0, torch.zeros_like(a0))
+        self.pretrain_alpha0.copy_(a0.to(self.pretrain_alpha0.device))
 
     def reset_counts(self):
         self.counts.zero_()
@@ -181,6 +231,16 @@ class DirichletDynamicsModel(models.Model):
         # retain == 1 -> the head's alpha; retain -> 0 -> all dims -> CONC_PRIOR
         # (equal), i.e. the predictive mean collapses to uniform.
         alpha_head = F.softplus(raw_alpha) + ALPHA_FLOOR
+        pa0 = self.pretrain_alpha0[s, a]                            # (B,)
+        if bool((pa0 > 0).any()):
+            # Head gives the direction (mean), the pretraining-counts table
+            # gives the concentration (conjugate posterior alpha0).  Rows
+            # whose (s,a) was never pretrained keep the head's magnitude.
+            p_mean = alpha_head / alpha_head.sum(-1, keepdim=True)
+            alpha_head = torch.where(
+                (pa0 > 0).unsqueeze(-1),
+                p_mean * pa0.clamp_min(self.k_dir * CONC_PRIOR).unsqueeze(-1),
+                alpha_head)
         alpha = (CONC_PRIOR + self.retain * (alpha_head - CONC_PRIOR)).clamp_min(ALPHA_FLOOR)
         if self.use_counts:
             # alpha_effective = (retained prior) + observed counts  (conjugate update)
@@ -256,6 +316,44 @@ class DirichletDynamicsModel(models.Model):
         avg_nll = nll_acc / self.num_mc_samples
         kl = self._total_kl()
         kl_denom = self.num_train_points if self.num_train_points else B
+        loss = avg_nll + self.beta * kl / kl_denom
+        return loss, {"nll": avg_nll.item(), "kl": kl.item()}
+
+    def loss_dm(self, model_in, dir_counts, r_tgt=None):
+        """Dirichlet-multinomial NLL on aggregated per-(s,a) direction counts.
+
+        The plain categorical `loss` depends only on the predictive mean
+        p = alpha/alpha0, which is invariant to rescaling alpha -- so alpha0
+        (the epistemic confidence the forget/learn loop modulates) receives
+        NO learning signal from data and ends up set by the KL-to-prior term
+        alone (~7 even with 20k samples).  The DM likelihood of aggregated
+        counts identifies alpha0: many consistent outcomes push the
+        concentration up with the sample count, exactly like the conjugate
+        posterior.  Rows are weighted by their counts implicitly (ll sums
+        over the n observations), so goal-weighted sampling also yields
+        goal-near states being more CONFIDENT, not just more accurate.
+        """
+        dir_counts = dir_counts.to(model_in.device)
+        n = dir_counts.sum(-1)                                   # (B,)
+        nll_acc = torch.zeros(1, device=self.device)
+        for _ in range(self.num_mc_samples):
+            alpha, r_mean, r_logvar, _ = self._forward_alpha(model_in, sample=True)
+            a0 = alpha.sum(-1)                                   # (B,)
+            ll = (torch.lgamma(a0) - torch.lgamma(a0 + n)
+                  + (torch.lgamma(alpha + dir_counts)
+                     - torch.lgamma(alpha)).sum(-1))             # (B,)
+            nll_acc = nll_acc + (-ll).mean()
+            if self.learn_reward and r_tgt is not None:
+                # Count-weighted Gaussian NLL on the per-(s,a) mean reward
+                # (each row summarizes n reward observations).
+                w = (n > 0).float()
+                rm = r_mean.squeeze(-1)
+                rl = r_logvar.squeeze(-1)
+                rew_nll = 0.5 * (rl + (r_tgt - rm) ** 2 / torch.exp(rl)) * n * w
+                nll_acc = nll_acc + rew_nll.mean()
+        avg_nll = nll_acc / self.num_mc_samples
+        kl = self._total_kl()
+        kl_denom = self.num_train_points if self.num_train_points else model_in.shape[0]
         loss = avg_nll + self.beta * kl / kl_denom
         return loss, {"nll": avg_nll.item(), "kl": kl.item()}
 

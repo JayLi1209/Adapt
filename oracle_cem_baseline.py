@@ -39,6 +39,7 @@ class PendulumSim:
         return s
 
     def set_mass(self, m): self.m = m
+    def set_gravity(self, g): self.g = g
 
 
 def cem_act(sim, s, rng):

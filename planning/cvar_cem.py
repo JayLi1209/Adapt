@@ -11,6 +11,7 @@ is unchanged from risk_averse_ayan.CVaRCEMAgent.
 """
 import numpy as np
 import torch
+import contextlib
 
 from planning.base import BNNModelPlanner
 
@@ -51,7 +52,7 @@ class CVaRCEMAgent(BNNModelPlanner):
                  alpha_max=ALPHA_MAX, n_confident=N_CONFIDENT,
                  surprise_tau=SURPRISE_TAU,
                  beta=BETA_EXPLORE, gamma=PLAN_GAMMA, action_smooth=ACTION_SMOOTH,
-                 warm_start=WARM_START, rng=None, **kwargs):
+                 warm_start=WARM_START, warm_blend=0.0, rng=None, **kwargs):
         # BNNModelPlanner sets up the map-derived reward/terminal/heuristic arrays.
         super().__init__(dynamics_model, bnn, desc, device, n_actions=n_actions,
                          gamma=gamma, rng=rng, **kwargs)
@@ -77,10 +78,27 @@ class CVaRCEMAgent(BNNModelPlanner):
         self.beta = beta
         self.action_smooth = action_smooth
         self.warm_start = warm_start
+        # warm_blend in [0,1]: fraction of the PREVIOUS step's refit plan
+        # (shifted forward) mixed into the CEM init.  Re-planning from scratch
+        # every step makes the executed first action a fresh sample of a noisy
+        # argmax (dithering); blending commits the plan across steps.
+        self.warm_blend = warm_blend
         # Reward-on-arrival vector and terminal/leaf arrays as plain numpy.
         self.reward_vec = self.cell_reward.astype(np.float64)        # goal +1, hole -1
         self.is_terminal = self.terminal.copy()                     # bool (S,)
         self.terminal_value = self.heuristic.astype(np.float64)     # gamma^dist(s,goal)
+        # leaf_mode (2026-09-23): "heuristic" (default, original) bootstraps
+        # V(s_H) = gamma^dist(s,goal), which assumes the goal is reached WITH
+        # CERTAINTY from any cell.  At gamma=0.9999 that is ~0.999 everywhere,
+        # so a 6-step window sees only the RISK of moving and none of the
+        # benefit of progress -> once the model believes in any hole risk,
+        # hovering in place is optimal until truncation.  "model" bootstraps
+        # with the value-iteration V of the SAME (planning-view) model that
+        # _pretrained_policy already computes each act(), so staying and
+        # moving are scored consistently.  Shared planner -> must be switched
+        # for every CEM method together (runner --cem-leaf).
+        self.leaf_mode = "heuristic"
+        self._V_model = None
         self._uniform = np.full((self.horizon, self.n_actions),
                                 1.0 / self.n_actions, dtype=np.float64)
         self.pi = self._uniform.copy()      # per-timestep categorical (H, A)
@@ -88,14 +106,38 @@ class CVaRCEMAgent(BNNModelPlanner):
         self.last_cvar = 0.0
         self.last_bonus = 0.0
         self.last_qrisk = np.zeros(self.n_actions)
+        self._prev_pi = None    # previous step's refit plan (for warm start)
+        # Planning-time uncertainty gate (SFI "inflate before planning"): when
+        # not None, bnn.retain is scaled by this factor while the planner reads
+        # the model, so a confident-but-possibly-stale model is INFLATED toward
+        # the uniform prior for scoring (CVaR tail becomes real again).  The
+        # online counts are added AFTER the retain transform, so post-change
+        # evidence stays fully trusted.  Set by the FIR wrapper each step.
+        self.plan_retain = None
+
+    @contextlib.contextmanager
+    def _planning_model_view(self):
+        """Temporarily scale bnn.retain by plan_retain while reading the model."""
+        pr = self.plan_retain
+        if pr is None or pr >= 1.0:
+            yield
+            return
+        saved = float(self.bnn.retain.item())
+        self.bnn.retain.fill_(saved * float(pr))
+        try:
+            yield
+        finally:
+            self.bnn.retain.fill_(saved)
 
     # The CEM planner does not use a persistent tree; reset/notify only reset the
     # warm-started plan so a regime change doesn't bias the next plan.
     def reset(self):
         self.pi = self._uniform.copy()
+        self._prev_pi = None
 
     def notify_change(self):
         self.pi = self._uniform.copy()
+        self._prev_pi = None
         # The new regime is unknown: drop to no-data so alpha falls to ALPHA_MIN
         # (maximally risk-averse) until post-change evidence rebuilds confidence.
         self.n_since_change = 0
@@ -149,7 +191,10 @@ class CVaRCEMAgent(BNNModelPlanner):
             state = s2
             disc *= self.gamma
         # terminal bootstrap V(s_H) only for trajectories still running
-        returns += disc * np.where(done, 0.0, self.terminal_value[state])
+        leaf = (self._V_model if (self.leaf_mode == "model"
+                                  and self._V_model is not None)
+                else self.terminal_value)
+        returns += disc * np.where(done, 0.0, leaf[state])
         return returns.reshape(J, K * N)
 
     @staticmethod
@@ -186,6 +231,7 @@ class CVaRCEMAgent(BNNModelPlanner):
             if np.max(np.abs(Vn - V)) < 1e-10:
                 V = Vn; break
             V = Vn
+        self._V_model = V
         return Q.argmax(1), T
 
     def _policy_init_pi(self, s0):
@@ -208,13 +254,20 @@ class CVaRCEMAgent(BNNModelPlanner):
         if self.is_terminal[s0]:
             return self._eye_a[0].cpu().numpy()
 
-        # K posterior transition matrices (Thompson draws -> epistemic axis).
-        Ts, _ = self._model_matrices(self.k_models, deterministic=False)
+        with self._planning_model_view():
+            # K posterior transition matrices (Thompson draws -> epistemic axis).
+            Ts, _ = self._model_matrices(self.k_models, deterministic=False)
 
-        # CEM init: seed the per-timestep categorical with the model's OWN greedy
-        # policy, unrolled from s0, so the rollouts evaluate continuations that
-        # FOLLOW THE MODEL POLICY rather than random walks.
-        self.pi = self._policy_init_pi(s0)
+            # CEM init: seed the per-timestep categorical with the model's OWN greedy
+            # policy, unrolled from s0, so the rollouts evaluate continuations that
+            # FOLLOW THE MODEL POLICY rather than random walks.
+            self.pi = self._policy_init_pi(s0)
+            # Warm start: blend in yesterday's plan shifted one step forward, so
+            # the executed first action is not a fresh draw of a noisy argmax.
+            if self.warm_blend > 0.0 and self._prev_pi is not None:
+                shifted = np.roll(self._prev_pi, -1, axis=0)
+                shifted[-1] = 1.0 / self.n_actions
+                self.pi = (1.0 - self.warm_blend) * self.pi + self.warm_blend * shifted
 
         # ── Confidence-gated risk control ────────────────────────────────────
         # One confidence signal drives BOTH knobs: alpha (risk tail) and whether
@@ -245,6 +298,7 @@ class CVaRCEMAgent(BNNModelPlanner):
             self.pi = (counts + self.action_smooth)
             self.pi /= self.pi.sum(axis=1, keepdims=True)
             last_scores, last_seqs = scores, A_seq
+        self._prev_pi = self.pi.copy()   # warm-start source for the next step
 
         # Diagnostics: per-first-action mean CVaR over the final population.
         a0 = int(np.argmax(self.pi[0]))

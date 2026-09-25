@@ -1,0 +1,19 @@
+Loaded pretrained BNN from /home/guo/Adapt/data/pendulum/bnn_dynamics_yuanhe.pth
+======================================================================
+Environment change experiments (change at t=0)
+  trials=10  steps=100
+  CEM: H=16 I=8 J=512 K=5
+  MCTS: sims=200 actions=7 rollout=15
+======================================================================
+
+--- mass_1_to_4 (mass=4.0) ---
+  Oracle CEM:          -517.1 ± 117.0  (107s)
+  Our method (CEM):     -657.8 ± 117.0  (66s)
+  ADA-MCTS:             -601.9 ± 118.0  (798s)
+
+--- gravity_10_to_20 (g=20.0) ---
+  Oracle CEM:          -600.6 ± 202.0  (106s)
+  Our method (CEM):     -781.3 ± 21.6  (58s)
+  ADA-MCTS:             -759.5 ± 14.9  (730s)
+
+DONE.

@@ -66,27 +66,102 @@ def surprise_dirichlet(dyn, bnn, obs, action, next_obs, reward, n_draws=20):
     nll = float(-torch.log(p_bar[s2]).item())
     entropy = float((-(p_bar * torch.log(p_bar)).sum()).item())
     delta_n = nll / (entropy + SURPRISE_EPS)
+    # std of -log p(s2') under s2' ~ p (for the standardized score
+    # (nll - H) / nll_std, 2026-09-24); informational, does not change delta_n.
+    nll_std = float(torch.sqrt((p_bar * (-torch.log(p_bar) - entropy) ** 2)
+                               .sum()).item())
     d = bnn.grid.direction_of(s, a, s2)
-    return dict(delta_n=delta_n, nll=nll, entropy=entropy,
+    return dict(delta_n=delta_n, nll=nll, entropy=entropy, nll_std=nll_std,
                 alpha0=float(alphas.sum(-1).mean().item()),
                 p_dir=p_dirs.mean(0).cpu().numpy(), direction=d,
                 p_reached=float(p_bar[s2].item()))
 
 
-def forget_dirichlet(bnn, drift_filter):
+def forget_dirichlet(bnn, drift_filter, rho_floor=1e-3, retain_floor=0.0):
     """Dirichlet-native re-inflation: retain the head's alpha toward the SYMMETRIC
     prior, which pulls the predictive mean toward uniform (so surprise drops).
 
-        retain <- retain * rho,    rho = 1 / max(delta_bar, 1)  in (0, 1].
+        retain <- max(retain * rho, retain_floor),
+        rho = clip(1 / max(delta_bar, 1), rho_floor, 1]
 
     rho == 1 (delta_bar <= 1, "nothing changed") is a no-op.  Returns
     (rho, retain_before, retain_after).
+
+    `rho_floor` / `retain_floor` make forgetting GENTLER (2026-09-16,
+    collaborator's "raise the retain factor / clip rho" suggestion).  Defaults
+    reproduce the original behaviour exactly.
+
+      rho_floor    : lower bound on a single tick's shrink factor.  The original
+                     1e-3 lets one huge delta_bar crush retain by 1000x in a
+                     single application; raising it (e.g. 0.5) caps how much any
+                     one forget tick can forget, so retain decays gradually
+                     instead of collapsing.
+      retain_floor : hard lower bound on retain itself, i.e. a guaranteed
+                     residual trust in the pretrained belief no matter how much
+                     surprise accumulates.  Targets the known failure mode where
+                     mild changes (p=0.9, the old prior still ~90% right) end up
+                     WORSE than severe ones because retain is driven to ~0
+                     regardless of how large the real change was.
     """
-    rho = float(np.clip(1.0 / max(drift_filter.delta_bar, 1.0), 1e-3, 1.0))
+    rho = float(np.clip(1.0 / max(drift_filter.delta_bar, 1.0),
+                        float(rho_floor), 1.0))
     before = float(bnn.retain.item())
     after = before * rho if rho < 1.0 else before
+    after = max(after, float(retain_floor))
     bnn.retain.fill_(after)
     return rho, before, after
+
+
+ML_RETAIN_GRID = np.concatenate([[0.0], np.logspace(-3, 0, 31)])
+
+
+@torch.no_grad()
+def ml_retain_dirichlet(bnn, dyn, buf, retain_grid=ML_RETAIN_GRID):
+    """Evidence-calibrated retain (2026-09-23, "forget-mode ml").
+
+    The rho = 1/delta_bar rule measures how SURPRISING the data is, not how
+    much the env CHANGED: a model pretrained at p=1.0 has ~zero entropy, so ONE
+    slip gives delta_bar ~ 1e3 whether the new p is 0.9 or 0.3, and retain is
+    crushed to the 1e-3 floor either way.  At p=0.9 that throws away a belief
+    that is still 90% right.
+
+    Instead pick the retain that best EXPLAINS the post-change transitions:
+        retain* = argmax_r  sum_{(s,a,s2) in buf} log pbar_r(s2 | s,a),
+        pbar_r  = mean of Dir(CONC_PRIOR + r * (alpha_head - CONC_PRIOR))
+    i.e. the same retain-blend the model already uses, without the online
+    counts (they are the separate, local evidence channel).  Mild changes
+    keep most of the prior (r* large), severe ones still go to ~0.
+
+    buf : list of (obs_onehot, act_onehot, s2_idx).  Returns retain*.
+    """
+    from bnn.dirichlet_model import CONC_PRIOR, ALPHA_FLOOR
+    if not buf:
+        return float(bnn.retain.item())
+    obs = torch.as_tensor(np.stack([b[0] for b in buf]), dtype=torch.float32,
+                          device=device)
+    act = torch.as_tensor(np.stack([b[1] for b in buf]), dtype=torch.float32,
+                          device=device)
+    s2 = torch.as_tensor([int(b[2]) for b in buf], dtype=torch.long,
+                         device=device)
+    model_in = dyn._get_model_input(obs, act)
+    saved_r, saved_c = float(bnn.retain.item()), bnn.use_counts
+    bnn.retain.fill_(1.0)
+    bnn.use_counts = False
+    try:
+        alpha_head, _, _, cells = bnn._forward_alpha(model_in, sample=False)
+    finally:
+        bnn.retain.fill_(saved_r)
+        bnn.use_counts = saved_c
+    best_r, best_ll = saved_r, -np.inf
+    for r in retain_grid:
+        alpha = (CONC_PRIOR + float(r) * (alpha_head - CONC_PRIOR)).clamp_min(
+            ALPHA_FLOOR)
+        p_dir = alpha / alpha.sum(-1, keepdim=True)
+        p_cells = bnn._cells_from_dir(p_dir, cells).clamp_min(SURPRISE_EPS)
+        ll = float(torch.log(p_cells.gather(1, s2.unsqueeze(1))).sum().item())
+        if ll > best_ll + 1e-9:
+            best_r, best_ll = float(r), ll
+    return best_r
 
 
 def unfrozen_params_dirichlet(bnn, n_unfrozen):
