@@ -309,7 +309,8 @@ class BNNCEM:
                  retrain_steps=5, retrain_lr=1e-2, retrain_buf_cap=64,
                  seed=0, retrain_min_conf=0.0, rho_floor=1e-3,
                  retain_floor=0.0, forget_mode="rho", plan_gate="announce",
-                 forget_reset=True, surprise_cap=None, surprise_score="ratio"):
+                 forget_reset=True, surprise_cap=None, surprise_score="ratio",
+                 surprise_clip=None):
         self.bnn = bnn
         self.dyn = dyn
         self.grid = grid
@@ -385,6 +386,10 @@ class BNNCEM:
         if surprise_score not in ("ratio", "z"):
             raise ValueError(f"surprise_score must be ratio|z, got {surprise_score!r}")
         self.surprise_score = surprise_score
+        # surprise_clip (2026-09-25, collaborator's fix): HARD clip
+        # delta_n -> min(delta_n, c) before the drift filter (c=2 suggested).
+        self.surprise_clip = (None if surprise_clip is None
+                              else float(surprise_clip))
         self._surprised = False
         self._post_buf = []
         self.retrain_buf_cap = int(retrain_buf_cap)
@@ -474,6 +479,8 @@ class BNNCEM:
                                                              SURPRISE_Z_EPS)
             if self.surprise_cap is not None:
                 dn = self.surprise_cap * float(np.tanh(dn / self.surprise_cap))
+            if self.surprise_clip is not None:
+                dn = min(dn, self.surprise_clip)
             self.drift.update(dn)
             if vs["delta_n"] > PLAN_GATE_TRIGGER:
                 self._surprised = True
@@ -942,6 +949,7 @@ def build_methods(args, grid, bnn, dyn, dist_by_time, names, change_step=None):
                                forget_reset=getattr(args, "forget_reset", True),
                                surprise_cap=getattr(args, "surprise_cap", None),
                                surprise_score=getattr(args, "surprise_score", "ratio"),
+                               surprise_clip=getattr(args, "surprise_clip", None),
                                use_counts=args.use_counts,
                                persist_counts=args.persist_counts,
                                count_w=args.count_w,
@@ -1176,6 +1184,10 @@ def main():
                     help="cem_fir: per-step surprise fed to the drift filter.  "
                          "ratio (default, original) = nll/H; z = 1 + (nll-H)/"
                          "std(nll), standardized")
+    ap.add_argument("--surprise-clip", type=float, default=None,
+                    help="cem_fir: HARD clip each step's surprise delta_n at c "
+                         "(min(delta_n, c)) before the drift filter; "
+                         "collaborator's fix uses c=2 (default off)")
     ap.add_argument("--surprise-cap", type=float, default=None,
                     help="cem_fir: soft-cap each step's surprise delta_n at "
                          "tau via tau*tanh(delta_n/tau) before the drift "
@@ -1338,11 +1350,12 @@ def main():
         log(f"  CVaR-CEM leaf value (all CEM methods): {args.cem_leaf}")
     if (args.forget_mode != "rho" or args.plan_gate != "announce"
             or not args.forget_reset or args.surprise_cap is not None
-            or args.surprise_score != "ratio"):
+            or args.surprise_score != "ratio" or args.surprise_clip is not None):
         log(f"  cem_fir forget_mode={args.forget_mode} plan_gate={args.plan_gate}"
             f" forget_reset={args.forget_reset}"
             f" surprise_cap={args.surprise_cap}"
-            f" surprise_score={args.surprise_score}")
+            f" surprise_score={args.surprise_score}"
+            f" surprise_clip={args.surprise_clip}")
     if args.rho_floor != 1e-3 or args.retain_floor != 0.0:
         log(f"  cem_fir gentler forgetting: rho_floor={args.rho_floor} "
             f"retain_floor={args.retain_floor}")
@@ -1378,7 +1391,8 @@ def main():
                forget_mode=args.forget_mode, plan_gate=args.plan_gate,
                forget_reset=args.forget_reset, cem_leaf=args.cem_leaf,
                surprise_cap=args.surprise_cap,
-               surprise_score=args.surprise_score)
+               surprise_score=args.surprise_score,
+               surprise_clip=args.surprise_clip)
     tasks = []
     # 1. stationary verification (change_step=None disables adaptation)
     tasks.append((args.grid, "stationary", [(0, ORIG_P)],
