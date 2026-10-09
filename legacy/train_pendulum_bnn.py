@@ -2,7 +2,7 @@
 smoother trajectories, then trains with batched GPU operations.
 
 Saves checkpoint + normalizer to data/pendulum/.
-Run:  python train_pendulum_bnn.py
+Run:  python legacy/train_pendulum_bnn.py
 """
 
 import pathlib
@@ -11,12 +11,21 @@ import numpy as np
 import torch
 from torch import optim
 
+import os
+import sys
+
+# This script lives in legacy/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from config import device
 from bnn.gaussian_model import make_gaussian_bnn
 from env.pendulum import build_pendulum_env
 from mbrl.types import TransitionBatch
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).resolve().parent.parent  # repo root (script lives in legacy/)
 SAVE_DIR = _HERE / "data" / "pendulum"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 

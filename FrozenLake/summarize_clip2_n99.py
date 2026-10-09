@@ -25,7 +25,7 @@ gamma=1.0 (NO discount; discount only inside the planner), K_FORGET=1, change at
 ts=0 ([1,0,0] -> [p',(1-p')/2,(1-p')/2]), --max-steps 1000 (NO truncation),
 holes scored 0 so mean return == goal rate, seed 0.
 
-    python summarize_clip2_n99.py
+    python FrozenLake/summarize_clip2_n99.py
 """
 import json
 import pathlib

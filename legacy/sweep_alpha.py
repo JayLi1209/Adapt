@@ -25,16 +25,16 @@ logs remain valid seed-0 runs.
 
 Run (from inside the repo, with mbrl + ns_gym importable):
     conda activate nsgym
-    python plot/sweep_alpha.py                            # fill the alpha grid, seed 0
-    python plot/sweep_alpha.py --alphas 0.5 --seeds 1 2   # extra seeds for one alpha
-    python plot/sweep_alpha.py --matched                  # matched-dynamics baseline
+    python legacy/sweep_alpha.py                            # fill the alpha grid, seed 0
+    python legacy/sweep_alpha.py --alphas 0.5 --seeds 1 2   # extra seeds for one alpha
+    python legacy/sweep_alpha.py --matched                  # matched-dynamics baseline
 """
 import argparse
 import pathlib
 import sys
 
 # The script lives in plot/ but imports the repo-root modules; put the root on
-# sys.path so `python plot/sweep_alpha.py` works directly.
+# sys.path so `python legacy/sweep_alpha.py` works directly.
 _HERE = pathlib.Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:

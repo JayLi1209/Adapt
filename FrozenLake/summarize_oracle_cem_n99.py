@@ -14,7 +14,7 @@ its run (goal rate over the first 99 trials / seeds):
   RATS      FL : ADA-MCTS repo logs/fl_rats{,_p90,_p50,_p30,_p10}_100ep.log
             NS : ADA-MCTS repo results/bridge_rats_bridge_open_p100_to_*_d3.json
 
-    python summarize_oracle_cem_n99.py
+    python FrozenLake/summarize_oracle_cem_n99.py
 """
 import glob
 import json

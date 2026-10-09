@@ -26,10 +26,10 @@ the JSON.
 
 Run (one process per N):
     conda activate nsgym
-    python sweep_dirichlet_layers.py --n-train-layers 3 --trials 40 \
+    python FrozenLake/sweep_dirichlet_layers.py --n-train-layers 3 --trials 40 \
         --out-dir results/adapter_sweep
     # g3-style alpha cell with a full trace for the first 2 trials:
-    python sweep_dirichlet_layers.py --n-train-layers 1 --head 0 --cvar-alpha 0.5 \
+    python FrozenLake/sweep_dirichlet_layers.py --n-train-layers 1 --head 0 --cvar-alpha 0.5 \
         --max-steps 500 --trials 40 --out-dir results/g3 --verbose-steps 2
 """
 import argparse
@@ -43,6 +43,15 @@ import numpy as np
 import torch
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+import os
+import sys
+
+# This script lives in FrozenLake/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from config import device, SAVE_DIR, ETA, GAMMA_UNCERTAINTY
 from env import build_scheduled_env

@@ -2,7 +2,7 @@
 goal rate +/- SEM, dbar at FIRST detection (mean +/- SEM over trials that
 detected), median final retain, #trials hitting the 1000-step cap, mean length.
 
-    python summarize_win5_n99.py
+    python FrozenLake/summarize_win5_n99.py
 """
 import glob
 import json

@@ -20,7 +20,7 @@ COMMON="--oracle --n-unfrozen 0 --no-forget --seed 0 --max-steps 1000 --cvar-alp
 for P in 0.9 0.7 0.5 0.3 0.1; do
   for K in $(seq 0 $(( NSHARD - 1 ))); do
     mkdir -p $OUT/fl_p$P
-    CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 $PY -u sweep_unfrozen_layers.py $COMMON \
+    CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 $PY -u FrozenLake/sweep_unfrozen_layers.py $COMMON \
       --trials $PER --trial-start $(( K * PER )) --change-p $P \
       --out-dir $OUT/fl_p$P/shard$K > $OUT/fl_p$P/shard$K.out 2>&1 &
   done

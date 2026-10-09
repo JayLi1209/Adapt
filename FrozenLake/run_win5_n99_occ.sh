@@ -33,7 +33,7 @@ run_one(){ # row p shard flags...
   local R=$1 P=$2 K=$3; shift 3
   local D=$OUT/$R/win5_p$P
   mkdir -p $D
-  CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 $PY -u sweep_unfrozen_layers.py \
+  CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 $PY -u FrozenLake/sweep_unfrozen_layers.py \
       --n-unfrozen 1 --trials $PER --trial-start $(( K * PER )) --seed 0 \
       --max-steps 1000 --cvar-alpha 0.0 --drift-window 5 --change-p $P "$@" \
       --out-dir $D/shard$K > $D/shard$K.out 2>&1

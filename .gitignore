@@ -7,3 +7,4 @@ backup/
 *.out
 *.tex
 results/
+scratch/

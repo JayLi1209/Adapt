@@ -14,7 +14,7 @@ All conditions share the 0.83 reference setup: CVaR+CEM planner at fixed
 cvar_alpha=0.0, gamma=1.0, [1,0,0]->[0.7,0.15,0.15] at ts=0, 100 trials, and
 --max-steps 1000 so nothing truncates.
 
-    python summarize_fl_ablation.py
+    python FrozenLake/summarize_fl_ablation.py
 """
 import json
 import pathlib

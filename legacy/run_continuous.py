@@ -5,7 +5,7 @@ Non-stationarity: pendulum mass 1.0 → 3.0 at t=80.
 The BNN detects the change via surprise, the drift filter tracks it,
 and forget re-inflates weight covariance to restore adaptability.
 
-Run:  python run_continuous.py
+Run:  python legacy/run_continuous.py
 """
 
 import copy
@@ -14,13 +14,22 @@ import pathlib
 import numpy as np
 import torch
 
+import os
+import sys
+
+# This script lives in legacy/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from config import device, ETA, GAMMA_UNCERTAINTY
 from env import build_pendulum_env
 from drift import DriftFilterV2
 from bnn import make_gaussian_bnn, surprise_gaussian, forget_gaussian, mean_sigma
 from planning.continuous_cem import ContinuousCEMAgent, H_PLAN, N_CEM_ITERS, N_CANDIDATES, K_MODELS, GAMMA
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).resolve().parent.parent  # repo root (script lives in legacy/)
 LOG = str(_HERE / "run_pendulum_adapt.log")
 PENDULUM_SAVE_DIR = _HERE / "data" / "pendulum"
 

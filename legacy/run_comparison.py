@@ -1,13 +1,21 @@
 """Pipeline: collect oracle data → train BNN → run both methods → compare.
 
-Usage: python run_comparison.py [--skip-collect] [--skip-train]
+Usage: python legacy/run_comparison.py [--skip-collect] [--skip-train]
 """
 
 import copy, math, pathlib, sys, time, numpy as np, torch
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).resolve().parent.parent  # repo root (script lives in legacy/)
 BNN_DIR = _HERE / "data" / "pendulum_oracle"
 BNN_DIR.mkdir(parents=True, exist_ok=True)
+
+import os
+
+# This script lives in legacy/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from config import device, ETA, GAMMA_UNCERTAINTY
 from env import build_pendulum_env

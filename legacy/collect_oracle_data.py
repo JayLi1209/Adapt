@@ -5,7 +5,7 @@ import pathlib, time
 import numpy as np
 from oracle_cem_baseline import PendulumSim, cem_act as _cem_act, H, I, J, GAMMA
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).resolve().parent.parent  # repo root (script lives in legacy/)
 OUT_DIR = _HERE / "data" / "pendulum_oracle"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
