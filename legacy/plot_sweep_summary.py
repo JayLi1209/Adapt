@@ -28,8 +28,8 @@ and truncated trials contribute 0.
 Output: results/graph2/sweep_alpha_summary.png (+ a stdout table).
 
 Usage:
-    python plot/plot_sweep_summary.py                  # all results/alpha_*.log
-    python plot/plot_sweep_summary.py results/alpha_0p5.log [more.log ...]
+    python legacy/plot_sweep_summary.py                  # all results/alpha_*.log
+    python legacy/plot_sweep_summary.py results/alpha_0p5.log [more.log ...]
 """
 import re
 import sys

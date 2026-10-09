@@ -45,6 +45,11 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+# sweep_dirichlet_layers (adapter helpers shared with FrozenLake) lives in FrozenLake/.
+_FL_DIR = os.path.join(_REPO_ROOT, "FrozenLake")
+if _FL_DIR not in sys.path:
+    sys.path.insert(1, _FL_DIR)
+
 # Bridge checkpoints live under Bridge/data/<grid>/, not the repo-root data/.
 BRIDGE_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 

@@ -14,7 +14,7 @@ All conditions share: ns-Bridge 5x8, deterministic prior p=1.0, CVaR+CEM at
 fixed cvar_alpha=0.0, gamma=1.0, plan_gamma=1.0, retrain_steps=50, K_FORGET=1, 100 trials,
 --max-steps 1000 so nothing truncates.
 
-    python summarize_bridge_ablation.py
+    python Bridge/summarize_bridge_ablation.py
 """
 import glob
 import json

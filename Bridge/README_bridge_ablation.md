@@ -9,7 +9,7 @@ planner's discount:
 | B | `Bridge/results/bridge_pg095/` | **0.95** | 2026-09-03 22:16 → 22:41 |
 
 Reproduce: `bash Bridge/run_bridge_ablation.sh` / `bash Bridge/run_bridge_pg095.sh`.
-Summarize: `python summarize_bridge_ablation.py` (edit `RESULT_DIR` for run B).
+Summarize: `python Bridge/summarize_bridge_ablation.py` (edit `RESULT_DIR` for run B).
 Logs: `bridge_ablation.log`, `bridge_pg095.log`.
 
 **Run B supersedes run A** — see §8. Run A's headline result is a confound.

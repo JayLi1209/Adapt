@@ -29,7 +29,7 @@ risk-aware about holes; SCORING is hole=0 (== goal rate) as everywhere else.
 With gamma=1 and hole=-1 the VI fixed point is well defined (holes are
 absorbing with negative value, so the agent strictly prefers reaching the goal).
 
-    python run_frozenlake_oracle.py --trials 100 --max-steps 1000 \
+    python FrozenLake/run_frozenlake_oracle.py --trials 100 --max-steps 1000 \
         --out-dir results/fl_ablation
 """
 import argparse
@@ -37,6 +37,15 @@ import json
 import pathlib
 
 import numpy as np
+
+import os
+import sys
+
+# This script lives in FrozenLake/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from env import build_scheduled_env
 from env.frozenlake import MODIFIED_REWARDS

@@ -6,7 +6,7 @@ Gold-standard baseline — upper bound on what CEM can achieve.
 import math, pathlib, time
 import numpy as np
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).resolve().parent.parent  # repo root (script lives in legacy/)
 LOG = str(_HERE / "run_pendulum_cem.log")
 
 MASS_SCHEDULE = [(0, 1.0), (80, 3.0)]

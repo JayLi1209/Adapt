@@ -5,11 +5,20 @@ Run after collect_oracle_data.py completes.
 import pathlib, numpy as np, torch
 from torch import optim
 
+import os
+import sys
+
+# This script lives in legacy/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from config import device
 from bnn.gaussian_model import make_gaussian_bnn
 from mbrl.types import TransitionBatch
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).resolve().parent.parent  # repo root (script lives in legacy/)
 DATA_DIR = _HERE / "data" / "pendulum_oracle"
 SAVE_DIR = DATA_DIR
 SAVE_DIR.mkdir(parents=True, exist_ok=True)

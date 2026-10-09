@@ -27,10 +27,10 @@ Outputs (into --out-dir, default results/pendulum_default):
 
 Run:
     conda activate nsgym
-    CUDA_VISIBLE_DEVICES=<gpu> python run_pendulum_default.py --trials 100
+    CUDA_VISIBLE_DEVICES=<gpu> python legacy/run_pendulum_default.py --trials 100
 
 Re-plot later without re-running:
-    python run_pendulum_default.py --plot-only --out-dir results/pendulum_default
+    python legacy/run_pendulum_default.py --plot-only --out-dir results/pendulum_default
 """
 import argparse
 import copy
@@ -42,6 +42,15 @@ import time
 import numpy as np
 import torch
 
+import os
+import sys
+
+# This script lives in legacy/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 from config import device, ETA, GAMMA_UNCERTAINTY
 from env import build_pendulum_env
 from drift import DriftFilterV2
@@ -52,7 +61,7 @@ from bnn import (make_gaussian_bnn, load_arch, surprise_gaussian, forget_gaussia
 from planning.continuous_cem import (ContinuousCEMAgent, GAMMA, project_unit_circle,
                                      pendulum_reward)
 
-SAVE_DIR = pathlib.Path(__file__).parent / "data" / "pendulum"
+SAVE_DIR = pathlib.Path(__file__).resolve().parent.parent / "data" / "pendulum"
 
 # ── CLAUDE.md default setting ─────────────────────────────────────────────────
 OBS_DIM, ACT_DIM = 3, 1

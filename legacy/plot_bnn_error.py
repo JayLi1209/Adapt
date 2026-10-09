@@ -17,8 +17,8 @@ plot error (y) vs timestep (x). One figure per alpha log, written to
 results/graph1/.
 
 Usage:
-    python plot_bnn_error.py                 # all results/alpha_*.log
-    python plot_bnn_error.py results/alpha_0p5.log [more.log ...]
+    python legacy/plot_bnn_error.py                 # all results/alpha_*.log
+    python legacy/plot_bnn_error.py results/alpha_0p5.log [more.log ...]
 """
 import re
 import sys

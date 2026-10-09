@@ -41,8 +41,8 @@ checkpoints are kept under `data/bridge/k2_opposite_archive/`.
 
 ## Pretraining
 
-    python ../pretrain_gridworld.py --grid bridge     --p 1.0
-    python ../pretrain_gridworld.py --grid bridge_h17 --p 1.0
+    python ../FrozenLake/pretrain_gridworld.py --grid bridge     --p 1.0
+    python ../FrozenLake/pretrain_gridworld.py --grid bridge_h17 --p 1.0
 
 Note `pretrain_gridworld.py` writes to the repo-root `data/<grid>/`; move the
 resulting checkpoint under `Bridge/data/<grid>/`, which is where these scripts

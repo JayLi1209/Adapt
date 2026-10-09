@@ -13,12 +13,21 @@ Refactor of notebooks/risk_averse_ayan.py into the repo/ package:
 
 Run (from inside repo/, with mbrl + ns_gym importable):
     conda activate nsgym
-    python run_risk_averse.py
+    python legacy/run_risk_averse.py
 """
 import pathlib
 
 import numpy as np
 import torch
+
+import os
+import sys
+
+# This script lives in legacy/; the shared modules (config, grids, bnn, env,
+# planning, utils, drift) live at the repo root, so put the root on sys.path.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from config import device, SAVE_DIR, ETA, KAPPA, GAMMA_UNCERTAINTY
 from env import build_scheduled_env
@@ -43,7 +52,7 @@ K_FORGET = 1                         # forget EVERY post-change step
 TRIAL_LEN = 100
 LEARN = True                         # accumulate post-change Dirichlet counts
 
-_HERE = pathlib.Path(__file__).parent
+_HERE = pathlib.Path(__file__).resolve().parent.parent  # repo root (script lives in legacy/)
 LOG = str(_HERE / "risk_averse_ayan.log")
 PLOT = str(_HERE / "risk_averse_ayan_metrics.png")
 
