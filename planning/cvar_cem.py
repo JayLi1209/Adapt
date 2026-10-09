@@ -51,7 +51,8 @@ class CVaRCEMAgent(BNNModelPlanner):
                  alpha_max=ALPHA_MAX, n_confident=N_CONFIDENT,
                  surprise_tau=SURPRISE_TAU,
                  beta=BETA_EXPLORE, gamma=PLAN_GAMMA, action_smooth=ACTION_SMOOTH,
-                 warm_start=WARM_START, rng=None, **kwargs):
+                 warm_start=WARM_START, pi_kappa=0.0, step_cost=0.0,
+                 rng=None, **kwargs):
         # BNNModelPlanner sets up the map-derived reward/terminal/heuristic arrays.
         super().__init__(dynamics_model, bnn, desc, device, n_actions=n_actions,
                          gamma=gamma, rng=rng, **kwargs)
@@ -77,7 +78,23 @@ class CVaRCEMAgent(BNNModelPlanner):
         self.beta = beta
         self.action_smooth = action_smooth
         self.warm_start = warm_start
+        # Algorithm 3 line 4 re-widening: the CEM proposal is seeded from the
+        # model's STALE greedy policy and (unlike the Gaussian-CEM sigma reset)
+        # is never re-widened, so a changed belief cannot move the argmax if the
+        # proposal never proposes the alternative.  pi_kappa mixes the seed with
+        # uniform:  pi <- (1-kappa)*greedy + kappa*uniform.
+        self.pi_kappa = float(pi_kappa)
+        # instrumentation filled by act()
+        self.last_margin = 0.0
+        self.last_scores = None
+        self.last_seqs_a0 = None
         # Reward-on-arrival vector and terminal/leaf arrays as plain numpy.
+        # Per-step living cost: a NEGATIVE reward charged on every non-terminal
+        # transition inside the planner's imagination (and in the value-iteration
+        # policy below).  The ENV reward is untouched, so the reported return /
+        # goal rate keep their meaning -- this only changes what the planner
+        # prefers, making dithering expensive and a short route worth risk.
+        self.step_cost = float(step_cost)
         self.reward_vec = self.cell_reward.astype(np.float64)        # goal +1, hole -1
         self.is_terminal = self.terminal.copy()                     # bool (S,)
         self.terminal_value = self.heuristic.astype(np.float64)     # gamma^dist(s,goal)
@@ -144,7 +161,8 @@ class CVaRCEMAgent(BNNModelPlanner):
             u = self.rng.random((M, 1)) * cdf[:, -1:]
             s2 = (cdf >= u).argmax(axis=1)                   # sample next cell
             s2 = np.where(done, state, s2)
-            returns += disc * np.where(done, 0.0, self.reward_vec[s2])
+            step_r = self.reward_vec[s2] - self.step_cost * (~self.is_terminal[s2])
+            returns += disc * np.where(done, 0.0, step_r)
             done = done | self.is_terminal[s2]
             state = s2
             disc *= self.gamma
@@ -177,7 +195,8 @@ class CVaRCEMAgent(BNNModelPlanner):
         r = self.reward_vec                                # (S,) reward on arrival
         term = self.is_terminal
         cont = (~term).astype(np.float64)                  # bootstrap 0 at absorbers
-        exp_r = (T * r[None, None, :]).sum(-1)             # (S,A) E[reward on arrival]
+        r_eff = r - self.step_cost * (~term)               # living cost on non-terminals
+        exp_r = (T * r_eff[None, None, :]).sum(-1)         # (S,A) E[reward on arrival]
         V = np.zeros(self.n, dtype=np.float64)
         Q = exp_r
         for _ in range(500):
@@ -200,6 +219,11 @@ class CVaRCEMAgent(BNNModelPlanner):
             pi[t, a] += 1.0
             s = int(np.argmax(T[s, a]))                    # expected next state
         pi /= pi.sum(1, keepdims=True)
+        if self.pi_kappa > 0.0:
+            # re-widen: blend the greedy seed toward uniform so CEM keeps mass on
+            # alternatives the stale policy would never propose.
+            pi = (1.0 - self.pi_kappa) * pi + self.pi_kappa * self._uniform
+            pi /= pi.sum(1, keepdims=True)
         return pi
 
     @torch.no_grad()
@@ -254,6 +278,11 @@ class CVaRCEMAgent(BNNModelPlanner):
             if mask.any():
                 qrisk[ai] = last_scores[mask].mean()
         self.last_qrisk = qrisk
+        # score margin: chosen first-action mean score minus the runner-up's
+        finite = np.sort(qrisk[np.isfinite(qrisk)])[::-1]
+        self.last_margin = float(finite[0] - finite[1]) if finite.size > 1 else float("nan")
+        self.last_scores = last_scores
+        self.last_seqs_a0 = last_seqs[:, 0].copy()
         self.last_cvar = float(qrisk[a0]) if np.isfinite(qrisk[a0]) else 0.0
         self.last_bonus = float(bonus[a0])
         return self._eye_a[a0].cpu().numpy()

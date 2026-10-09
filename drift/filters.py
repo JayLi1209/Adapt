@@ -143,3 +143,66 @@ class DriftFilterV2:
         # SIGNED point estimate (no max(...,0)); the value reflects ALL evidence,
         # and forget() handles the non-negativity of the actual inflation.
         return self.lambda_hat + kappa * self.lambda_sd
+
+
+class PerDimDriftFilter:
+    """One independent DriftFilterV2 per OUTPUT DIMENSION.
+
+    The scalar pipeline averages the per-dim surprises into one number before it
+    ever reaches a filter, so a change confined to one channel (pendulum mass moves
+    theta_dot, not cos/sin) is diluted by the dims that are still well predicted.
+    Here each dim keeps its own baseline, window and lambda_hat, and the vector of
+    estimates drives per-row inflation (bnn.gaussian_workflow.forget_gaussian_perdim).
+
+    Every per-dim surprise delta_n_d is separately calibrated to E[.] = 1, so the
+    inherited default_baseline=1.0 is correct for each filter with no rescaling --
+    which matters at change_step=0, where there is no pre-change window to calibrate
+    an empirical baseline from.
+    """
+
+    def __init__(self, n_dims, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY,
+                 default_baseline=1.0, window=None):
+        """default_baseline may be a scalar or a PER-DIM sequence.
+
+        The scalar 1.0 assumes a perfectly calibrated model (E[delta_n_d] = 1 for
+        every d).  Real pretrained models are not: on clean, in-distribution
+        held-out data this LunarLander checkpoint sits at [0.02 .. 9.29] across
+        dims.  Feeding those per-dim held-out means in instead makes "surprise"
+        mean *departure from this model's own known calibration* rather than
+        *departure from a perfect model*, which is what stops the filter from
+        reporting pretraining miscalibration as drift at t=0 (there is no
+        pre-change window to learn an empirical baseline from when the change
+        fires at ts 0).  See calibrate_drift_baseline.py.
+        """
+        self.n_dims = int(n_dims)
+        b = np.broadcast_to(np.asarray(default_baseline, dtype=np.float64),
+                            (self.n_dims,))
+        self.default_baseline = b.copy()
+        self.filters = [DriftFilterV2(eta=eta, gamma_uncertainty=gamma_uncertainty,
+                                      default_baseline=float(b[i]),
+                                      window=window)
+                        for i in range(self.n_dims)]
+
+    def reset(self):
+        for f in self.filters:
+            f.reset()
+
+    def update(self, vec):
+        """vec: (n_dims,) per-dim surprise for this step."""
+        for f, v in zip(self.filters, vec):
+            f.update(float(v))
+
+    def drift_estimate(self, kappa=KAPPA):
+        return np.array([f.drift_estimate(kappa) for f in self.filters])
+
+    @property
+    def lambda_hat(self):
+        return np.array([f.lambda_hat for f in self.filters])
+
+    @property
+    def delta_bar(self):
+        return np.array([f.delta_bar for f in self.filters])
+
+    @property
+    def baseline(self):
+        return np.array([f.baseline for f in self.filters])
