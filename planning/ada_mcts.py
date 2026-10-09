@@ -19,7 +19,7 @@ import mbrl.models as models
 
 from planning.base import BNNModelPlanner
 from bnn.dirichlet_workflow import epistemic_dirichlet
-from bnn.dirichlet_model import ALPHA_FLOOR, SURPRISE_EPS, N_STATES, direction_of
+from bnn.dirichlet_model import ALPHA_FLOOR, SURPRISE_EPS
 
 # ── ADA-MCTS hyperparameters ──────────────────────────────────────────────────
 M_SIMULATIONS = 3000      # MCTS iterations per action (paper: 30000)
@@ -64,6 +64,9 @@ class ADAMCTSAgent(BNNModelPlanner):
                  eps_a=EPS_A,
                  dpas_gamma=DPAS_GAMMA,
                  h_rollout=H_ROLLOUT,
+                 dpas_regular_model="prev",
+                 variant="upstream",
+                 rollout_cap=500,
                  **kwargs):
         super().__init__(dynamics_model, bnn, desc, device,
                          n_actions=n_actions, gamma=gamma, rng=rng, **kwargs)
@@ -73,6 +76,39 @@ class ADAMCTSAgent(BNNModelPlanner):
         self.eps_a = eps_a
         self.dpas_gamma = dpas_gamma
         self.h_rollout = h_rollout
+        # Which model supplies the REGULAR (non-worst-case) Phase-2 sample.
+        #   "prev"  -> M_{k-1}, the frozen snapshot.  Reproduces the upstream
+        #             ADA-MCTS/adamcts.py Node.expand(), which samples
+        #             `transition2` in every Phase-2 branch.
+        #   "k"     -> M_k, the ADAPTED model.  This is what Algorithm 2 line 56
+        #             specifies:  s' ~ p( . | s, a, M_hat_k ).
+        # Upstream and the pseudocode genuinely disagree here; "prev" is kept as
+        # the default so existing results stay reproducible.
+        if dpas_regular_model not in ("prev", "k"):
+            raise ValueError("dpas_regular_model must be 'prev' or 'k'")
+        self.dpas_regular_model = dpas_regular_model
+        # variant = "upstream" : the port of ADA-MCTS/adamcts.py (default, keeps
+        #                        earlier results reproducible).
+        # variant = "alg2"     : Algorithm 2 of the paper, line by line:
+        #   L5-6   terminal leaf backs up R(s) (hole = -1, goal = +1)
+        #   L17-21 expand ALL actions (N_init = Q_init = 0), then take one new
+        #          chance child and DPAS its successor decision node nu''
+        #   L35-42 rollout: a ~ U(A), s' <- DPAS(s,a), until terminal, gamma/step
+        #   L49    Delta <- gamma * Delta at EVERY level of the backup
+        #   L53-58 dE = VarE(Mk(s,a)) - VarE(Mk-1(s,a)),
+        #          dA = mean_P VarA(Mk) - mean_P VarA(Mk-1);
+        #          dE <= eps_E and dA <= eps_A -> s' ~ p(.|s,a,Mk)
+        #          else                        -> s' ~ p_wc(.|s,a,Mk-1)
+        #   No "first-3-steps" Phase-1 gate, no leaf heuristic, no H cap other
+        #   than a `rollout_cap` safety bound (value 0 past it).
+        if variant not in ("upstream", "alg2"):
+            raise ValueError("variant must be 'upstream' or 'alg2'")
+        self.variant = variant
+        self.rollout_cap = rollout_cap
+        # Running sums of Var_A over the pair set P queried in the current search.
+        self._va_sum_k = 0.0
+        self._va_sum_prev = 0.0
+        self._va_n = 0
 
         # M_{k-1} frozen snapshot (created at change notification)
         self.bnn_prev = None
@@ -87,7 +123,12 @@ class ADAMCTSAgent(BNNModelPlanner):
 
         # Post-change tracking
         self._post_change_steps = 0
-        self._training_started = True   # starts True (pre-change, trust model)
+        # Pre-change there is no M_{k-1} snapshot, so DPAS trusts the model and
+        # Phase 1 is skipped.  notify_change() flips this to False, and
+        # observe_transition() flips it back after _n_threshold post-change
+        # samples.  If the caller never advances it, DPAS stays pinned in Phase 1
+        # (worst-case under M_k) for the whole episode.
+        self._training_started = True
         self._n_threshold = 3  # min post-change samples before switching mode
         self._last_dpas_mode = "reg"  # track DPAS decisions for logging
         self._wc_count = 0            # worst-case samples drawn this act()
@@ -113,9 +154,23 @@ class ADAMCTSAgent(BNNModelPlanner):
         self._cache = {}
 
     def learn(self, s, a, s2):
-        """Update online counts after observing (s,a) → s2."""
-        d = direction_of(s, a, s2)
+        """Update online counts after observing (s,a) → s2, and advance DPAS.
+
+        Use this when the caller does NOT maintain the conjugate counts itself.
+        """
+        d = self.bnn.grid.direction_of(s, a, s2)
         self.bnn.add_count(s, a, d)
+        self.observe_transition()
+
+    def observe_transition(self):
+        """Advance the DPAS phase counter for one post-change transition.
+
+        Separated from `learn` because the SFIR sweeps already call
+        `bnn.add_count(...)` themselves; calling `learn` there would double-count.
+        Without this being called, `_training_started` never flips and DPAS is
+        pinned in Phase 1 (worst-case sampling under M_k) for the whole episode --
+        the agent stays maximally pessimistic and never uses its adapted belief.
+        """
         self._post_change_steps += 1
         if (not self._training_started and
                 self._post_change_steps >= self._n_threshold):
@@ -128,7 +183,7 @@ class ADAMCTSAgent(BNNModelPlanner):
         if key in self._cache:
             return self._cache[key]
 
-        obs = np.zeros(N_STATES, dtype=np.float32)
+        obs = np.zeros(self.n, dtype=np.float32)
         obs[s] = 1.0
         act = np.zeros(self.n_actions, dtype=np.float32)
         act[a] = 1.0
@@ -156,7 +211,22 @@ class ADAMCTSAgent(BNNModelPlanner):
             aleatoric_prev = aleatoric_k
             p_cells_prev = p_cells_k
 
+        # Alg. 2 variances.  epistemic_dirichlet's `epistemic` is the per-cell
+        # MEAN of Var_w[p]; Var_E is the total over cells (upstream also sums).
+        # By the law of total variance, the aleatoric part of the one-hot
+        # outcome's variance is  sum_i pbar_i (1 - pbar_i) - Var_E.
+        n_cells = len(p_cells_k)
+        var_e_k = epistemic_k * n_cells
+        var_e_prev = epistemic_prev * n_cells
+        var_a_k = float(np.sum(p_cells_k * (1.0 - p_cells_k))) - var_e_k
+        var_a_prev = float(np.sum(p_cells_prev * (1.0 - p_cells_prev))) - var_e_prev
+        self._va_sum_k += var_a_k
+        self._va_sum_prev += var_a_prev
+        self._va_n += 1
+
         entry = {
+            "var_e_k": var_e_k,
+            "var_e_prev": var_e_prev,
             "epistemic_k": epistemic_k,
             "epistemic_prev": epistemic_prev,
             "aleatoric_k": aleatoric_k,
@@ -189,11 +259,19 @@ class ADAMCTSAgent(BNNModelPlanner):
             elif ale_1 < ale_2:
                 lik = exp(-gamma * (ale_2 - ale_1))
                 if (ale_2 - ale_1) < 1 and U(0,1) < lik:
-                    s' ~ P_2                                # regular,    M_{k-1}
+                    s' ~ P_reg                              # regular
                 else:
                     s' ~ pessimistic(P_2)                   # worst-case, M_{k-1}
             else:
-                s' ~ P_2                                    # regular,    M_{k-1}
+                s' ~ P_reg                                  # regular
+
+        NOTE -- upstream vs. the paper.  Algorithm 2 line 56 reads
+            s' ~ p( . | s, a, M_hat_k )
+        i.e. the REGULAR sample is drawn from the ADAPTED model M_k.  The upstream
+        implementation (ADA-MCTS/adamcts.py Node.expand) instead draws
+        `transition2` = M_{k-1} in every Phase-2 branch, so the adapted model only
+        ever supplies worst-case samples in Phase 1.  `dpas_regular_model` selects
+        between them: "prev" (default) reproduces upstream, "k" follows the paper.
 
         `pessimistic(.)` is Node.pessimistic_sample with danger=False (the
         setting act_learn.py runs): one-hot the worst-reward reachable cell if
@@ -212,20 +290,25 @@ class ADAMCTSAgent(BNNModelPlanner):
             return self._worst_case_sample(s, a, child_values, p_k)
 
         # Phase 2: gated by the aleatoric comparison against M_{k-1}.
+        # The REGULAR sample comes from whichever model dpas_regular_model names;
+        # the worst-case fallback always uses M_{k-1} (Algorithm 2 line 58).
+        p_reg = p_k if self.dpas_regular_model == "k" else p_prev
+        reg_tag = "reg_k" if self.dpas_regular_model == "k" else "reg_prev"
+
         if ale_k + self.eps_a < ale_prev:
             diff = ale_prev - ale_k
             likelihood = math.exp(-self.dpas_gamma * diff)
             if diff < 1.0 and float(self.rng.random()) < likelihood:
-                self._last_dpas_mode = "reg_prev"
+                self._last_dpas_mode = reg_tag
                 self._reg_count += 1
-                return self._categorical_sample(p_prev)
+                return self._categorical_sample(p_reg)
             self._last_dpas_mode = "wc_prev"
             self._wc_count += 1
             return self._worst_case_sample(s, a, child_values, p_prev)
 
-        self._last_dpas_mode = "reg_prev"
+        self._last_dpas_mode = reg_tag
         self._reg_count += 1
-        return self._categorical_sample(p_prev)
+        return self._categorical_sample(p_reg)
 
     def _categorical_sample(self, probs):
         probs = np.asarray(probs, dtype=np.float64)
@@ -261,6 +344,34 @@ class ADAMCTSAgent(BNNModelPlanner):
         worst = min(rewards, key=rewards.get)
         return worst
 
+    # ── Algorithm 2 DPAS / rollout ───────────────────────────────────────────
+    def _dpas_alg2(self, s, a):
+        """Algorithm 2, lines 52-61."""
+        q = self._query(s, a)
+        d_e = q["var_e_k"] - q["var_e_prev"]                         # L53
+        n = max(1, self._va_n)
+        d_a = self._va_sum_k / n - self._va_sum_prev / n              # L54
+        if d_e <= self.eps_e and d_a <= self.eps_a:                   # L55
+            self._last_dpas_mode = "reg_k"
+            self._reg_count += 1
+            return self._categorical_sample(q["p_cells_k"])           # L56
+        self._last_dpas_mode = "wc_prev"
+        self._wc_count += 1
+        return self._worst_case_sample(s, a, None, q["p_cells_prev"])  # L58
+
+    def _rollout_alg2(self, s0):
+        """Algorithm 2, lines 35-43 (iterative form of the recursion)."""
+        total, disc, s = 0.0, 1.0, s0
+        for _ in range(self.rollout_cap):
+            a = int(self.rng.integers(0, self.n_actions))             # L36
+            s2 = self._dpas_alg2(s, a)                                 # L37
+            total += disc * float(self.cell_reward[s2])                # L39/L41
+            if self.terminal[s2]:                                      # L38
+                break
+            disc *= self.gamma                                         # L42
+            s = s2
+        return total
+
     # ── rollout ──────────────────────────────────────────────────────────────
     def _rollout(self, s0):
         """Uniform random rollout from s0 using M_k model, for H_ROLLOUT steps."""
@@ -284,6 +395,13 @@ class ADAMCTSAgent(BNNModelPlanner):
     def _backprop(self, leaf, delta):
         """Climb from leaf to root, adding discounted delta."""
         node = leaf
+        if self.variant == "alg2":                  # L45-50: gamma every level
+            while node is not None:
+                node.visits += 1
+                node.value += delta
+                node = node.parent
+                delta *= self.gamma
+            return
         while node is not None:
             node.visits += 1
             node.value += delta
@@ -328,8 +446,16 @@ class ADAMCTSAgent(BNNModelPlanner):
                         child = _Node(node.state, action=a, parent=node,
                                        node_type="chance")
                         node.children.append(child)
-                    # Return a random newly-expanded child
-                    return self.rng.choice(node.children)
+                    if self.variant != "alg2":
+                        # Return a random newly-expanded child
+                        return self.rng.choice(node.children)
+                    # Alg. 2 L21/L28: nu''.s <- DPAS(nu'.s, nu'.a); the leaf
+                    # is the successor DECISION node nu''.
+                    ch = node.children[int(self.rng.integers(0, len(node.children)))]
+                    s2 = self._dpas_alg2(ch.state, ch.action)
+                    leaf = _Node(s2, parent=ch, node_type="decision")
+                    ch.children.append(leaf)
+                    return leaf
                 else:
                     node = self._uct_select(node)
             else:  # chance node
@@ -344,7 +470,8 @@ class ADAMCTSAgent(BNNModelPlanner):
                         child.value / child.visits if child.visits > 0
                         else self.heuristic[child.state]
                     )
-                s2 = self._dpas(s, a, child_values)
+                s2 = (self._dpas_alg2(s, a) if self.variant == "alg2"
+                      else self._dpas(s, a, child_values))
 
                 # Find or create child decision node at s2
                 existing = None
@@ -372,11 +499,18 @@ class ADAMCTSAgent(BNNModelPlanner):
         self._cache = {}
         self._wc_count = 0
         self._reg_count = 0
+        self._va_sum_k = self._va_sum_prev = 0.0   # P = pairs of THIS search
+        self._va_n = 0
         root = _Node(s0, node_type="decision")
 
         for _ in range(self.m_simulations):
             leaf = self._traverse(root)
-            if self.terminal[leaf.state]:
+            if self.variant == "alg2":
+                # L5-8: terminal -> R(s) (hole -1 / goal +1), else Rollout.
+                delta = (float(self.cell_reward[leaf.state])
+                         if self.terminal[leaf.state]
+                         else self._rollout_alg2(leaf.state))
+            elif self.terminal[leaf.state]:
                 delta = float(self.cell_value[leaf.state])
             else:
                 delta = self._rollout(leaf.state)

@@ -133,8 +133,30 @@ class DirichletDynamicsModel(models.Model):
         self.bayes_layers = nn.ModuleList(layers)
 
         # Retention factor in (0, 1]; forget lowers it to pull alpha toward the
-        # symmetric prior CONC_PRIOR (mean -> uniform, entropy up, surprise down).
+        # prior (mean -> conc_prior's shape, entropy up, surprise down).
         self.register_buffer("retain", torch.tensor(float(RETAIN_INIT)))
+        # Anchor mode: when True, `forget` applies the Algorithm-3 affine pull
+        # alpha <- alpha_0 + rho*(alpha - alpha_0) to a PERSISTENT per-(s,a) alpha
+        # state, so alpha_0 (= conc_prior) is a genuine attractor.  The default
+        # (False) keeps the shipped multiplicative-retain path, where conc_prior
+        # is only the limit point of a shrink that compounds to zero.
+        self.anchor_forget = False
+        # Persistent per-(s,a,K) alpha used ONLY in anchor mode; lazily filled from
+        # the head on first touch so an untouched row still reads the head.
+        self.register_buffer("alpha_state",
+                             torch.zeros(grid.n_states, grid.n_actions, self.k_dir))
+        self.register_buffer("alpha_valid",
+                             torch.zeros(grid.n_states, grid.n_actions,
+                                         dtype=torch.bool))
+        # Per-direction prior concentration over [intended, perp+, perp-].
+        # Default = symmetric CONC_PRIOR (the shipped behaviour).  A NON-symmetric
+        # vector tilts the belief that forget falls back to: e.g. [1,5,1] scaled
+        # says "a perp+ slip is 5x more likely than the intended move", which on
+        # CliffWalking makes UP-from-start (whose perp+ is RIGHT -> cliff) look
+        # dangerous and LEFT look safe.  Registered as a buffer so it rides along
+        # with state_dict/load and to(device).
+        self.register_buffer("conc_prior",
+                             torch.full((self.k_dir,), float(CONC_PRIOR)))
         # Direction -> cell geometry (fixed grid).
         self.register_buffer("dir_cells", grid.build_dir_cells())
 
@@ -160,6 +182,54 @@ class DirichletDynamicsModel(models.Model):
     def reset_counts(self):
         self.counts.zero_()
 
+    def reset_alpha_state(self):
+        """Clear the persistent anchor-mode alpha (call at trial start)."""
+        self.alpha_state.zero_()
+        self.alpha_valid.zero_()
+
+    @torch.no_grad()
+    def head_alpha(self, s, a):
+        """The head's raw alpha for one (s,a) -- the anchor-mode seed."""
+        obs = torch.zeros(1, self.n_states, device=self.device)
+        act = torch.zeros(1, self.n_actions, device=self.device)
+        obs[0, int(s)] = 1.0; act[0, int(a)] = 1.0
+        x = torch.cat([obs, act], dim=-1)
+        h = x
+        for layer in self.bayes_layers[:self.n_trunk]:
+            h = F.silu(layer(h, sample=False))
+        raw = self.bayes_layers[self.n_trunk](h, sample=False)
+        return (F.softplus(raw) + ALPHA_FLOOR)[0]
+
+    @torch.no_grad()
+    def anchor_pull(self, rho):
+        """Algorithm 3 line 26: alpha <- alpha_0 + rho*(alpha - alpha_0) applied
+        to every (s,a) row, with alpha_0 = conc_prior.  Rows not yet materialised
+        are seeded from the head first, so the pull acts on the real belief."""
+        if not bool(self.alpha_valid.all()):
+            for s in range(self.n_states):
+                for a in range(self.n_actions):
+                    if not bool(self.alpha_valid[s, a]):
+                        self.alpha_state[s, a] = self.head_alpha(s, a)
+            self.alpha_valid.fill_(True)
+        a0 = self.conc_prior.view(1, 1, -1)
+        self.alpha_state.copy_(a0 + float(rho) * (self.alpha_state - a0))
+
+    def set_conc_prior(self, weights):
+        """Set the per-direction prior over [intended, perp+, perp-].
+
+        `weights` is a K-vector of RELATIVE weights; it is rescaled so the total
+        concentration equals the symmetric default (K * CONC_PRIOR), keeping the
+        prior's strength unchanged and altering only its SHAPE.  So [1,1,1] is
+        exactly the shipped symmetric prior and [1,5,1] tilts toward perp+.
+        """
+        w = torch.as_tensor(weights, dtype=torch.float32, device=self.conc_prior.device)
+        if w.numel() != self.k_dir:
+            raise ValueError(f"conc_prior needs {self.k_dir} weights, got {w.numel()}")
+        if float(w.min()) <= 0:
+            raise ValueError("conc_prior weights must be positive")
+        w = w / w.sum() * (self.k_dir * CONC_PRIOR)
+        self.conc_prior.copy_(w)
+
     # ── core forward: features -> (alpha, reward mu/logvar, geometry) ──────────
     def _forward_alpha(self, x, sample=True, num_weight_groups=1):
         """Return per-row (alpha (B,K), r_mean (B,1), r_logvar (B,1), cells (B,K))."""
@@ -181,7 +251,16 @@ class DirichletDynamicsModel(models.Model):
         # retain == 1 -> the head's alpha; retain -> 0 -> all dims -> CONC_PRIOR
         # (equal), i.e. the predictive mean collapses to uniform.
         alpha_head = F.softplus(raw_alpha) + ALPHA_FLOOR
-        alpha = (CONC_PRIOR + self.retain * (alpha_head - CONC_PRIOR)).clamp_min(ALPHA_FLOOR)
+        cp = self.conc_prior.to(alpha_head.dtype)            # (K,) broadcasts over B
+        if self.anchor_forget:
+            # Algorithm 3 line 26 semantics: the live alpha is the persistent
+            # state that forget pulls toward alpha_0.  Rows never touched by a
+            # forget fall back to the head's alpha.
+            valid = self.alpha_valid[s, a].unsqueeze(-1)          # (B,1)
+            alpha = torch.where(valid, self.alpha_state[s, a].to(alpha_head.dtype),
+                                alpha_head).clamp_min(ALPHA_FLOOR)
+        else:
+            alpha = (cp + self.retain * (alpha_head - cp)).clamp_min(ALPHA_FLOOR)
         if self.use_counts:
             # alpha_effective = (retained prior) + observed counts  (conjugate update)
             alpha = alpha + self.counts[s, a]

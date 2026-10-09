@@ -1,3 +1,3 @@
-from drift.filters import DriftFilterV1, DriftFilterV2
+from drift.filters import DriftFilterV1, DriftFilterV2, PerDimDriftFilter
 
-__all__ = ["DriftFilterV1", "DriftFilterV2"]
+__all__ = ["DriftFilterV1", "DriftFilterV2", "PerDimDriftFilter"]

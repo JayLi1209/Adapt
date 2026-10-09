@@ -167,10 +167,11 @@ def build_env(name, intended_prob_schedule, max_episode_steps=None,
             base, {"P": update_fn}, change_notification=True,
             initial_prob_dist=_pad4(initial), modified_rewards=MODIFIED_REWARDS,
             terminal_cliff=terminal_cliff)
-    elif name == "bridge":
+    elif name.startswith("bridge"):
         # ns_gym's Bridge is broken and non-faithful; use the self-contained
-        # tabular env, whose dynamics are exactly grid.slip_dist (intended p,
-        # opposite 1-p).  Already one-hot, so no OneHotGridWrapper needed.
+        # tabular env, whose dynamics are exactly grid.slip_dist.  Covers every
+        # bridge map variant (bridge, bridge_h17, ...).  Already one-hot, so no
+        # OneHotGridWrapper needed.
         return TabularGridEnv(grid, dist_by_time, max_episode_steps), grid
     else:
         raise ValueError(f"no builder for grid {name!r}")

@@ -91,12 +91,25 @@ def surprise_gaussian(dyn, bnn, obs, action, next_obs, reward,
 
     S = epi_s + ale_s + eps
     nu = tgt_s - mu_s
-    delta_n = float((nu ** 2 / S).mean().item())
+    # PER-DIM vectors, before the reduction.  The scalars below are exactly their
+    # means, so every existing caller is unaffected; the vectors let a caller run
+    # one drift filter / inflation / retrain gate PER OUTPUT DIM instead of
+    # averaging the dims into a single statistic first (see
+    # inflate_head_rows_by_process_noise and drift.PerDimDriftFilter).  Each
+    # delta_n_vec[d] is separately calibrated to E[.] = 1, so the filters need no
+    # per-dim rescaling.
+    delta_vec = (nu ** 2 / S)[0]
+    nu2_vec = (nu ** 2)[0]
+    delta_n = float(delta_vec.mean().item())
     return dict(delta_n=delta_n,
                 epistemic=float(epi_s.mean().item()),
                 aleatoric=float(ale_s.mean().item()),
                 S=float(S.mean().item()),
-                nu2=float((nu ** 2).mean().item()))
+                nu2=float(nu2_vec.mean().item()),
+                delta_n_vec=delta_vec.cpu().numpy(),
+                nu2_vec=nu2_vec.cpu().numpy(),
+                epistemic_vec=epi_s[0].cpu().numpy(),
+                aleatoric_vec=ale_s[0].cpu().numpy())
 
 
 @torch.no_grad()
@@ -197,6 +210,169 @@ def forget_gaussian(bnn, drift_filter, inflate_mode=INFLATE_MODE,
     raise ValueError(f"unknown inflate_mode {inflate_mode!r}")
 
 
+# ── Per-row (per-output-dim) re-inflation ─────────────────────────────────────
+# The head is a DIAGONAL Gaussian: bayes_layers[-1].weight_mu is (2*out_size, hid),
+# where row d feeds mean_d and row out_size+d feeds logvar_d.  With the trunk frozen
+# those two rows are the ONLY parameters that touch output dim d, so a per-dim drift
+# estimate can be applied to exactly its own rows and to nothing else.  The trunk is
+# shared across dims and has no per-dim rows, so it is never inflated here.
+
+def _head_rows_for(out_size, d):
+    """The two head rows owned by output dim d: (mean row, logvar row)."""
+    return d, out_size + d
+
+
+def inflate_head_rows_by_process_noise(bnn, q_vec, out_size, forget_mean=FORGET_MEAN):
+    """Additive process noise on ONLY the head rows of each output dim.
+
+    q_vec[d] <= 0 leaves dim d completely untouched -- including the learned-reward
+    channel, which carries no q when it is excluded from the surprise.  The sigma
+    update is identical to inflate_by_process_noise:
+        sigma_w^2 <- sigma_w^2 + q_d * prior_var.
+    Returns the number of dims actually inflated.
+    """
+    q_vec = np.asarray(q_vec, dtype=np.float64)
+    head = bnn.bayes_layers[-1]
+    prior_var = head.prior_std ** 2
+    n_applied = 0
+    with torch.no_grad():
+        for d, q_hat in enumerate(q_vec):
+            if q_hat <= 0.0:
+                continue
+            q = float(q_hat) * prior_var
+            for r in _head_rows_for(out_size, d):
+                for mu_p, rho_p in ((head.weight_mu, head.weight_rho),
+                                    (head.bias_mu, head.bias_rho)):
+                    sigma = F.softplus(rho_p.data[r])
+                    sigma_new = (sigma ** 2 + q).sqrt()
+                    rho_p.data[r] = torch.log(
+                        torch.expm1(sigma_new).clamp_min(1e-6))
+                    if forget_mean:
+                        mu_p.data[r].mul_(1.0 / (1.0 + float(q_hat)))
+            n_applied += 1
+    return n_applied
+
+
+def inflate_head_rows_toward_prior(bnn, rho_vec, out_size, forget_mean=FORGET_MEAN):
+    """Per-row RETENTION pull, the bounded counterpart of the additive path:
+        tau <- tau0 + rho_d (tau - tau0)   on dim d's two head rows only.
+
+    rho_d >= 1 is a no-op for that dim.  Returns the number of dims pulled.
+    """
+    rho_vec = np.asarray(rho_vec, dtype=np.float64)
+    head = bnn.bayes_layers[-1]
+    tau0 = 1.0 / (head.prior_std ** 2)
+    n_applied = 0
+    with torch.no_grad():
+        for d, rho in enumerate(rho_vec):
+            if rho >= 1.0:
+                continue
+            for r in _head_rows_for(out_size, d):
+                for mu_p, rho_p in ((head.weight_mu, head.weight_rho),
+                                    (head.bias_mu, head.bias_rho)):
+                    sigma = F.softplus(rho_p.data[r])
+                    tau_new = tau0 + float(rho) * (1.0 / (sigma ** 2) - tau0)
+                    sigma_new = (1.0 / tau_new).sqrt()
+                    rho_p.data[r] = torch.log(
+                        torch.expm1(sigma_new).clamp_min(1e-6))
+                    if forget_mean:
+                        mu_p.data[r].mul_(float(rho))
+            n_applied += 1
+    return n_applied
+
+
+def forget_gaussian_perdim(bnn, perdim_filter, out_size, inflate_mode=INFLATE_MODE,
+                           q_scale=Q_SCALE, q_max=Q_MAX, deadband=LAMBDA_DEADBAND,
+                           kappa=KAPPA, forget_mean=FORGET_MEAN):
+    """Per-row re-inflation: every output dim forgets on its OWN drift evidence.
+
+    Mirrors forget_gaussian's deadband / cap semantics, applied per dim: dim d
+    inflates only if its own drift estimate clears the deadband.  Both modes are
+    supported, since the two envs default differently (Pendulum "additive",
+    LunarLander "retention"):
+
+        additive  : sigma_d^2 <- sigma_d^2 + q_d * prior_var,  q_d capped at q_max
+        retention : tau_d     <- tau0 + rho_d (tau_d - tau0),  rho_d = 1/max(dbar_d,1)
+
+    Returns (applied, fired):
+      applied  (out_size,) the q_d (additive) or rho_d (retention) actually used,
+                           0 / 1 respectively for dims that did not fire;
+      fired    (out_size,) bool -- the per-dim retrain gate.  Dims the filter does
+                           not score (e.g. the reward channel) are always False.
+    """
+    est = np.asarray(perdim_filter.drift_estimate(kappa), dtype=np.float64)
+    n = min(len(est), out_size)
+    q = np.zeros(out_size, dtype=np.float64)
+    q[:n] = q_scale * est[:n]
+    # deadband may be a scalar or PER-DIM.  Per-dim is what an unbiased (calibrated)
+    # baseline needs: with the baseline at the model's own clean-data level the
+    # excess is zero-mean under no change, so without a per-dim noise threshold the
+    # filter fires on half the clean-data noise.
+    db = np.zeros(out_size, dtype=np.float64)
+    db[:] = np.broadcast_to(np.asarray(deadband, dtype=np.float64), (out_size,))
+    fired = np.zeros(out_size, dtype=bool)
+    fired[:n] = q[:n] > db[:n]
+
+    if inflate_mode == "additive":
+        applied = np.where(fired, np.minimum(q, q_max), 0.0)
+        inflate_head_rows_by_process_noise(bnn, applied, out_size,
+                                           forget_mean=forget_mean)
+    elif inflate_mode == "retention":
+        dbar = np.ones(out_size, dtype=np.float64)
+        dbar[:n] = np.asarray(perdim_filter.delta_bar, dtype=np.float64)[:n]
+        applied = np.where(fired, np.clip(1.0 / np.maximum(dbar, 1.0), 1e-3, 1.0), 1.0)
+        # rho == 1 is already a no-op, so a dim that fired but whose dbar <= 1 is
+        # simply not pulled -- same self-limiting behaviour as the scalar path.
+        fired &= applied < 1.0
+        inflate_head_rows_toward_prior(bnn, applied, out_size, forget_mean=forget_mean)
+    else:
+        raise ValueError(f"unknown inflate_mode {inflate_mode!r}")
+    return applied, fired
+
+
+def forget_gaussian_head_only(bnn, drift_filter, out_size, inflate_mode=INFLATE_MODE,
+                              q_scale=Q_SCALE, q_max=Q_MAX, deadband=LAMBDA_DEADBAND,
+                              kappa=KAPPA, forget_mean=FORGET_MEAN):
+    """CONTROL for forget_gaussian_perdim: the ordinary SCALAR drift estimate, but
+    applied to the head rows only (trunk untouched).  Isolates "head-only scope"
+    from "per-dim signal" -- without it, per-dim mode changes both at once and any
+    effect is unattributable.  Returns the q_hat (additive) or rho (retention)
+    actually used, or 0.0 if the estimate was below the deadband.
+    """
+    q_hat = q_scale * drift_filter.drift_estimate(kappa)
+    if q_hat <= deadband:
+        return 0.0
+    if inflate_mode == "additive":
+        q_hat = min(q_hat, q_max)
+        inflate_head_rows_by_process_noise(bnn, np.full(out_size, q_hat), out_size,
+                                           forget_mean=forget_mean)
+        return q_hat
+    elif inflate_mode == "retention":
+        rho = float(np.clip(1.0 / max(drift_filter.delta_bar, 1.0), 1e-3, 1.0))
+        inflate_head_rows_toward_prior(bnn, np.full(out_size, rho), out_size,
+                                       forget_mean=forget_mean)
+        return rho
+    raise ValueError(f"unknown inflate_mode {inflate_mode!r}")
+
+
+@torch.no_grad()
+def head_row_sigma(bnn, out_size):
+    """Mean posterior width sigma over each output dim's own head rows, (out_size,).
+
+    mean_sigma averages the WHOLE net, which barely moves once only the head is
+    inflated; this is the readout that actually tracks per-row forgetting.
+    """
+    head = bnn.bayes_layers[-1]
+    w_sig, b_sig = F.softplus(head.weight_rho.data), F.softplus(head.bias_rho.data)
+    out = np.zeros(out_size, dtype=np.float64)
+    for d in range(out_size):
+        rows = _head_rows_for(out_size, d)
+        tot = sum(float(w_sig[r].sum() + b_sig[r]) for r in rows)
+        cnt = sum(w_sig[r].numel() + 1 for r in rows)
+        out[d] = tot / cnt
+    return out
+
+
 def adapter_params_gaussian(bnn, update_final_layer):
     """Mean weights of the online-adaptation stack: every inserted adapter plus,
     when update_final_layer, the Gaussian output layer.  Mu only -- the
@@ -248,6 +424,54 @@ def retrain_gaussian(bnn, opt, model_in, target, n_steps=5, use_reward_dim=True)
         nll.backward()
         opt.step()
     return float(nll.item())
+
+
+def retrain_gaussian_perdim(bnn, opt, model_in, target, active_dims, out_size,
+                            n_dims_total, n_steps=5):
+    """Gated per-dim retrain of the diagonal head's rows.
+
+    Only the dims in `active_dims` are updated; the rest are left EXACTLY as they
+    were.  Two details make that true rather than approximately true:
+
+      1. The loss is normalised by `n_dims_total`, not by len(active_dims), so
+         gating a dim off does not silently scale up every surviving dim's
+         gradient.  With all dims active this is bit-identical to the
+         `.mean()`-over-dims normalisation retrain_gaussian uses.
+      2. Inactive rows are snapshotted and RESTORED after opt.step().  A zero
+         gradient is not enough to freeze them: Adam keeps stepping from stale
+         momentum (exp_avg decays by beta1 but stays non-zero), so a dim that
+         fired earlier would keep drifting on every later step.
+
+    Returns (total_nll, per_dim_nll) where per_dim_nll[d] is NaN for inactive dims.
+    """
+    active = sorted(int(d) for d in active_dims)
+    per_dim = np.full(out_size, np.nan)
+    if not active:
+        return None, per_dim
+
+    head = bnn.bayes_layers[-1]
+    keep = torch.ones(head.weight_mu.shape[0], dtype=torch.bool,
+                      device=head.weight_mu.device)          # True == restore (frozen)
+    for d in active:
+        for r in _head_rows_for(out_size, d):
+            keep[r] = False
+
+    total = None
+    for _ in range(n_steps):
+        opt.zero_grad()
+        mean, logvar = bnn._run_network(model_in, sample=False)
+        losses = [(0.5 * (logvar[:, d] + (target[:, d] - mean[:, d]) ** 2
+                          / torch.exp(logvar[:, d]))).mean() for d in active]
+        total = sum(losses) / float(n_dims_total)
+        total.backward()
+        w_snap = head.weight_mu.data.clone()
+        b_snap = head.bias_mu.data.clone()
+        opt.step()
+        head.weight_mu.data[keep] = w_snap[keep]
+        head.bias_mu.data[keep] = b_snap[keep]
+    for d, l in zip(active, losses):
+        per_dim[d] = float(l.item())
+    return float(total.item()), per_dim
 
 
 def retrain_layers_gaussian(bnn, n_unfreeze=1, use_adapters=True):

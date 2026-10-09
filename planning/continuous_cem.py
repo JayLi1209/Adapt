@@ -52,6 +52,146 @@ def project_unit_circle(next_obs, max_speed=PENDULUM_MAX_SPEED):
     return torch.cat([cs / norm, thdot], dim=1)
 
 
+def make_box_projection(low, high):
+    """Obs projection that CLAMPS every dim into [low, high] (the box analogue of
+    project_unit_circle, for envs whose observation is a raw state vector).
+
+    Same rationale: the real env's state is bounded (MuJoCo joint limits, and in
+    practice a bounded velocity envelope), but a learned model self-fed for H
+    steps has no such bound, so imagined states can run far off-distribution and
+    both wreck the predictions and corrupt the return.  Clamping mirrors the env
+    and keeps imagined states inside the training range.
+    """
+    lo = torch.as_tensor(low, dtype=torch.float32, device=device)
+    hi = torch.as_tensor(high, dtype=torch.float32, device=device)
+
+    def _project(next_obs):
+        return torch.clamp(next_obs, lo, hi)
+
+    return _project
+
+
+# ── InvertedPendulum-v5 (MuJoCo cart-pole) ────────────────────────────────────
+# obs = [x, theta, x_dot, theta_dot]; reward = int(not terminated) = +1 per
+# surviving step; terminated iff |theta| > 0.2 rad (or the state goes non-finite).
+IP_ANGLE_LIMIT = 0.2
+IP_THETA_DIM = 1
+
+
+def inverted_pendulum_terminated(next_obs, angle_limit=IP_ANGLE_LIMIT):
+    """GROUND-TRUTH InvertedPendulum-v5 termination, as a per-row bool tensor.
+
+    Mirrors InvertedPendulumEnv.step exactly:
+        terminated = not isfinite(obs).all() or |obs[1]| > 0.2
+    """
+    finite = torch.isfinite(next_obs).all(dim=1)
+    upright = next_obs[:, IP_THETA_DIM].abs() <= angle_limit
+    return ~(finite & upright)
+
+
+def make_inverted_pendulum_terminal(weight=0.5, theta_ref=IP_ANGLE_LIMIT,
+                                    theta_dot_ref=1.0, x_ref=1.0, x_dot_ref=1.0):
+    """Terminal potential Phi(s_H) for the InvertedPendulum survival objective.
+
+    WHY THIS IS NEEDED.  The env pays +1 per surviving step, so a candidate's
+    score is decided entirely by WHEN it dies.  Near the upright equilibrium the
+    pole physically cannot fall inside the planning horizon -- 20 steps is 0.8 s,
+    about 3.2 instability time constants, so an uncontrolled deviation from
+    theta ~ 1e-3 only reaches ~0.025, well short of the 0.2 limit.  Virtually
+    every candidate therefore scores the identical maximum, the elite set is an
+    arbitrary tie-break, the refitted mean collapses toward zero action, and the
+    planner does nothing until the state has drifted far enough out that the
+    horizon finally becomes informative -- by which point recovery is marginal.
+    Lengthening the horizon instead is not available: past ~25 steps the model's
+    imagined trajectory has diverged and it mislabels who survives.
+
+    WHY IT DOES NOT CHANGE THE PROBLEM.  This is POTENTIAL-BASED shaping, whose
+    per-step form F(s, s') = gamma * Phi(s') - Phi(s) provably leaves the optimal
+    policy unchanged (Ng et al., 1999).  Summed over an H-step rollout it
+    telescopes to gamma^H Phi(s_H) - Phi(s_0), and s_0 is shared by every
+    candidate, so adding gamma^H Phi(s_H) IS that shaping, exactly.  Read the
+    other way it is the horizon's missing terminal value: "how much room is left
+    at the end", which is what the truncated sum threw away.
+
+    The magnitude is deliberately capped below the value of one extra step of
+    life (Phi in [-weight, 0] with weight 0.5, versus ~0.83 for surviving the
+    final step), so shaping can only ever break ties AMONG survivors -- it can
+    never make a candidate that dies outrank one that lives.
+
+    The evaluated return is untouched by any of this: the agent is still scored
+    on the env's own +1-per-step reward.
+    """
+    ref = torch.tensor([x_ref, theta_ref, x_dot_ref, theta_dot_ref],
+                       dtype=torch.float32, device=device)
+
+    def _terminal(final_obs, alive):
+        cost = ((final_obs / ref) ** 2).sum(dim=1).clamp(max=1.0)
+        # A dead trajectory has no margin left, so it takes the full penalty
+        # rather than being scored on a meaningless post-fall state.
+        cost = alive * cost + (1.0 - alive) * 1.0
+        return -weight * cost
+
+    return _terminal
+
+
+def inverted_pendulum_reward(obs, act):
+    """GROUND-TRUTH InvertedPendulum-v5 reward: +1 for every step.
+
+    Constant, hence carrying no gradient on its own -- the planner's entire
+    signal comes from multiplying this by the alive mask that `term_fn` drives
+    (see ContinuousCEMAgent.act).  Kept explicit rather than folded into the mask
+    so the reward and the termination stay separately auditable, and so the
+    learned reward head is never consulted for a quantity we know exactly.
+    """
+    return torch.ones(obs.shape[0], dtype=torch.float32, device=obs.device)
+
+
+# Operating envelope of a competent controller on this env, measured from a
+# discrete-time LQR on the linearised simulator: |x| < 0.03, |theta| < 0.01,
+# |x_dot| < 0.04, |theta_dot| < 0.07.  The running cost is normalised by scales a
+# few times larger than these, so it varies over the region where control
+# actually happens instead of being numerically flat there.
+IP_STATE_REF = (0.30, 0.02, 0.30, 0.20)     # x, theta, x_dot, theta_dot
+
+
+def make_inverted_pendulum_reward(w_state=0.3, w_act=0.02, refs=IP_STATE_REF,
+                                  act_scale=3.0):
+    """Regularised MPC running reward:  1 - w_state * c(s) - w_act * (a/a_max)^2.
+
+    WHY THE BARE +1 REWARD IS NOT PLANNABLE.  With survival as the only term, a
+    candidate is scored purely by WHEN it dies, and near the equilibrium nothing
+    dies inside the horizon -- so several hundred candidates tie at the maximum.
+    CEM then averages the first actions of an arbitrary elite subset.  Those
+    first actions disagree wildly (measured: +/-0.7 where LQR wants ~0.001)
+    because in an open-loop plan almost any a_0 can still be corrected by later
+    actions in the same sequence: a_0 is genuinely UNDER-DETERMINED, and the
+    committed action is therefore noise.  The pole then random-walks out until
+    the horizon finally sees a fall, by which point recovery is marginal.
+
+    The two extra terms are the textbook MPC regularisers that remove that
+    degeneracy, and each fixes a distinct half of it:
+
+      w_act   penalises control effort, which makes the minimiser of a_0 UNIQUE
+              (of all the recoverable first actions, prefer the smallest);
+      w_state penalises deviation at EVERY step rather than only at the horizon,
+              so a candidate that wanders and returns loses to one that stays put.
+
+    Both are bounded well below the +1 survival term (c is clamped to 1), so
+    ranking still puts survival first and these only order the survivors.
+
+    The EVALUATED return is never touched: the agent is still scored on the env's
+    own +1-per-step reward.  This is the planner's internal objective only.
+    """
+    ref = torch.tensor(refs, dtype=torch.float32, device=device)
+
+    def _reward(obs, act):
+        cost = ((obs / ref) ** 2).sum(dim=1).clamp(max=1.0)
+        effort = (act[:, 0] / act_scale) ** 2
+        return 1.0 - w_state * cost - w_act * effort
+
+    return _reward
+
+
 def pendulum_reward(obs, act):
     """GROUND-TRUTH Pendulum-v1 reward from (obs, action) -- the analytic cost.
 
@@ -81,9 +221,26 @@ class ContinuousCEMAgent:
                  n_candidates=N_CANDIDATES, elite_frac=ELITE_FRAC,
                  k_models=K_MODELS, cvar_alpha=CVAR_ALPHA, gamma=GAMMA,
                  obs_project=None, reward_fn=None, reward_clip=None,
-                 rng=None, **kwargs):
+                 term_fn=None, terminal_fn=None, action_low=-2.0, action_high=2.0,
+                 sigma_init=1.0, rng=None, **kwargs):
         self.dyn = dyn
         self.bnn = bnn
+        # Optional GROUND-TRUTH termination predicate term_fn(next_obs) -> bool
+        # tensor.  When supplied, the rollout carries an ALIVE MASK: once a
+        # candidate's imagined trajectory terminates, every later step of that
+        # trajectory contributes zero reward, exactly as the real MDP does.
+        #
+        # This is mandatory for InvertedPendulum, whose reward is the constant +1
+        # -- without the mask every action sequence scores identically and CEM is
+        # a no-op.  It is left OFF by default because masking is only correct for
+        # non-negative rewards: on Pendulum (reward <= 0 always) zeroing the tail
+        # would make dying the highest-scoring outcome.
+        self.term_fn = term_fn
+        # Optional terminal value terminal_fn(final_obs, alive) -> (B,) added to
+        # the return with the horizon's discount, i.e. gamma^H Phi(s_H).  This is
+        # potential-based shaping (policy-preserving) / the truncated horizon's
+        # missing terminal value.  None = the plain H-step sum, unchanged.
+        self.terminal_fn = terminal_fn
         # Optional analytic reward r(obs_t, act_t) used INSTEAD of the model's
         # learned reward head during imagined rollouts.  None = use the learned
         # head (previous behaviour, unbounded off-distribution).
@@ -110,12 +267,17 @@ class ContinuousCEMAgent:
         self.gamma = gamma
         self.rng = rng if rng is not None else np.random.default_rng(0)
 
-        self.action_low = -2.0
-        self.action_high = 2.0
+        # Actuator limits.  These MUST match the env: candidates are clipped to
+        # them, so bounds wider than the env's make the planner commit to forces
+        # the env will silently clip (a model/plan mismatch), and narrower bounds
+        # hide usable control authority.  Pendulum-v1 is [-2, 2] (the default);
+        # InvertedPendulum-v5 is [-3, 3].
+        self.action_low = float(action_low)
+        self.action_high = float(action_high)
         self._mu = np.zeros((horizon, act_dim), dtype=np.float32)
-        self._sigma = np.full((horizon, act_dim), 1.0, dtype=np.float32)
+        self._sigma = np.full((horizon, act_dim), sigma_init, dtype=np.float32)
         self._sigma_min = 0.05
-        self._sigma_init = 1.0    # sigma each replan restarts from (see act())
+        self._sigma_init = float(sigma_init)  # sigma each replan restarts from (see act())
 
         self.surprise_bar = 1.0
         self.n_since_change = 0
@@ -131,7 +293,8 @@ class ContinuousCEMAgent:
 
     def reset(self):
         self._mu = np.zeros((self.horizon, self.act_dim), dtype=np.float32)
-        self._sigma = np.full((self.horizon, self.act_dim), 1.0, dtype=np.float32)
+        self._sigma = np.full((self.horizon, self.act_dim), self._sigma_init,
+                              dtype=np.float32)
 
     def notify_change(self):
         self.reset()
@@ -170,58 +333,9 @@ class ContinuousCEMAgent:
                 candidates = self._mu + self._sigma * noise
                 candidates = np.clip(candidates, self.action_low, self.action_high)
 
-                # Repeat each candidate K times for posterior diversity: (J*K, H, A)
-                if K > 1:
-                    act_seqs = np.repeat(candidates, K, axis=0)  # (J*K, H, A)
-                else:
-                    act_seqs = candidates
-
-                # ── Batched rollout: all J*K trajectories in parallel ──────
-                obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)
-                obs_t = obs_t.unsqueeze(0).expand(total_batch, -1)       # (J*K, obs_dim)
-                state = self.dyn.reset(obs_t)
-                returns = torch.zeros(total_batch, device=self.device)
-                disc = 1.0
-
-                # With K>1 posterior draws we MUST sample weights (deterministic
-                # =False), else BayesianLinear returns the mean weights for every
-                # row (see bnn/layers.py: `if not sample: use weight_mu`), the K
-                # draws collapse to identical returns, and CVaR-alpha has NO effect.
-                # K==1 keeps the deterministic mean-model rollout (risk-neutral).
-                rollout_det = (K <= 1)
-                for t in range(H):
-                    act_t = torch.as_tensor(act_seqs[:, t, :], dtype=torch.float32,
-                                            device=self.device)          # (J*K, act_dim)
-                    cur_obs = obs_t          # state at imagined time t (pre-transition)
-                    next_obs, rew, _, _ = self.dyn.sample(
-                        act_t, state, deterministic=rollout_det)
-                    if self.obs_project is not None:
-                        next_obs = self.obs_project(next_obs)
-
-                    # Reward from the ANALYTIC cost r(s_t, a_t) when supplied (the
-                    # env computes its reward from the pre-transition state too);
-                    # otherwise fall back to the model's learned reward channel.
-                    if self.reward_fn is not None:
-                        step_rew = self.reward_fn(cur_obs, act_t)
-                    else:
-                        step_rew = rew.squeeze(-1)
-                    if self.reward_clip is not None:
-                        step_rew = step_rew.clamp(self.reward_clip[0],
-                                                  self.reward_clip[1])
-                    returns += disc * step_rew
-                    obs_t = next_obs
-                    state = self.dyn.reset(obs_t)
-                    disc *= self.gamma
-
-                returns_np = returns.cpu().numpy()                       # (J*K,)
-
-                # ── Score each candidate as CVaR over its K returns ──────
-                if K > 1:
-                    returns_grouped = returns_np.reshape(J, K)           # (J, K)
-                    scores = np.array([self._cvar_value(returns_grouped[j])
-                                       for j in range(J)])
-                else:
-                    scores = returns_np
+                # ── Batched rollout + CVaR score of every candidate ──────
+                returns_grouped = self._rollout_returns(obs_arr, candidates)  # (J, K)
+                scores = self._scores(returns_grouped)                         # (J,)
 
                 # ── Select elites and refit Gaussian ────────────────────
                 elite_idx = np.argpartition(-scores, self.n_elite - 1)[:self.n_elite]
@@ -261,6 +375,87 @@ class ContinuousCEMAgent:
             self.bnn.num_weight_groups = saved_groups
 
         return self._mu[0].copy()
+
+    @torch.no_grad()
+    def _rollout_returns(self, obs_arr, candidates):
+        """Imagined discounted H-step return of every candidate under K posterior
+        draws: (J, H, A) action sequences -> (J, K) returns.
+
+        This is the planner-independent EVALUATOR (MPPI / MCTS in
+        planning/continuous_planners.py score their sequences through it too, so
+        a planner comparison changes only the optimizer).  Caller must have set
+        bnn.num_weight_groups = K.  Row j*K + k uses weight group k, so at every
+        imagined step all candidates share the same K fresh weight draws.
+        """
+        J, H = candidates.shape[0], candidates.shape[1]
+        K = self.k_models
+        total_batch = J * K
+        # Repeat each candidate K times for posterior diversity: (J*K, H, A)
+        if K > 1:
+            act_seqs = np.repeat(candidates, K, axis=0)  # (J*K, H, A)
+        else:
+            act_seqs = candidates
+
+        # ── Batched rollout: all J*K trajectories in parallel ──────
+        obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)
+        obs_t = obs_t.unsqueeze(0).expand(total_batch, -1)       # (J*K, obs_dim)
+        state = self.dyn.reset(obs_t)
+        returns = torch.zeros(total_batch, device=self.device)
+        # alive[i] == 1.0 while candidate i's imagined trajectory has not
+        # yet terminated.  Stays all-ones when term_fn is None, so the
+        # masked update below is bit-identical to the unmasked rollout.
+        alive = torch.ones(total_batch, device=self.device)
+        disc = 1.0
+
+        # With K>1 posterior draws we MUST sample weights (deterministic
+        # =False), else BayesianLinear returns the mean weights for every
+        # row (see bnn/layers.py: `if not sample: use weight_mu`), the K
+        # draws collapse to identical returns, and CVaR-alpha has NO effect.
+        # K==1 keeps the deterministic mean-model rollout (risk-neutral).
+        rollout_det = (K <= 1)
+        for t in range(H):
+            act_t = torch.as_tensor(act_seqs[:, t, :], dtype=torch.float32,
+                                    device=self.device)          # (J*K, act_dim)
+            cur_obs = obs_t          # state at imagined time t (pre-transition)
+            next_obs, rew, _, _ = self.dyn.sample(
+                act_t, state, deterministic=rollout_det)
+            if self.obs_project is not None:
+                next_obs = self.obs_project(next_obs)
+
+            # Reward from the ANALYTIC cost r(s_t, a_t) when supplied (the
+            # env computes its reward from the pre-transition state too);
+            # otherwise fall back to the model's learned reward channel.
+            if self.reward_fn is not None:
+                step_rew = self.reward_fn(cur_obs, act_t)
+            else:
+                step_rew = rew.squeeze(-1)
+            if self.reward_clip is not None:
+                step_rew = step_rew.clamp(self.reward_clip[0],
+                                          self.reward_clip[1])
+            if self.term_fn is not None:
+                # The env pays reward for step t iff s_{t+1} is NOT the
+                # terminating state (InvertedPendulumEnv: reward =
+                # int(not terminated)), so the mask is updated with the
+                # freshly imagined next_obs BEFORE it scales this step's
+                # reward.  Once dead a trajectory stays dead.
+                alive = alive * (~self.term_fn(next_obs)).float()
+                step_rew = step_rew * alive
+            returns += disc * step_rew
+            obs_t = next_obs
+            state = self.dyn.reset(obs_t)
+            disc *= self.gamma
+
+        if self.terminal_fn is not None:
+            # disc == gamma^H here (it was multiplied once per step).
+            returns = returns + disc * self.terminal_fn(obs_t, alive)
+
+        return returns.cpu().numpy().reshape(J, K)
+
+    def _scores(self, returns_grouped):
+        """Score each candidate as CVaR_alpha over its K returns: (J, K) -> (J,)."""
+        if returns_grouped.shape[1] > 1:
+            return np.array([self._cvar_value(r) for r in returns_grouped])
+        return returns_grouped[:, 0]
 
     def _cvar_value(self, returns):
         m = len(returns)

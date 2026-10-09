@@ -59,12 +59,30 @@ class BayesianDynamicsModel(models.Model):
         self.out_size = out_size
         self.beta = beta
         self.num_mc_samples = num_mc_samples
+        # beta-NLL (Seitzer et al., ICLR 2022).  0.0 = plain Gaussian NLL (the
+        # shipped behaviour).  See `loss` for what it fixes and why.
+        self.beta_nll = 0.0
         # Planning-rollout M x k split (see BayesianLinear): per timestep draw
         # `num_weight_groups` (M) independent weight sets, each shared by k rows.
         self.num_weight_groups = num_weight_groups
         # Pre-noise per-row network means from the most recent stochastic sample_1d
         # call -- lets a caller read epistemic uncertainty off the planning pass.
         self.last_pred_mean = None
+        # Whether a stochastic sample_1d ADDS the predicted observation noise on
+        # top of the weight-sampled mean.  True (default) is the shipped
+        # behaviour: preds = mu_w + sigma_aleatoric * eps.
+        #
+        # Set False for a DETERMINISTIC env, where the aleatoric channel is not
+        # real process noise but absorbed model error, and injecting it every
+        # step of a self-fed rollout simulates randomness the env does not have.
+        # On an open-loop-UNSTABLE plant that is fatal: InvertedPendulum's error
+        # doubles every ~4 steps, so per-step noise of a fifth of the true state
+        # change compounds until every imagined trajectory falls over, regardless
+        # of the actions -- the planner then cannot rank candidates at all.
+        # With this False the K posterior draws still differ (each uses its own
+        # weight sample), so CVaR still averages a genuine tail -- one made of
+        # EPISTEMIC disagreement rather than fictitious observation noise.
+        self.aleatoric_in_rollout = True
         # Size of the FULL training set, used to scale the KL term in the ELBO.
         self.num_train_points = None
 
@@ -92,7 +110,37 @@ class BayesianDynamicsModel(models.Model):
         self.max_logvar = Parameter(0.5 * torch.ones(out_size))
         self.min_logvar = Parameter(-10.0 * torch.ones(out_size))
 
+        # OUTPUT standardizer (see set_output_scaler).  Identity by default, so
+        # models that do not set it behave exactly as before.
+        self.register_buffer("out_mu", torch.zeros(out_size))
+        self.register_buffer("out_std", torch.ones(out_size))
+
         self.to(device)
+
+    def set_output_scaler(self, mu, std, eps=1e-8):
+        """Make the network predict STANDARDIZED targets internally.
+
+        mbrl normalizes model INPUTS but not targets, which is fine when every
+        output dim has a similar scale (Pendulum: delta-obs ~0.1, reward ~1) and
+        fatal when it does not.  On LunarLander the nine target dims span
+        std 0.0037 (delta x) to 1.0 (reward): a Kaiming-init net starts three
+        orders of magnitude above delta x, the shared trunk spends its capacity
+        on the loud dims, and the log-variance bounds (a single clamp applied to
+        all dims) cannot be right for both ends at once.
+
+        With a scaler set, `_run_network` trains in standardized space and then
+        maps back:  mean = mean_std * std + mu,  logvar = logvar_std + 2 log std.
+        So EVERY caller (mbrl's wrapper, surprise_gaussian, forget, retrain)
+        still sees raw target units -- only the parameters live in the well-
+        conditioned space.  The buffers ride along in state_dict, so a checkpoint
+        reloads with its scaler.
+        """
+        with torch.no_grad():
+            self.out_mu.copy_(torch.as_tensor(mu, dtype=torch.float32,
+                                              device=self.out_mu.device))
+            self.out_std.copy_(torch.as_tensor(std, dtype=torch.float32,
+                                               device=self.out_std.device
+                                               ).clamp_min(eps))
 
     def reset_adapters(self):
         """Re-init every adapter to near-deterministic identity (weight_mu = I,
@@ -121,7 +169,9 @@ class BayesianDynamicsModel(models.Model):
         # Smoothly clamp log-variance (as in PETS) for stable training.
         bounded = self.max_logvar - F.softplus(self.max_logvar - raw_logvar)
         final_logvar = self.min_logvar + F.softplus(bounded - self.min_logvar)
-        return mean, final_logvar
+        # De-standardize into raw target units (identity unless a scaler was set).
+        return (mean * self.out_std + self.out_mu,
+                final_logvar + 2.0 * torch.log(self.out_std))
 
     def forward(self, x, sample=True, num_weight_groups=1):
         return self._run_network(x, sample=sample, num_weight_groups=num_weight_groups)
@@ -136,11 +186,42 @@ class BayesianDynamicsModel(models.Model):
             layer.anchor_prior_to_current(include_sigma=include_sigma)
 
     def loss(self, model_in, target=None):
+        """Negative ELBO: (beta-)Gaussian NLL + beta * KL / N.
+
+        With `beta_nll` > 0 this is the beta-NLL of Seitzer et al. (ICLR 2022),
+        which fixes a specific pathology of plain heteroscedastic NLL:
+
+            dNLL/dmu = -(y - mu) / sigma^2
+
+        so every sample's pull on the MEAN is weighted by 1/sigma^2.  Wherever the
+        net predicts a large sigma it also stops learning mu there -- the fit is
+        "honestly calibrated" and simultaneously bad.  On this env that region is
+        ground contact: measured on held-out data, contact rows supply only 6.7%
+        of ang_vel's mu-gradient while carrying 75.3% of its error mass (11x
+        starvation), and ang_vel is duly the worst-predicted dim.
+
+        beta-NLL multiplies the per-element NLL by a DETACHED sigma^(2*beta),
+        cancelling that weighting: beta=0 is plain NLL, beta=1 makes the
+        mu-gradient exactly MSE's, beta=0.5 is the paper's robust default.  sigma
+        still gets its own gradient, so calibration is retained.
+
+        The weights are normalised to mean 1 PER DIM, which does two things:
+        it keeps the loss on the same scale as plain NLL (so `beta`, set from
+        --kl-budget against the un-weighted NLL, stays calibrated), and it makes
+        the result invariant to whether sigma is measured in raw or standardized
+        units -- the per-dim target scale from set_output_scaler cancels out, so
+        this only redistributes weight ACROSS SAMPLES within a dim and never
+        re-introduces the cross-dim imbalance the output scaler exists to remove.
+        """
         B = model_in.numel() // self.in_size
         nll_acc = torch.zeros(1, device=self.device)
         for _ in range(self.num_mc_samples):
             mean, logvar = self._run_network(model_in, sample=True)
             nll = 0.5 * (logvar + (target - mean) ** 2 / torch.exp(logvar))
+            if self.beta_nll > 0.0:
+                w = torch.exp(logvar).detach() ** self.beta_nll
+                w = w / w.mean(dim=0, keepdim=True).clamp_min(1e-12)
+                nll = nll * w
             nll_acc = nll_acc + nll.mean()
         avg_nll = nll_acc / self.num_mc_samples
         kl = self._total_kl()
@@ -164,7 +245,12 @@ class BayesianDynamicsModel(models.Model):
                 num_weight_groups=self.num_weight_groups,
             )
             self.last_pred_mean = mean.clone()
-            if deterministic:
+            if deterministic or not self.aleatoric_in_rollout:
+                # `mean` here is already the WEIGHT-SAMPLED mean whenever
+                # deterministic is False, so returning it keeps the epistemic
+                # spread across posterior draws and drops only the observation
+                # noise.  Under deterministic=True it is the mean-weight
+                # prediction, exactly as before.
                 return mean, {}
             std = torch.exp(0.5 * logvar)
             preds = mean + std * torch.randn_like(mean)
