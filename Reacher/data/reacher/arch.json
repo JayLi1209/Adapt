@@ -1,0 +1,1 @@
+{"hid_size": 256, "num_layers": 4, "obs_dim": 10, "act_dim": 2, "gear": 1.0, "mass": 1.0, "damping": 1.0, "beta_nll": 0.5, "out_scaler": true, "goal_weight": true, "floor": 0.05, "d0": 0.05, "n_collect": 100000, "epochs": 1200, "seed": 0, "val_nll": -6.598196506500244, "val_nrmse": 0.06396801024675369}
