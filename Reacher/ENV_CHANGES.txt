@@ -1,0 +1,187 @@
+================================================================================
+REACHER ENVIRONMENT CHANGES -- THE FOUR PERTURBATION CELLS
+================================================================================
+Written 2026-08-31.  Describes the four cells run in results/traces100/
+(4 cells x 5 arms x 100 seeds x 200 steps = 2,000 episodes).
+
+Source of truth: env/reacher.py, test_reacher_default_head.py.
+
+--------------------------------------------------------------------------------
+SHARED SETUP (identical across all four cells)
+--------------------------------------------------------------------------------
+Base task     Reacher-v5 (MuJoCo).  2-link arm, 2 torque actuators, reach a
+              randomly placed target.  Workspace is a disk of radius ~0.21 m.
+
+Observation   OBS_DIM = 10.  Dims 8:10 are (fingertip - target) in (x, y) --
+              the reward-carrying dims.  Action ACT_DIM = 2 (joint torques).
+
+Reward        r = -||fingertip - target|| - ||a||^2   (distance + control cost).
+              UNCHANGED by every perturbation below.  All four faults perturb
+              the DYNAMICS only; the reward function is never touched.  For the
+              saturation/rotation faults the control cost is charged on the
+              COMMANDED action, not the perturbed torque, so the planner cannot
+              be rewarded for the fault.
+
+Episode       200 steps, NO TRUNCATION.  (Reacher-v5's native TimeLimit is 50
+              steps; that is overridden.  200 is load-bearing -- an online
+              adapter given only 50 steps sees 50 samples with which to learn a
+              2-D force field.  The trace curves show arms do not separate until
+              ~step 20-40, so a 50-step episode would miss most of the effect.)
+
+Change onset  ts = 0 for every cell.  The fault is present from the first step;
+              there is no clean pre-change phase within an episode.
+
+Discount      gamma = 1.0  (NO DISCOUNT)
+Planner       CEM + CVaR, horizon H = 15, J = 500 candidates, 8 CEM iterations,
+              K = 3 posterior draws, alpha = 0.8.  Per real action this rolls
+              out J*K = 1,500 imagined trajectories x 15 steps x 8 iters =
+              180,000 imagined model-steps.
+Seeds         1000..1099 (100 per cell).  Every arm runs every seed, so all
+              comparisons against no_adapt are PAIRED on identical episodes.
+Arms          nl1_forget_qv, nl1_noforget, no_adapt, forget_elbo, oracle
+Surprise      per-dimension surprise score; surprise -> smooth -> inflate.
+
+================================================================================
+FAULT A -- NON-LINEAR WIND  (cells 1 and 2)
+================================================================================
+A static-per-episode, SPATIALLY-varying force field applied to the fingertip.
+
+  F_x(x,y) = F_max * tanh( sin(2*k_s*x + C_x1) + sin(pi*k_s*y + C_x2) )
+  F_y(x,y) = F_max * tanh( sin(2*k_s*y + C_y1) + sin(pi*k_s*x + C_y2) )
+
+  - The four phase offsets C are drawn once at reset and HELD FIXED for the
+    whole episode.  Within an episode the wind is therefore a fixed function of
+    POSITION, not a time-varying disturbance.  This is deliberate: a fixed field
+    is learnable by a state-conditioned adapter, which is what the head is asked
+    to do.
+  - The force is written into data.xfrc_applied at the body's CURRENT position
+    once per MuJoCo SUBSTEP (frame_skip = 2), so it is closed-loop -- the arm
+    feels the field it is currently moving through, not a constant push.
+  - Applied to the fingertip body, so the disturbance is a pure end-effector
+    force and the field the arm feels is exactly F(fingertip_x, fingertip_y).
+  - F_max: 0 -> 500 at ts = 0.
+
+  Note on F_max = 500: CLAUDE.md's default "wind intensity 0 -> 5" is INERT on
+  Reacher.  At F=5 the wind shifts joint velocity ~0.007 rad/s per step against
+  a model one-step RMSE of ~0.24 on those dims -- roughly 34x BELOW the model's
+  own noise floor, and statistically indistinguishable from no wind.  Reacher's
+  actuator gear is 200 N*m at ctrl=1, so a 5 N force on the 0.21 m lever is 0.5%
+  of actuator authority.  The "intensity 5" convention is inherited from
+  LunarLander, which is ~380x softer in the relevant units.  F=500 was chosen as
+  the point where headroom is real but the ORACLE has not itself collapsed
+  (F=1000 degrades the oracle, meaning the task breaks rather than the model).
+
+--------------------------------------------------------------------------------
+CELL 1 -- WIND, k_s = 0.5      (F_max 0 -> 500 at ts 0)
+--------------------------------------------------------------------------------
+NATURE      Low spatial frequency.  Across the 0.21 m workspace the sine
+            arguments sweep only a fraction of a radian, so the field is
+            NEAR-UNIFORM -- effectively a large, smooth, position-dependent
+            push with very long coherence length.
+
+WHY IT      This is the LEARNABLE end of the frequency axis.  The field is
+MATTERS     spatially coherent, so a qvel-restricted adapter can represent and
+            cancel it.  It is also the regime with the LARGEST headroom.
+
+--------------------------------------------------------------------------------
+CELL 2 -- WIND, k_s = 5        (F_max 0 -> 500 at ts 0)
+--------------------------------------------------------------------------------
+NATURE      Mid spatial frequency.  The field's wavelength becomes comparable
+            to the arm's own excursions, so the fingertip crosses crests and
+            troughs on its way to the target.
+
+WHY IT      This is the HARDEST cell for everyone, not just for the adapter.
+MATTERS     Headroom COLLAPSES to +16.66 -- the smallest of the four cells --
+            because the disturbance degrades the ORACLE too (oracle -16.19,
+            its worst of any cell) while no_adapt actually improves relative to
+            k_s=0.5.  Less is available to win, so a smaller win is expected.
+
+  FREQUENCY CONTEXT (from the 3-seed sweep, results/ks_sweep/):
+  nl1_forget_qv's advantage is MONOTONIC in k_s: +13.9 / +12.3 / +1.9 / -3.3
+  at k_s = 0.5 / 1 / 5 / 15.  It stops winning by k_s = 15.  The mirror-image
+  arm lin1_noforget wins ONLY at k_s = 15 (+2.3) and loses everywhere else.
+  So "which arm wins on wind" is not a fact about the method -- it is a fact
+  about k_s.  k_s = 15 (the historical default, chosen because k_s=1
+  "degenerates to a near-uniform push") is the single WORST frequency in the
+  range for showing that adaptation works: the physical reading was right, but
+  near-uniform is exactly what makes a fault learnable.
+
+================================================================================
+FAULT B -- ACTUATOR ROTATION  (cells 3 and 4)
+================================================================================
+A transmission-coupling fault: the commanded torque vector is ROTATED.
+
+  tau = R(theta) @ a,     R(theta) = [[cos, -sin], [sin, cos]]
+
+  - R is ORTHOGONAL, so ||tau|| == ||a|| EXACTLY.  The planner keeps its entire
+    torque budget and cannot lose by "getting there slower" -- the whole
+    performance gap is DIRECTION error.  This makes theta a single clean
+    difficulty knob.
+  - Physically: a cable- or tendon-driven arm has a motor->joint coupling
+    matrix; re-tensioning or re-routing changes it.
+  - Applied to the COMMANDED action on its way into the simulator, BEFORE any
+    saturation (rotation is a property of the transmission).  The control cost
+    is still charged on the commanded a, so the reward function is untouched.
+  - Expected progress toward the target falls roughly as cos(theta).
+  - Wind is DISABLED in these cells (--fmax 0).
+
+  IMPORTANT FLAG HAZARD: the driver's --fmax DEFAULTS TO 500.  A rotation run
+  that omits "--fmax 0" silently runs wind AND rotation simultaneously.  This
+  has already invalidated at least one historical batch (results/mulqv_rot60.json
+  carries fmax=500 alongside rot=60 and is excluded from all analysis).
+
+--------------------------------------------------------------------------------
+CELL 3 -- ROTATION, theta = 90 deg     (applied at ts 0)
+--------------------------------------------------------------------------------
+NATURE      Torque rotated a quarter turn.  cos(90) = 0, so the commanded
+            direction contributes ZERO expected progress toward the target:
+            a full channel swap-and-flip.  Torque magnitude is unchanged.
+
+WHY IT      Just past the crossover.  Below ~60 deg the fault is too small to be
+MATTERS     worth modelling -- the frozen model's bias costs less than the
+            adapter's added variance, and every adaptation arm LOSES.  90 deg is
+            the first angle where adaptation clearly pays.
+
+--------------------------------------------------------------------------------
+CELL 4 -- ROTATION, theta = 150 deg    (applied at ts 0)
+--------------------------------------------------------------------------------
+NATURE      Torque very nearly REVERSED.  cos(150) = -0.866, so the commanded
+            direction actively drives the fingertip AWAY from the target.
+            Magnitude still unchanged.
+
+WHY IT      The most severe fault in the whole study and the largest headroom
+MATTERS     (+78.84).  Cleanest separation between arms; every seed agrees.
+
+
+================================================================================
+CROSS-CELL SUMMARY
+================================================================================
+                          headroom   nl1_forget_qv   nl1_noforget   forget_elbo
+  wind  k_s = 0.5           +21.50    +8.32 (74%)     -2.33          -6.43
+  wind  k_s = 5             +16.66    +2.60 (57%)     -0.74          -8.49
+  rot   90 deg              +25.33    +7.35 (72%)     -2.01          -5.69
+  rot   150 deg             +78.84   +52.19 (100%)    -4.05         +32.75
+  (parenthesis = per-seed win rate against no_adapt out of 100)
+
+THREE FINDINGS THAT HOLD ACROSS ALL FOUR CELLS
+
+1. nl1_forget_qv is the ONLY arm that beats the frozen model in every cell.
+   This overturns the earlier "all adaptation arms lose" conclusion, which was
+   recorded at wind k_s=15 -- an operating point that turns out to be the worst
+   available for both faults.
+
+2. nl1_noforget (ELBO refit, NO inflation) is NEGATIVE in all four cells.
+   Since nl1_forget_qv = ELBO + surprise-triggered inflation, the inflation is
+   doing the work, not the refit.
+
+3. forget_elbo INVERTS between the two fault types: second-best arm at rot 150
+   (+32.75, 100/100 wins) and the WORST arm in both wind cells (-6.43, -8.49).
+   Refitting the body's output layer helps against a clean action-space rotation
+   and actively hurts against a spatial force field.
+
+SEVERITY IS THE CONTROLLING VARIABLE.  In both faults the adapter's advantage
+grows with fault size: rotation crosses from loss to win between 60 and 90 deg,
+and wind's advantage decays as k_s rises.  The advantage is not a fixed property
+of the method -- it is a function of where on the severity axis you sample.
+
+================================================================================

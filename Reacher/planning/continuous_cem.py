@@ -155,8 +155,6 @@ class ContinuousCEMAgent:
         # by default -- zero overhead on the normal path.
         self.record_diag = False
         self.iter_diag = []
-        # Imagined transitions consumed by the most recent act() (see sim_budget).
-        self.sim_steps = 0
 
     def reset(self):
         self._mu = np.zeros((self.horizon, self.act_dim), dtype=np.float32)
@@ -166,99 +164,14 @@ class ContinuousCEMAgent:
     def notify_change(self):
         self.reset()
 
-    # ── shared objective (also used by planning/continuous_planners.py) ──────
-    # Imagined transitions per act() call: one (state, action) -> next-state
-    # model query per posterior draw per imagined step.  Every planner in
-    # continuous_planners.py is budgeted against this same count.
-    def sim_budget(self):
-        return self.n_cem_iters * self.n_candidates * self.k_models * self.horizon
-
-    @torch.no_grad()
-    def _rollout_returns(self, obs_arr, candidates):
-        """Discounted H-step imagined returns of J open-loop action sequences.
-
-        candidates (J, H, A) -> numpy (J, K): column k is posterior draw k.
-        Each candidate is repeated K times (rows j*K .. j*K+K-1); the caller must
-        have set bnn.num_weight_groups = K, so row r uses weight set r % K and
-        weights are RESAMPLED every imagined step.  This is the body of the
-        original CEM loop, moved verbatim -- same op order, same RNG draws.
-        """
-        H = self.horizon
-        J = candidates.shape[0]
-        K = self.k_models
-        total_batch = J * K
-
-        # Repeat each candidate K times for posterior diversity: (J*K, H, A)
-        if K > 1:
-            act_seqs = np.repeat(candidates, K, axis=0)  # (J*K, H, A)
-        else:
-            act_seqs = candidates
-
-        # ── Batched rollout: all J*K trajectories in parallel ──────
-        obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)
-        obs_t = obs_t.unsqueeze(0).expand(total_batch, -1)       # (J*K, obs_dim)
-        state = self.dyn.reset(obs_t)
-        returns = torch.zeros(total_batch, device=self.device)
-        disc = 1.0
-
-        # With K>1 posterior draws we MUST sample weights (deterministic
-        # =False), else BayesianLinear returns the mean weights for every
-        # row (see bnn/layers.py: `if not sample: use weight_mu`), the K
-        # draws collapse to identical returns, and CVaR-alpha has NO effect.
-        # K==1 keeps the deterministic mean-model rollout (risk-neutral).
-        rollout_det = (K <= 1)
-        for t in range(H):
-            act_t = torch.as_tensor(act_seqs[:, t, :], dtype=torch.float32,
-                                    device=self.device)          # (J*K, act_dim)
-            cur_obs = obs_t          # state at imagined time t (pre-transition)
-            if (self.alt_dynamics_fn is not None
-                    and t >= self.alt_dynamics_after):
-                next_obs = self.alt_dynamics_fn(cur_obs, act_t)
-                rew = None           # reward_fn supplies the reward below
-            else:
-                next_obs, rew, _, _ = self.dyn.sample(
-                    act_t, state, deterministic=rollout_det)
-            if self.obs_project is not None:
-                next_obs = self.obs_project(next_obs)
-
-            # Reward from the ANALYTIC cost r(s_t, a_t) when supplied (the
-            # env computes its reward from the pre-transition state too);
-            # otherwise fall back to the model's learned reward channel.
-            if self.reward_fn is not None:
-                step_rew = self.reward_fn(cur_obs, act_t)
-            else:
-                step_rew = rew.squeeze(-1)
-            if self.reward_clip is not None:
-                step_rew = step_rew.clamp(self.reward_clip[0],
-                                          self.reward_clip[1])
-            returns += disc * step_rew
-            obs_t = next_obs
-            state = self.dyn.reset(obs_t)
-            disc *= self.gamma
-
-        # Terminal value: `disc` is exactly gamma^H here (multiplied once
-        # per completed step), and obs_t is s_H, so this appends the
-        # discounted tail value the truncated rollout would otherwise drop.
-        if self.terminal_value_fn is not None:
-            returns += disc * self.terminal_value_fn(obs_t)
-
-        self.sim_steps += total_batch * H
-        return returns.cpu().numpy().reshape(J, K)               # (J, K)
-
-    def _scores(self, returns_grouped):
-        """CVaR_alpha over each candidate's K draws: (J, K) -> (J,)."""
-        if returns_grouped.shape[1] > 1:
-            return np.array([self._cvar_value(returns_grouped[j])
-                             for j in range(returns_grouped.shape[0])])
-        return returns_grouped[:, 0]
-
     @torch.no_grad()
     def act(self, obs):
         obs_arr = np.asarray(obs, dtype=np.float32).ravel()
         H, A, J = self.horizon, self.act_dim, self.n_candidates
         K = self.k_models
-        self.sim_steps = 0
 
+        # Total batch = J * K (J candidates × K posterior draws each)
+        total_batch = J * K
         saved_groups = self.bnn.num_weight_groups
         self.bnn.num_weight_groups = K if K > 1 else 1
 
@@ -285,8 +198,69 @@ class ContinuousCEMAgent:
                 candidates = self._mu + self._sigma * noise
                 candidates = np.clip(candidates, self.action_low, self.action_high)
 
-                returns_grouped = self._rollout_returns(obs_arr, candidates)  # (J, K)
-                scores = self._scores(returns_grouped)
+                # Repeat each candidate K times for posterior diversity: (J*K, H, A)
+                if K > 1:
+                    act_seqs = np.repeat(candidates, K, axis=0)  # (J*K, H, A)
+                else:
+                    act_seqs = candidates
+
+                # ── Batched rollout: all J*K trajectories in parallel ──────
+                obs_t = torch.as_tensor(obs_arr, dtype=torch.float32, device=self.device)
+                obs_t = obs_t.unsqueeze(0).expand(total_batch, -1)       # (J*K, obs_dim)
+                state = self.dyn.reset(obs_t)
+                returns = torch.zeros(total_batch, device=self.device)
+                disc = 1.0
+
+                # With K>1 posterior draws we MUST sample weights (deterministic
+                # =False), else BayesianLinear returns the mean weights for every
+                # row (see bnn/layers.py: `if not sample: use weight_mu`), the K
+                # draws collapse to identical returns, and CVaR-alpha has NO effect.
+                # K==1 keeps the deterministic mean-model rollout (risk-neutral).
+                rollout_det = (K <= 1)
+                for t in range(H):
+                    act_t = torch.as_tensor(act_seqs[:, t, :], dtype=torch.float32,
+                                            device=self.device)          # (J*K, act_dim)
+                    cur_obs = obs_t          # state at imagined time t (pre-transition)
+                    if (self.alt_dynamics_fn is not None
+                            and t >= self.alt_dynamics_after):
+                        next_obs = self.alt_dynamics_fn(cur_obs, act_t)
+                        rew = None           # reward_fn supplies the reward below
+                    else:
+                        next_obs, rew, _, _ = self.dyn.sample(
+                            act_t, state, deterministic=rollout_det)
+                    if self.obs_project is not None:
+                        next_obs = self.obs_project(next_obs)
+
+                    # Reward from the ANALYTIC cost r(s_t, a_t) when supplied (the
+                    # env computes its reward from the pre-transition state too);
+                    # otherwise fall back to the model's learned reward channel.
+                    if self.reward_fn is not None:
+                        step_rew = self.reward_fn(cur_obs, act_t)
+                    else:
+                        step_rew = rew.squeeze(-1)
+                    if self.reward_clip is not None:
+                        step_rew = step_rew.clamp(self.reward_clip[0],
+                                                  self.reward_clip[1])
+                    returns += disc * step_rew
+                    obs_t = next_obs
+                    state = self.dyn.reset(obs_t)
+                    disc *= self.gamma
+
+                # Terminal value: `disc` is exactly gamma^H here (multiplied once
+                # per completed step), and obs_t is s_H, so this appends the
+                # discounted tail value the truncated rollout would otherwise drop.
+                if self.terminal_value_fn is not None:
+                    returns += disc * self.terminal_value_fn(obs_t)
+
+                returns_np = returns.cpu().numpy()                       # (J*K,)
+
+                # ── Score each candidate as CVaR over its K returns ──────
+                if K > 1:
+                    returns_grouped = returns_np.reshape(J, K)           # (J, K)
+                    scores = np.array([self._cvar_value(returns_grouped[j])
+                                       for j in range(J)])
+                else:
+                    scores = returns_np
 
                 # ── Select elites and refit Gaussian ────────────────────
                 elite_idx = np.argpartition(-scores, self.n_elite - 1)[:self.n_elite]

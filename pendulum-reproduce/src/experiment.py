@@ -1,4 +1,8 @@
-"""CLAUDE.md DEFAULT pendulum setting, 100 trials: conjugate action head vs the
+"""[pendulum-reproduce] Verbatim copy of Pendulum/test_pendulum_default_head.py,
+except: MODEL_DIR is resolved relative to this file, and setup() exposes main()'s
+model/agent construction to src/worker.py.  run_trial is unchanged.
+
+CLAUDE.md DEFAULT pendulum setting, 100 trials: conjugate action head vs the
 surprise-forget-inflate scheme it is meant to replace.
 
 SETTING (matches run_pendulum_default.py exactly unless noted)
@@ -49,7 +53,7 @@ from planning.continuous_planners import (ContinuousMPPIAgent, ContinuousMCTSAge
                                           ContinuousILQRAgent)
 import defaults as rpd
 
-MODEL_DIR = "data/pendulum"
+MODEL_DIR = str(pathlib.Path(__file__).resolve().parent.parent / "data" / "pendulum")
 MAX_T = 2.0                     # Pendulum-v1 default actuator limit
 H, CEM_ITERS, CANDIDATES, ELITE, K_MODELS, ALPHA = 40, 8, 500, 0.1, 10, 1.0
 GAMMA, MASS, GRAV = rpd.GAMMA, rpd.TARGET_MASS, rpd.DEFAULT_GRAV
@@ -262,6 +266,29 @@ def run_trial(arm, seed, bnn, dyn, init_state, agent, w0):
                 sim_steps_mean=float(np.mean(sim_steps)),
                 sim_steps_min=int(np.min(sim_steps)),
                 act_sec_mean=float(np.mean(act_sec)))
+
+
+def setup(planner="cem", mass=MASS, gravity=GRAV, steps=TRIAL_LEN):
+    """main()'s model/agent construction, callable from src/worker.py.  Sets
+    the same module globals main() sets from its flags, so run_trial behaves
+    exactly as under `--planner/--mass/--gravity/--steps`."""
+    globals()["TRIAL_LEN"] = steps
+    globals()["MASS"] = mass
+    globals()["GRAV"] = gravity
+    globals()["W_TARGET"] = 3.0 * DT / (mass * 1.0 ** 2)
+    hid, nl = load_arch(MODEL_DIR)
+    bnn, dyn = make_gaussian_bnn(3, 1, hid_size=hid, num_layers=nl)
+    dyn.input_normalizer.load(MODEL_DIR); bnn.load(MODEL_DIR, "bnn_dynamics.pth")
+    bnn.num_weight_groups = 1; bnn.aleatoric_in_rollout = False
+    bnn.anchor_prior_to_current(include_sigma=True)
+    init_state = copy.deepcopy(bnn.state_dict())
+    w0 = measure_gain(bnn, dyn, gain_probe(), n_dims=3)
+    agent = PLANNERS[planner](dyn, bnn, 3, 1, device=device, horizon=H,
+                              n_cem_iters=CEM_ITERS, n_candidates=CANDIDATES,
+                              elite_frac=ELITE, k_models=K_MODELS, cvar_alpha=ALPHA,
+                              gamma=GAMMA, obs_project=project_unit_circle,
+                              reward_fn=pendulum_reward)
+    return bnn, dyn, init_state, agent, w0
 
 
 def main():

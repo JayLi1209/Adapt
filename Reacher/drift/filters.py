@@ -1,0 +1,193 @@
+"""The two drift filters the env loop runs in parallel.
+
+DriftFilterV1 : rectified-excess EWMA estimator (from bnn_fl_cem_surprise_drift.py).
+                Shadow filter, logged for comparison.
+DriftFilterV2 : equal-weight, SIGNED drift filter with an empirical baseline (from
+                mcts_drift_copy_v2.py).  The REAL filter -- its delta_bar drives
+                forget_dirichlet.
+
+Both are extracted verbatim; only the constant imports changed (now from config).
+"""
+from collections import deque
+
+import numpy as np
+
+from config import ETA, GAMMA_UNCERTAINTY, KAPPA
+
+
+class DriftFilterV1:
+    """Rectified-excess EWMA estimator of the squared drift lambda.
+
+    lambda_hat = EWMA([delta_n - 1]_+); optionally an EWMA of the excess's second
+    moment for a moment-matched std.  Reset at the change notification.
+    """
+
+    def __init__(self, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY):
+        self.eta = eta
+        self.gamma_uncertainty = gamma_uncertainty
+        self.reset()
+
+    def reset(self):
+        self.lambda_hat = 0.0      # filtered squared drift (per-dim, excess units)
+        self._m2 = 0.0             # EWMA of excess^2 (for the Gamma-view variance)
+
+    def update(self, delta_n):
+        excess = max(delta_n - 1.0, 0.0)
+        self.lambda_hat = (1.0 - self.eta) * self.lambda_hat + self.eta * excess
+        if self.gamma_uncertainty:
+            self._m2 = (1.0 - self.eta) * self._m2 + self.eta * (excess ** 2)
+        return self.lambda_hat
+
+    @property
+    def delta_bar(self):
+        """Filtered, calibration-relative surprise (baseline 1)."""
+        return 1.0 + self.lambda_hat
+
+    @property
+    def lambda_sd(self):
+        """Moment-matched standard deviation of the filtered excess."""
+        if not self.gamma_uncertainty:
+            return 0.0
+        var = max(self._m2 - self.lambda_hat ** 2, 0.0)
+        # EWMA of an i.i.d. stream has variance ~ eta/(2-eta) of the sample var.
+        return float(np.sqrt(var * self.eta / (2.0 - self.eta)))
+
+    def drift_estimate(self, kappa=KAPPA):
+        """Point (risk-neutral) or risk-averse (kappa>0) squared-drift estimate."""
+        return max(self.lambda_hat + kappa * self.lambda_sd, 0.0)
+
+
+class DriftFilterV2:
+    """Equal-weight, SIGNED drift filter with an EMPIRICAL baseline (v2).
+
+    Every update() BEFORE the first reset() (the pre-change phase) is treated as
+    unchanged and folded into the baseline b; reset() (fired at the change
+    notification) freezes b and switches to detection, where lambda_hat is the
+    signed equal-weight mean of (delta_n - b).
+
+    window=None (default) averages over ALL post-change samples (the original
+    cumulative behavior).  window=k averages over only the LAST k samples --
+    set k to the forget period so each forget application consumes exactly the
+    evidence gathered since the previous one (no sample drives two
+    applications).  Only sensible when k is large enough to average out the
+    per-sample noise in delta_n; with k ~ 1 the estimate is a single draw and
+    the (shrink-only) forgetting compounds noise instead of canceling it.
+    """
+
+    def __init__(self, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY,
+                 default_baseline=1.0, window=None):
+        # eta kept for call-site compatibility; unused (equal weights, not EWMA).
+        self.gamma_uncertainty = gamma_uncertainty
+        self.default_baseline = default_baseline   # used until b is calibrated
+        self.window = window
+        self._b_sum = 0.0
+        self._b_n = 0
+        self._calibrating = True
+        self._reset_detection()
+
+    @property
+    def baseline(self):
+        return self._b_sum / self._b_n if self._b_n > 0 else self.default_baseline
+
+    def _reset_detection(self):
+        self._sum = 0.0
+        self._sumsq = 0.0
+        self._n = 0
+        self._buf = deque(maxlen=self.window) if self.window else None
+
+    def reset(self):
+        # Change notification: stop calibrating, KEEP the learned baseline, and
+        # clear the post-change drift accumulators.
+        self._calibrating = False
+        self._reset_detection()
+
+    def update(self, delta_n):
+        if self._calibrating:
+            # pre-change == known-unchanged: fold into the empirical baseline b
+            self._b_sum += delta_n
+            self._b_n += 1
+            return self.lambda_hat
+        excess = delta_n - self.baseline     # SIGNED, EMPIRICAL baseline (not 1.0)
+        if self._buf is not None:
+            self._buf.append(excess)         # windowed: only the last k samples
+        else:
+            self._sum += excess
+            self._sumsq += excess * excess
+            self._n += 1
+        return self.lambda_hat
+
+    @property
+    def lambda_hat(self):
+        if self._buf is not None:
+            return float(np.mean(self._buf)) if self._buf else 0.0
+        return self._sum / self._n if self._n > 0 else 0.0
+
+    @property
+    def delta_bar(self):
+        # May be < 1 when the net post-shift evidence says "mostly unchanged".
+        return 1.0 + self.lambda_hat
+
+    @property
+    def lambda_sd(self):
+        if self._buf is not None:
+            if not self.gamma_uncertainty or len(self._buf) < 2:
+                return 0.0
+            return float(np.sqrt(np.var(self._buf) / len(self._buf)))
+        if not self.gamma_uncertainty or self._n < 2:
+            return 0.0
+        mean = self.lambda_hat
+        var = max(self._sumsq / self._n - mean * mean, 0.0)
+        return float(np.sqrt(var / self._n))   # std error of the equal-weight mean
+
+    def drift_estimate(self, kappa=KAPPA):
+        # SIGNED point estimate (no max(...,0)); the value reflects ALL evidence,
+        # and forget() handles the non-negativity of the actual inflation.
+        return self.lambda_hat + kappa * self.lambda_sd
+
+
+class PerDimDriftFilter:
+    """Per-output-dimension bank of independent DriftFilterV2 filters.
+
+    Wraps `n_dims` separate DriftFilterV2 instances -- one per model output
+    channel (e.g. delta_cos, delta_sin, delta_theta_dot, [reward]) -- so a
+    channel whose dynamics haven't actually shifted keeps its own calibrated
+    baseline and doesn't get dragged along by a channel that has drifted.
+    Every method mirrors DriftFilterV2's but takes/returns a length-n_dims
+    array instead of a scalar.  This is the `drift.PerDimDriftFilter` referenced
+    by bnn.gaussian_workflow.forget_gaussian_perdim / retrain_gaussian_perdim.
+    """
+
+    def __init__(self, n_dims, eta=ETA, gamma_uncertainty=GAMMA_UNCERTAINTY,
+                 default_baseline=1.0, window=None):
+        self.n_dims = n_dims
+        self.filters = [
+            DriftFilterV2(eta=eta, gamma_uncertainty=gamma_uncertainty,
+                          default_baseline=default_baseline, window=window)
+            for _ in range(n_dims)
+        ]
+
+    def reset(self):
+        for f in self.filters:
+            f.reset()
+
+    def update(self, delta_n_vec):
+        return np.array([f.update(float(v)) for f, v in zip(self.filters, delta_n_vec)])
+
+    def drift_estimate(self, kappa=KAPPA):
+        return np.array([f.drift_estimate(kappa) for f in self.filters])
+
+    @property
+    def lambda_hat(self):
+        return np.array([f.lambda_hat for f in self.filters])
+
+    @property
+    def delta_bar(self):
+        return np.array([f.delta_bar for f in self.filters])
+
+    @property
+    def baseline(self):
+        return np.array([f.baseline for f in self.filters])
+
+
+# Backward-compat alias for the name used earlier in this branch's history.
+DriftFilterV2PerDim = PerDimDriftFilter

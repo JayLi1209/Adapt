@@ -1,0 +1,240 @@
+{
+  "overall": {
+    "nrmse": 0.06374111771583557,
+    "r2": 0.9933952689170837,
+    "z_std": 0.6541147232055664,
+    "cov1": 0.8861305713653564,
+    "cov2": 0.9826889038085938,
+    "rmse_reward": 0.03681400418281555,
+    "rmse_dist": 0.0014918324304744601
+  },
+  "goal": {
+    "nrmse": 0.04751179739832878,
+    "r2": 0.9968590140342712,
+    "z_std": 0.4215891659259796,
+    "cov1": 0.9598353505134583,
+    "cov2": 0.9980459213256836,
+    "rmse_reward": 0.01831209287047386,
+    "rmse_dist": 0.0006054988480173051
+  },
+  "off_goal": {
+    "nrmse": 0.06564387679100037,
+    "r2": 0.992883026599884,
+    "z_std": 0.692179262638092,
+    "cov1": 0.867655336856842,
+    "cov2": 0.9788394570350647,
+    "rmse_reward": 0.0401364304125309,
+    "rmse_dist": 0.0016402497421950102
+  },
+  "rollout": {
+    "1": {
+      "model": 0.05087665468454361,
+      "persist": 0.7360296249389648,
+      "ratio": 0.06912310421466827,
+      "dist_err": 0.00018975432612933218
+    },
+    "2": {
+      "model": 0.07429168373346329,
+      "persist": 1.429036259651184,
+      "ratio": 0.051987264305353165,
+      "dist_err": 0.0004257799300830811
+    },
+    "5": {
+      "model": 0.20737995207309723,
+      "persist": 3.2596795558929443,
+      "ratio": 0.06361973285675049,
+      "dist_err": 0.0018915121909230947
+    },
+    "10": {
+      "model": 0.5274322628974915,
+      "persist": 5.07622766494751,
+      "ratio": 0.1039024069905281,
+      "dist_err": 0.008530146442353725
+    },
+    "15": {
+      "model": 0.9508187770843506,
+      "persist": 6.13590669631958,
+      "ratio": 0.1549597829580307,
+      "dist_err": 0.02266331948339939
+    },
+    "20": {
+      "model": 1.4893006086349487,
+      "persist": 6.6159138679504395,
+      "ratio": 0.22510883212089539,
+      "dist_err": 0.042345285415649414
+    },
+    "25": {
+      "model": 2.1475367546081543,
+      "persist": 6.928188323974609,
+      "ratio": 0.309970885515213,
+      "dist_err": 0.06414921581745148
+    },
+    "30": {
+      "model": 2.7704524993896484,
+      "persist": 7.156709671020508,
+      "ratio": 0.3871125876903534,
+      "dist_err": 0.08243949711322784
+    }
+  },
+  "rollout_noproj": {
+    "1": {
+      "model": 0.05087814852595329,
+      "persist": 0.7360296249389648,
+      "ratio": 0.06912513822317123,
+      "dist_err": 0.00031543857767246664
+    },
+    "2": {
+      "model": 0.07408203929662704,
+      "persist": 1.429036259651184,
+      "ratio": 0.051840558648109436,
+      "dist_err": 0.0008238835725933313
+    },
+    "5": {
+      "model": 0.20534780621528625,
+      "persist": 3.2596795558929443,
+      "ratio": 0.06299632042646408,
+      "dist_err": 0.0033141816966235638
+    },
+    "10": {
+      "model": 0.5197458863258362,
+      "persist": 5.07622766494751,
+      "ratio": 0.10238821804523468,
+      "dist_err": 0.011550244875252247
+    },
+    "15": {
+      "model": 0.9300007224082947,
+      "persist": 6.13590669631958,
+      "ratio": 0.15156695246696472,
+      "dist_err": 0.026901401579380035
+    },
+    "20": {
+      "model": 1.4466478824615479,
+      "persist": 6.6159138679504395,
+      "ratio": 0.2186618447303772,
+      "dist_err": 0.04689081385731697
+    },
+    "25": {
+      "model": 2.049081563949585,
+      "persist": 6.928188323974609,
+      "ratio": 0.2957600951194763,
+      "dist_err": 0.06913086026906967
+    },
+    "30": {
+      "model": 2.6058366298675537,
+      "persist": 7.156709671020508,
+      "ratio": 0.3641109764575958,
+      "dist_err": 0.08682026714086533
+    }
+  },
+  "reward_decomp": {
+    "(a) learned head": 0.03681400418281555,
+    "(b) analytic on model's predicted next state": 0.001483145751990378,
+    "(c) analytic on current state (1-step offset)": 0.01973397471010685
+  },
+  "planning": {
+    "random": {
+      "ret": -42.40017982930298,
+      "ret_se": 0.3881028343472848,
+      "final_dist": 0.17766980264335872,
+      "final_dist_se": 0.008051079125466667,
+      "last10_dist": 0.17205260943341996,
+      "n_trials": 100,
+      "label": "random actions"
+    },
+    "zero": {
+      "ret": -11.657653496308223,
+      "ret_se": 0.4453852351409015,
+      "final_dist": 0.23313044741749764,
+      "final_dist_se": 0.00890844547032286,
+      "last10_dist": 0.23313354671001435,
+      "n_trials": 100,
+      "label": "zero action (arm holds still)"
+    },
+    "bnn": {
+      "ret": -4.484359049207601,
+      "ret_se": 0.1911062263193109,
+      "final_dist": 0.01700698348111473,
+      "final_dist_se": 0.001715310318152805,
+      "last10_dist": 0.01809954909665976,
+      "n_trials": 100,
+      "label": "BNN CEM+CVaR, learned reward [DEFAULT]"
+    },
+    "bnn_alea": {
+      "ret": -4.491452378779006,
+      "ret_se": 0.1856876367507364,
+      "final_dist": 0.016203533227089794,
+      "final_dist_se": 0.0014537670431024512,
+      "last10_dist": 0.017319126983144088,
+      "n_trials": 100,
+      "label": "  ablation: + aleatoric noise in rollout"
+    },
+    "bnn_noproj": {
+      "ret": -4.516790116103034,
+      "ret_se": 0.17985643489183953,
+      "final_dist": 0.015624688046518714,
+      "final_dist_se": 0.001480649807263995,
+      "last10_dist": 0.017163267823343632,
+      "n_trials": 100,
+      "label": "  ablation: no manifold projection"
+    },
+    "bnn_analytic": {
+      "ret": -3.5208077507360644,
+      "ret_se": 0.1271165144367426,
+      "final_dist": 0.0013960800374479732,
+      "final_dist_se": 0.0001516759130581627,
+      "last10_dist": 0.0018095471972301314,
+      "n_trials": 100,
+      "label": "  ablation: analytic reward (isolates reward head)"
+    },
+    "oracle": {
+      "ret": -3.448504464949429,
+      "ret_se": 0.12493718297375211,
+      "final_dist": 0.0010591817516979064,
+      "final_dist_se": 6.675751800945964e-05,
+      "last10_dist": 0.0013606452598469332,
+      "n_trials": 100,
+      "label": "ORACLE CEM (true MuJoCo dynamics)"
+    }
+  },
+  "oracle_gap": {
+    "oracle": -3.448504464949429,
+    "bnn": -4.484359049207601,
+    "random": -42.40017982930298,
+    "zero": -11.657653496308223,
+    "frac_of_range": 0.9734066744352123,
+    "frac_of_range_vs_zero": 0.8738170570053938,
+    "deficit": 1.0358545842581721,
+    "best_bnn_label": "  ablation: analytic reward (isolates reward head)",
+    "best_bnn": -3.5208077507360644
+  },
+  "config": {
+    "model_dir": "/home/yli113/Adapt/data/reacher",
+    "n_test": 40000,
+    "seed": 777,
+    "rollout_h": 30,
+    "rollout_traj": 300,
+    "plan_trials": 100,
+    "plan_len": 50,
+    "plan_h": 15,
+    "plan_candidates": 500,
+    "plan_iters": 8,
+    "k_models": 3,
+    "cvar_alpha": 0.8,
+    "gamma": 1.0,
+    "nthread": 12,
+    "skip_planning": false,
+    "skip_oracle": false,
+    "skip_ablations": false,
+    "out": null,
+    "quick": false
+  },
+  "checks": {
+    "1-step NRMSE < 0.30": true,
+    "1-step R^2 > 0.90": true,
+    "calibration z_std in [0.5,2]": true,
+    "goal region no worse than off-goal (NRMSE)": true,
+    "H=20 rollout beats persistence": true,
+    "BNN CEM beats random actions": true,
+    "BNN within 25% of oracle-over-zero-action range": true
+  }
+}

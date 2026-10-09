@@ -341,14 +341,32 @@ class LinearActionHead:
 
 
 @torch.no_grad()
-def measure_gain(bnn, dyn, obs, n_dims=3, u=1.0):
-    """w0: central difference d mu / du of the frozen network, per output dim."""
-    d = []
-    for s in (-u, u):
-        a = torch.full((obs.shape[0], 1), s, device=obs.device)
-        m, _ = bnn._run_network(dyn._get_model_input(obs, a), sample=False)
-        d.append(m[:, :n_dims])
-    return ((d[1] - d[0]) / (2 * u)).mean(0).cpu().numpy().astype(np.float64)
+def measure_gain(bnn, dyn, obs, n_dims=3, u=1.0, act_dim=1):
+    """w0: central difference d mu / du of the frozen network, per output dim.
+
+    With act_dim == 1 this returns a length-n_dims vector, exactly as before.
+    With act_dim > 1 it returns the (n_dims, act_dim) JACOBIAN, one column per
+    action channel, obtained by perturbing each channel on its own -- which is
+    what a multi-input warm start needs: Reacher's two torques drive the two
+    joints through different rows, so a single shared scalar would misstate both.
+    """
+    if act_dim == 1:
+        d = []
+        for s_ in (-u, u):
+            a = torch.full((obs.shape[0], 1), s_, device=obs.device)
+            m, _ = bnn._run_network(dyn._get_model_input(obs, a), sample=False)
+            d.append(m[:, :n_dims])
+        return ((d[1] - d[0]) / (2 * u)).mean(0).cpu().numpy().astype(np.float64)
+    cols = []
+    for j in range(act_dim):
+        d = []
+        for s_ in (-u, u):
+            a = torch.zeros((obs.shape[0], act_dim), device=obs.device)
+            a[:, j] = s_
+            m, _ = bnn._run_network(dyn._get_model_input(obs, a), sample=False)
+            d.append(m[:, :n_dims])
+        cols.append(((d[1] - d[0]) / (2 * u)).mean(0).cpu().numpy())
+    return np.stack(cols, axis=1).astype(np.float64)      # (n_dims, act_dim)
 
 
 @torch.no_grad()
@@ -429,46 +447,96 @@ class NonlinearAdapterHead(nn.Module):
     the next ELBO step contracts from it rather than from N(0, prior_std).
     """
 
-    def __init__(self, w0, obs_dim=3, hid=64, prior_std=0.1, init_sigma=1e-3):
-        """hid > 0 gives the 3-layer form Skip + L2(silu(L1(.))).  hid == 0
-        DROPS the nonlinear branch entirely, leaving the SINGLE Bayesian layer
-        h(x) = Skip(x) -- affine in [cos, sin, thdot, u], still gradient-trained
-        by the same ELBO, still warm-started to w0*u, and still forgotten and
-        re-anchored by the same retention rule.  Depth is then the only thing
-        that differs between the two arms."""
+    def __init__(self, w0, obs_dim=3, hid=64, prior_std=0.1, init_sigma=1e-3,
+                 act_dim=1, depth=2, compose="add"):
+        """depth=2: h = skip(x) + l2(SiLU(l1(x)))   -- MLP non-linear branch.
+        depth=1: h = skip(x) + SiLU(l_nl(x))        -- single Bayesian layer with
+                 a fixed non-linear wrapper.  BOTH are non-linear adapters; the
+                 ELBO is agnostic to depth, the total KL just loses one term.
+                 The one-layer branch is a generalised linear model: each output
+                 is a fixed non-linearity of a linear combination of the inputs,
+                 so it cannot form multi-stage interactions across state dims.
+        """
         super().__init__()
         from bnn.layers import BayesianLinear
         self.obs_dim = int(obs_dim)
-        self.hid = int(hid)
-        in_dim = obs_dim + 1
+        self.act_dim = int(act_dim)
+        self.depth = int(depth)
+        # "add": delta = body(s,0) + h(s,u)          -- residual adapter
+        # "mul": delta = h(s,u) * body(s,0)          -- gain on the WHOLE delta.
+        # Under "mul" the warm start must be h == 1 (identity for a product), not
+        # h == w0 @ u, so the action block is NOT written and the bias is set to
+        # one.  Note this makes the warm start reproduce the body at u=0, i.e.
+        # the ZERO-ACTION model -- unlike "add" it is not a no-op on the body's
+        # action response, because no gain on a passive delta can synthesise a
+        # control term.
+        self.compose = str(compose)
+        # Dims the multiplicative gain acts on.  None = all dims.  When set, the
+        # gain is applied ONLY to these dims and every other dim passes through
+        # as the body's own mu_body(s,0), untouched.  This matters because dims
+        # whose delta is structurally zero (Reacher's target dims 4,5 are
+        # constant within an episode, measured |mu_body(s,0)| = 0.00000) give a
+        # gain no leverage at all and an undefined regression ratio.
+        self.mul_dims = None
+        in_dim = obs_dim + self.act_dim
         self.skip = BayesianLinear(in_dim, obs_dim, prior_std=prior_std)
-        if self.hid > 0:
+        if self.depth == 2:
             self.l1 = BayesianLinear(in_dim, hid, prior_std=prior_std)
             self.l2 = BayesianLinear(hid, obs_dim, prior_std=prior_std)
         else:
-            self.l1 = self.l2 = None
+            # SiLU(0)=0, so zero-init keeps the warm start an exact no-op, the
+            # same property the depth-2 branch gets from zeroing l2.
+            self.l_nl = BayesianLinear(in_dim, obs_dim, prior_std=prior_std)
         rho0 = math.log(math.expm1(init_sigma))
         with torch.no_grad():
             self.skip.weight_mu.zero_()
-            self.skip.weight_mu[:, -1] = torch.as_tensor(w0, dtype=torch.float32)
-            self.skip.bias_mu.zero_(); self.skip.weight_rho.fill_(rho0)
+            # Warm start: the action block of `skip` is set to the body's own
+            # measured gain, so at init h(s,u) = w0 @ u and the composed model
+            # reproduces the frozen body.  w0 is a vector when act_dim == 1 and
+            # the (obs_dim, act_dim) Jacobian otherwise.
+            w0_t = torch.as_tensor(np.asarray(w0), dtype=torch.float32)
+            if self.compose == "mul":
+                # h == 1 identically: zero weights (already zeroed), unit bias.
+                self.skip.bias_mu.fill_(1.0)
+            elif self.act_dim == 1:
+                self.skip.weight_mu[:, -1] = w0_t.reshape(-1)
+            else:
+                self.skip.weight_mu[:, -self.act_dim:] = w0_t.reshape(
+                    self.obs_dim, self.act_dim)
+            if self.compose != "mul":
+                self.skip.bias_mu.zero_()
+            self.skip.weight_rho.fill_(rho0)
             self.skip.bias_rho.fill_(rho0)
-            if self.hid > 0:
+            if self.depth == 2:
                 self.l2.weight_mu.zero_(); self.l2.bias_mu.zero_()
                 self.l2.weight_rho.fill_(rho0); self.l2.bias_rho.fill_(rho0)
+            else:
+                self.l_nl.weight_mu.zero_(); self.l_nl.bias_mu.zero_()
+                self.l_nl.weight_rho.fill_(rho0); self.l_nl.bias_rho.fill_(rho0)
         self.anchor(include_sigma=True)
+        # Read the body's reward channel at the TRUE action (see `attach`).  Set
+        # False only if the planner supplies its own analytic reward and the
+        # learned channel is unused, where it saves a forward pass.
+        self.use_body_reward = True
+        # If True, imagined rollouts use the adapter's posterior MEAN instead of
+        # sampling it.  The adapter still learns a full posterior (and forgetting
+        # still acts on it); this only decides whether its spread is injected
+        # into the planner's K draws.  See test_reacher_default_head.py.
+        self.rollout_mean_only = False
         self._orig_sample = None
         self._dyn = None
 
     @property
     def layers(self):
-        return [self.skip] if self.hid == 0 else [self.skip, self.l1, self.l2]
+        return ([self.skip, self.l1, self.l2] if self.depth == 2
+                else [self.skip, self.l_nl])
 
     def forward(self, x, sample=True):
-        h = self.skip(x, sample=sample)
-        if self.hid > 0:
-            h = h + self.l2(F.silu(self.l1(x, sample=sample)), sample=sample)
-        return h
+        if self.depth == 2:
+            return self.skip(x, sample=sample) + self.l2(
+                F.silu(self.l1(x, sample=sample)), sample=sample)
+        return self.skip(x, sample=sample) + F.silu(
+            self.l_nl(x, sample=sample))
 
     def kl(self):
         return sum(l.kl_divergence() for l in self.layers)
@@ -484,7 +552,14 @@ class NonlinearAdapterHead(nn.Module):
                                         sample=sample, num_weight_groups=n_groups)
         h = self.forward(torch.cat([obs, act], dim=-1), sample=sample)
         mean = mean.clone()
-        mean[:, :self.obs_dim] = mean[:, :self.obs_dim] + h
+        if self.compose == "mul":
+            if self.mul_dims is None:
+                mean[:, :self.obs_dim] = mean[:, :self.obs_dim] * h
+            else:
+                _d = self.mul_dims
+                mean[:, _d] = mean[:, _d] * h[:, _d]
+        else:
+            mean[:, :self.obs_dim] = mean[:, :self.obs_dim] + h
         return mean, logvar
 
     def attach(self, dyn):
@@ -493,14 +568,51 @@ class NonlinearAdapterHead(nn.Module):
         orig, head = dyn.sample, self
 
         def composed(act, model_state, deterministic=False, rng=None):
-            nxt, rew, term, ns = orig(torch.zeros_like(act), model_state,
-                                      deterministic=deterministic, rng=rng)
+            # STATE dims come from the body at u=0 plus the adapter, exactly as
+            # `predict` defines the composition.
+            nxt, _rew0, term, ns = orig(torch.zeros_like(act), model_state,
+                                        deterministic=deterministic, rng=rng)
+            # REWARD comes from the body at the TRUE action.  This is not a
+            # detail: the body's reward channel is a learned function of (s, u),
+            # and on Reacher it carries the control cost -||u||^2.  Reading it at
+            # u=0 -- which is what the state pathway needs -- reports every
+            # candidate as costing nothing to actuate, so the planner sees free
+            # torque and thrashes.  Measured on the wind run: return collapsed to
+            # -29 with the adapter's own prediction error the BEST of any arm,
+            # the signature of a good model behind a broken objective.
+            #
+            # The head corrects DYNAMICS only; the reward function is unchanged
+            # by the perturbation, so the body's reward head stays valid at
+            # (s, u) and is simply read there.  Costs one extra forward per
+            # imagined step.
+            #
+            # (The Pendulum package does not hit this because that experiment
+            # plans with the ANALYTIC reward, so its learned reward channel is
+            # never consulted.)
+            if head.use_body_reward:
+                _n1, rew, _t1, _s1 = orig(act, model_state,
+                                          deterministic=deterministic, rng=rng)
+            else:
+                rew = _rew0
             obs = model_state["obs"]
             with torch.no_grad():
                 h = head.forward(torch.cat([obs, act], dim=-1),
-                                 sample=not deterministic)
+                                 sample=(not deterministic
+                                         and not head.rollout_mean_only))
             nxt = nxt.clone()
-            nxt[:, :head.obs_dim] = nxt[:, :head.obs_dim] + h
+            # `orig` returns obs + delta (target_is_delta), so composing on the
+            # DELTA requires subtracting obs, applying the head, and adding it
+            # back -- multiplying the absolute next-state would scale the state
+            # itself rather than the predicted change.
+            if head.compose == "mul":
+                _b = nxt[:, :head.obs_dim] - obs[:, :head.obs_dim]
+                if head.mul_dims is None:
+                    nxt[:, :head.obs_dim] = obs[:, :head.obs_dim] + _b * h
+                else:
+                    _d = head.mul_dims
+                    nxt[:, _d] = obs[:, _d] + _b[:, _d] * h[:, _d]
+            else:
+                nxt[:, :head.obs_dim] = nxt[:, :head.obs_dim] + h
             ns["obs"] = nxt
             return nxt, rew, term, ns
 
@@ -516,23 +628,39 @@ class NonlinearAdapterHead(nn.Module):
 
     # ── surprise-driven retention on the ADAPTER's own posterior ─────────────
     @torch.no_grad()
-    def forget(self, delta_bar):
+    def forget(self, delta_bar, mode="precision_only"):
         """tau <- tau0 + rho (tau - tau0),  rho = 1/max(delta_bar, 1).  Bounded by
-        the prior, so it cannot ratchet.  Returns rho actually applied per dim."""
+        the prior, so it cannot ratchet.  Returns rho actually applied per dim.
+
+        mode="precision_only" is the legacy conjugate formula: it inflates the
+        variational precision and leaves weight_mu untouched.  On a
+        GRADIENT-FIT head that is incoherent -- the mean carries everything the
+        head learned, so the belief widens while nothing is un-learned.
+        mode="prior_drift" additionally decays the mean toward the warm-start
+        anchor by the same rho, which is the coherent non-conjugate reading.
+        """
         db = np.asarray(delta_bar, dtype=np.float64)[:self.obs_dim]
         rho = np.clip(1.0 / np.maximum(db, 1.0), 1e-3, 1.0)
         if (rho >= 1.0).all():
             return rho, False
-        spec = ([(self.skip, True)] if self.hid == 0 else
-                [(self.skip, True), (self.l2, True), (self.l1, False)])
-        for layer, per_dim in spec:
+        _layers = (((self.skip, True), (self.l2, True), (self.l1, False))
+                   if self.depth == 2
+                   else ((self.skip, True), (self.l_nl, True)))
+        for layer, per_dim in _layers:
             tau0 = 1.0 / (layer.prior_std ** 2)
+            anch = getattr(layer, "_anchor_mu", None)
             for mu_p, rho_p in ((layer.weight_mu, layer.weight_rho),
                                 (layer.bias_mu, layer.bias_rho)):
                 for r in range(rho_p.shape[0]):
                     rr = float(rho[r]) if per_dim else float(rho.min())
                     if rr >= 1.0:
                         continue
+                    if mode == "prior_drift":
+                        # decay the MEAN toward the prior mean the KL is anchored
+                        # to, by the same rho that decays the precision
+                        pm = (layer.prior_weight_mu if mu_p is layer.weight_mu
+                              else layer.prior_bias_mu)
+                        mu_p.data[r] = pm[r] + rr * (mu_p.data[r] - pm[r])
                     sigma = F.softplus(rho_p.data[r])
                     tau_new = tau0 + rr * (1.0 / (sigma ** 2) - tau0)
                     rho_p.data[r] = torch.log(
@@ -558,8 +686,27 @@ def elbo_step_adapter(head, opt, bnn, dyn, obs_b, act_b, tgt_b, active_dims,
     with torch.no_grad():
         m0, lv0 = bnn._run_network(
             dyn._get_model_input(obs_b, torch.zeros_like(act_b)), sample=False)
-        r = tgt_b[:, :head.obs_dim] - m0[:, :head.obs_dim]
         s2 = torch.exp(lv0[:, :head.obs_dim]).clamp_min(1e-8)
+        if getattr(head, "compose", "add") == "mul":
+            # Multiplicative composition fits  delta ~= h * mu_body(s,0) on the
+            # mul dims, so their regression target is the RATIO delta/mu_body and
+            # the residual (r - h) becomes (delta/mu_body - h).  Weighting by
+            # 1/sigma_n^2 in ratio space is the same Gaussian likelihood divided
+            # by mu_body^2, so sigma is rescaled: sigma_ratio = sigma_n/|mu_body|.
+            # Dims OUTSIDE mul_dims keep the additive residual, matching how
+            # `predict`/`composed` pass them through.
+            _b = m0[:, :head.obs_dim]
+            _sgn = torch.where(_b < 0, -torch.ones_like(_b), torch.ones_like(_b))
+            _bs = torch.where(_b.abs() < 1e-6, _sgn * 1e-6, _b)
+            r = tgt_b[:, :head.obs_dim] - _b            # additive default
+            _md = head.mul_dims if head.mul_dims is not None else list(
+                range(head.obs_dim))
+            r = r.clone()
+            r[:, _md] = tgt_b[:, _md] / _bs[:, _md]
+            s2 = s2.clone()
+            s2[:, _md] = s2[:, _md] / _bs[:, _md].pow(2)
+        else:
+            r = tgt_b[:, :head.obs_dim] - m0[:, :head.obs_dim]
     x = torch.cat([obs_b, act_b], dim=-1)
     nll = kl = None
     for _ in range(n_steps):

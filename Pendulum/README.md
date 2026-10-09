@@ -1,4 +1,4 @@
-# Ant — frozen body + adapter head on non-stationary Pendulum
+# Pendulum — frozen body + adapter head on non-stationary Pendulum
 
 Self-contained replication package. Everything needed to regenerate the two
 result tables in §7 is in this folder; it has no dependency on the parent
@@ -27,7 +27,7 @@ Constants are quoted with `file:line` so they can be checked rather than trusted
 ### Layout
 
 ```
-Ant/
+Pendulum/
   README.md                      this file
   test_pendulum_default_head.py  the driver (all 6 arms)
   config.py                      device selection
